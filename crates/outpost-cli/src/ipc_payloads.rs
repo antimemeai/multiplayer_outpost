@@ -19,6 +19,9 @@ pub const ERR_SECRET_OWN_DEVICE_SECRET: u16 = 4030;
 pub const ERR_SECRET_OWN_DEVICE_CWT: u16 = 4031;
 pub const ERR_SECRET_INVITE_TOKEN: u16 = 4032;
 pub const ERR_SECRET_PRIVATE_KEY_PEM: u16 = 4033;
+pub const ERR_SECRET_RECOVERY_KEY: u16 = 4205;
+pub const ERR_SECRET_DEVICE_LINK_TOKEN: u16 = 4206;
+pub const ERR_SECRET_RECOVERY_FILE: u16 = 4207;
 
 pub const fn secret_kind_to_error_code(kind: SecretMatchKind) -> u16 {
     match kind {
@@ -26,6 +29,9 @@ pub const fn secret_kind_to_error_code(kind: SecretMatchKind) -> u16 {
         SecretMatchKind::OwnDeviceCwt => ERR_SECRET_OWN_DEVICE_CWT,
         SecretMatchKind::InviteToken => ERR_SECRET_INVITE_TOKEN,
         SecretMatchKind::PrivateKeyPem => ERR_SECRET_PRIVATE_KEY_PEM,
+        SecretMatchKind::RecoveryKey => ERR_SECRET_RECOVERY_KEY,
+        SecretMatchKind::DeviceLinkToken => ERR_SECRET_DEVICE_LINK_TOKEN,
+        SecretMatchKind::RecoveryFile => ERR_SECRET_RECOVERY_FILE,
     }
 }
 
@@ -35,6 +41,9 @@ pub const fn error_code_to_secret_kind(code: u16) -> Option<SecretMatchKind> {
         ERR_SECRET_OWN_DEVICE_CWT => Some(SecretMatchKind::OwnDeviceCwt),
         ERR_SECRET_INVITE_TOKEN => Some(SecretMatchKind::InviteToken),
         ERR_SECRET_PRIVATE_KEY_PEM => Some(SecretMatchKind::PrivateKeyPem),
+        ERR_SECRET_RECOVERY_KEY => Some(SecretMatchKind::RecoveryKey),
+        ERR_SECRET_DEVICE_LINK_TOKEN => Some(SecretMatchKind::DeviceLinkToken),
+        ERR_SECRET_RECOVERY_FILE => Some(SecretMatchKind::RecoveryFile),
         _ => None,
     }
 }

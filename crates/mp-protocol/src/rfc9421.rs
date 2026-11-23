@@ -64,22 +64,53 @@ pub enum KeyId {
     Device { account_id: AccountId, device_id: DeviceId },
     Root { account_id: AccountId },
     Registration { root_pubkey_sha256_prefix: [u8; 16] },
+    Recovery { root_pubkey_sha256_prefix: [u8; 16] },
+    DeviceLink { device_pubkey_sha256_prefix: [u8; 16] },
+}
+
+fn parse_hex16_prefix(hex_part: &str) -> Result<[u8; 16], Rfc9421Error> {
+    if hex_part.len() != 32 {
+        return Err(Rfc9421Error::InvalidKeyId);
+    }
+    let mut prefix = [0u8; 16];
+    for (i, slot) in prefix.iter_mut().enumerate() {
+        let hi = hex_nibble(hex_part.as_bytes().get(i * 2).copied())?;
+        let lo = hex_nibble(hex_part.as_bytes().get(i * 2 + 1).copied())?;
+        *slot = (hi << 4) | lo;
+    }
+    Ok(prefix)
+}
+
+fn format_hex16_prefix(label: &str, bytes: &[u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(label.len() + 32);
+    out.push_str(label);
+    for &b in bytes {
+        if let (Some(&c1), Some(&c2)) =
+            (HEX.get(usize::from(b >> 4)), HEX.get(usize::from(b & 0x0f)))
+        {
+            out.push(char::from(c1));
+            out.push(char::from(c2));
+        }
+    }
+    out
 }
 
 impl KeyId {
     pub fn parse(raw: &str) -> Result<Self, Rfc9421Error> {
         if let Some(hex_part) = raw.strip_prefix("reg.") {
-            if hex_part.len() != 32 {
-                return Err(Rfc9421Error::InvalidKeyId);
-            }
-            let mut prefix = [0u8; 16];
-            for (i, slot) in prefix.iter_mut().enumerate() {
-                let hi = hex_nibble(hex_part.as_bytes().get(i * 2).copied())?;
-                let lo = hex_nibble(hex_part.as_bytes().get(i * 2 + 1).copied())?;
-                *slot = (hi << 4) | lo;
-            }
             return Ok(Self::Registration {
-                root_pubkey_sha256_prefix: prefix,
+                root_pubkey_sha256_prefix: parse_hex16_prefix(hex_part)?,
+            });
+        }
+        if let Some(hex_part) = raw.strip_prefix("rec.") {
+            return Ok(Self::Recovery {
+                root_pubkey_sha256_prefix: parse_hex16_prefix(hex_part)?,
+            });
+        }
+        if let Some(hex_part) = raw.strip_prefix("link.") {
+            return Ok(Self::DeviceLink {
+                device_pubkey_sha256_prefix: parse_hex16_prefix(hex_part)?,
             });
         }
 
@@ -104,19 +135,13 @@ impl KeyId {
             Self::Root { account_id } => format!("{account_id}.root"),
             Self::Registration {
                 root_pubkey_sha256_prefix,
-            } => {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                let mut out = String::from("reg.");
-                for &b in root_pubkey_sha256_prefix {
-                    if let (Some(&c1), Some(&c2)) =
-                        (HEX.get(usize::from(b >> 4)), HEX.get(usize::from(b & 0x0f)))
-                    {
-                        out.push(char::from(c1));
-                        out.push(char::from(c2));
-                    }
-                }
-                out
-            }
+            } => format_hex16_prefix("reg.", root_pubkey_sha256_prefix),
+            Self::Recovery {
+                root_pubkey_sha256_prefix,
+            } => format_hex16_prefix("rec.", root_pubkey_sha256_prefix),
+            Self::DeviceLink {
+                device_pubkey_sha256_prefix,
+            } => format_hex16_prefix("link.", device_pubkey_sha256_prefix),
         }
     }
 }
@@ -562,15 +587,23 @@ pub fn verify_rfc9421_request(
 
     let parsed = parse_signature_input(req.signature_input)?;
 
-    // Bind `reg.<hex>` keyid cryptographically to sha256(pubkey)[..16]!
-    if let KeyId::Registration {
-        root_pubkey_sha256_prefix,
-    } = parsed.keyid
-    {
-        let digest = sha256(pubkey);
-        if digest.get(0..16) != Some(root_pubkey_sha256_prefix.as_slice()) {
-            return Err(Rfc9421Error::InvalidKeyId);
+    // Bind `reg.<hex>`, `rec.<hex>`, and `link.<hex>` keyids cryptographically to sha256(pubkey)[..16]!
+    match parsed.keyid {
+        KeyId::Registration {
+            root_pubkey_sha256_prefix: prefix,
         }
+        | KeyId::Recovery {
+            root_pubkey_sha256_prefix: prefix,
+        }
+        | KeyId::DeviceLink {
+            device_pubkey_sha256_prefix: prefix,
+        } => {
+            let digest = sha256(pubkey);
+            if digest.get(0..16) != Some(prefix.as_slice()) {
+                return Err(Rfc9421Error::InvalidKeyId);
+            }
+        }
+        KeyId::Device { .. } | KeyId::Root { .. } => {}
     }
 
     // 1. Validate time window syntax (`created < expires`, `expires - created <= 120`) —

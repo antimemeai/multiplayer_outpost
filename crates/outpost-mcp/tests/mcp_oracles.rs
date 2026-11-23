@@ -1424,3 +1424,77 @@ async fn oracle_6_gate1_fence_scope_inside_block_and_blocked_stdout_sub_50ms_eof
     );
 }
 
+/// Test 8: v0.2.0 Identity Portability secret refusal mappings (`recovery_key`,
+/// `device_link_token`, `recovery_file`) return crisp `secret_material_refused`
+/// errors with exact `"kind"` codes and never echo offending payloads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oracle_8_identity_portability_secret_refusal_kind_codes() {
+    let backend = MockBackend::new();
+    {
+        let mut st = backend.lock_state();
+        st.send_outcomes
+            .push_back(Err(BackendError::SecretRefused(SecretMatchKind::RecoveryKey)));
+        st.send_outcomes.push_back(Err(BackendError::SecretRefused(
+            SecretMatchKind::DeviceLinkToken,
+        )));
+        st.send_outcomes.push_back(Err(BackendError::SecretRefused(
+            SecretMatchKind::RecoveryFile,
+        )));
+    }
+
+    let mut h = PipeHarness::spawn(Arc::clone(&backend), McpServerConfig::default());
+    h.send_json(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18" }
+    }));
+    let _ = h.read_json_line();
+
+    let cases = [
+        (
+            2,
+            "mprk1_000G4-0R40M-30E20-9185G-R38E1-W8124-GK2GA-HC5RR-34D1P-70X3R-FPD00",
+            "recovery_key",
+        ),
+        (
+            3,
+            "mpdl1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "device_link_token",
+        ),
+        (
+            4,
+            "-----BEGIN MULTIPLAYER RECOVERY KEY-----\nTVBLRVkxAAA=\n-----END MULTIPLAYER RECOVERY KEY-----",
+            "recovery_file",
+        ),
+    ];
+
+    for (req_id, payload, expected_kind) in cases {
+        h.send_json(&json!({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "tools/call",
+            "params": {
+                "name": "party_send",
+                "arguments": { "party_id": 42, "body": payload }
+            }
+        }));
+        let reply = h.read_json_line();
+        assert_eq!(ptr(&reply, "/id"), req_id);
+        assert_eq!(ptr(&reply, "/result/isError"), true);
+        assert_eq!(
+            ptr(&reply, "/result/structuredContent/error"),
+            "secret_material_refused"
+        );
+        assert_eq!(ptr(&reply, "/result/structuredContent/retryable"), false);
+        assert_eq!(ptr(&reply, "/result/structuredContent/kind"), expected_kind);
+        let serialized = serde_json::to_string(&reply).unwrap_or_default();
+        assert!(
+            !serialized.contains(payload),
+            "secret refusal for {expected_kind} must never echo payload"
+        );
+    }
+
+    let _ = h.close_and_wait().await;
+}
+

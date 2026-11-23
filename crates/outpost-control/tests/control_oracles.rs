@@ -31,7 +31,8 @@ use mp_protocol::{
 };
 use outpost_control::{
     ApprovePartyRequest, ChurnStatus, ControlClient, ControlClientConfig, ControlError,
-    CreatePartyRequest, EndpointUpdateCoalescer, EnrollDeviceRequest, EvictionChurnDetector,
+    CreatePartyRequest, DeviceLinkApproveRequest, DeviceLinkInspectResponse,
+    DeviceLinkPollResponse, EndpointUpdateCoalescer, EnrollDeviceRequest, EvictionChurnDetector,
     JoinPartyRequest, JoinPartyResponse, MAX_CLOCK_OFFSET_MS, MAX_RESPONSE_BODY_BYTES,
     MP1_PING_TEXT, MP1_PONG_TEXT, MintPartyInviteRequest, Mp1WsEvent, Mp1WsTarget,
     RegisterAccountRequest, RequestSigner, WsConnectError, WsError,
@@ -1087,7 +1088,9 @@ async fn oracle_typed_rest_endpoints_match_exact_server_contract() {
             let verify_pk = match parsed_si.keyid {
                 mp_protocol::KeyId::Root { .. } => &root_pubkey,
                 mp_protocol::KeyId::Device { .. } => &dev_pubkey,
-                mp_protocol::KeyId::Registration { .. } => panic!("unexpected reg keyid"),
+                mp_protocol::KeyId::Registration { .. }
+                | mp_protocol::KeyId::Recovery { .. }
+                | mp_protocol::KeyId::DeviceLink { .. } => panic!("unexpected special keyid"),
             };
 
             verify_rfc9421_request(
@@ -1784,4 +1787,519 @@ async fn oracle_ws_upgrade_bounded_headers_hostile_accept_and_401_clock_skew_ret
         recorded[0], recorded[1],
         "WS clock_skew retry MUST generate a fresh RFC 9421 nonce"
     );
+}
+
+// ===========================================================================
+// Oracle 8: Identity Portability, Web Portal, & TLS 1.3 Relay Ping Endpoints
+// ===========================================================================
+
+fn generate_test_pki_for(authority: &str) -> TestPki {
+    let certified = rcgen::generate_simple_self_signed(vec![authority.to_owned()])
+        .expect("rcgen cert generation");
+    let cert_der = certified.cert.der().clone();
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        certified.key_pair.serialize_der(),
+    ));
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert_der.clone()).expect("add test root cert");
+    let client_tls13 =
+        build_tls13_client_config_with_roots(roots).expect("build TLS 1.3 client config");
+
+    TestPki {
+        cert_der,
+        key_der,
+        client_tls13,
+    }
+}
+
+#[tokio::test]
+async fn oracle_identity_portability_and_web_portal_endpoints() {
+    let pki = generate_test_pki();
+    let tls13_acceptor = make_server_acceptor(&pki, &[&rustls::version::TLS13]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let acct_id = AccountId::new(1001).expect("acct");
+    let dev_id = DeviceId::new(2002).expect("dev");
+
+    let root_secret = [81u8; 32];
+    let root_pubkey = SigningKey::from_bytes(&root_secret)
+        .verifying_key()
+        .to_bytes();
+    let dev_secret = [82u8; 32];
+    let dev_pubkey = SigningKey::from_bytes(&dev_secret)
+        .verifying_key()
+        .to_bytes();
+    let new_dev_secret = [83u8; 32];
+    let new_dev_pubkey = SigningKey::from_bytes(&new_dev_secret)
+        .verifying_key()
+        .to_bytes();
+    let new_dev_cwt = make_cwt(root_secret, new_dev_pubkey);
+
+    let root_signer = RequestSigner::root(acct_id, root_secret);
+    let dev_signer = RequestSigner::device(acct_id, dev_id, dev_secret);
+    let rec_signer = RequestSigner::recovery(root_secret);
+    let link_signer = RequestSigner::device_link(new_dev_secret);
+
+    assert!(
+        rec_signer.key_id().format().starts_with("rec.")
+            && rec_signer.key_id().format().len() == 36
+    );
+    assert!(
+        link_signer.key_id().format().starts_with("link.")
+            && link_signer.key_id().format().len() == 37
+    );
+
+    let expected_rec_keyid = rec_signer.key_id().format();
+    let expected_link_keyid = link_signer.key_id().format();
+    let expected_cwt_b64 = B64_STD.encode(&new_dev_cwt);
+    let srv_cwt_b64 = expected_cwt_b64.clone();
+    let poll_nonces = Arc::new(Mutex::new(Vec::<String>::new()));
+    let poll_nonces_srv = Arc::clone(&poll_nonces);
+
+    let srv = tokio::spawn(async move {
+        // 13 live TLS 1.3 requests covering all 8 new endpoints + both branches of inspect/poll/web-sessions
+        let mut create_calls = 0u8;
+        let mut inspect_calls = 0u8;
+        let mut poll_calls = 0u8;
+
+        for _ in 0..13 {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls");
+            let req = read_http_request(&mut tls).await;
+            let method = HttpMethod::parse(&req.method).expect("method");
+            let sig_input = req.headers.get("signature-input").expect("sig-in");
+            let sig = req.headers.get("signature").expect("sig");
+            let parsed_si = mp_protocol::parse_signature_input(sig_input).expect("parse si");
+
+            let verify_pk = match parsed_si.keyid {
+                mp_protocol::KeyId::Root { .. } | mp_protocol::KeyId::Recovery { .. } => {
+                    &root_pubkey
+                }
+                mp_protocol::KeyId::Device { .. } => &dev_pubkey,
+                mp_protocol::KeyId::DeviceLink { .. } => &new_dev_pubkey,
+                mp_protocol::KeyId::Registration { .. } => panic!("unexpected reg keyid"),
+            };
+
+            let verified = verify_rfc9421_request(
+                &Rfc9421Request {
+                    method,
+                    authority: req.headers.get("host").map(String::as_str).unwrap_or(""),
+                    path: &req.path,
+                    query: &req.query,
+                    content_type: req.headers.get("content-type").map(String::as_str),
+                    content_digest: req.headers.get("content-digest").map(String::as_str),
+                    has_content_encoding: req.headers.contains_key("content-encoding"),
+                    body: &req.body,
+                    signature_input: sig_input,
+                    signature: sig,
+                },
+                TEST_AUTHORITY,
+                verify_pk,
+                wall_now_secs(),
+            )
+            .expect("RFC 9421 verification must pass for all identity portability endpoints");
+
+            let body_val: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("valid json body");
+
+            let (status, json) = match (req.method.as_str(), req.path.as_str(), req.query.as_str())
+            {
+                ("POST", "/v1/accounts/recover-lookup", "?") => {
+                    assert_eq!(verified.keyid.format(), expected_rec_keyid);
+                    let obj = body_val.as_object().expect("json object");
+                    assert_eq!(obj.len(), 1);
+                    assert_eq!(
+                        obj.get("root_pubkey_b64").and_then(serde_json::Value::as_str),
+                        Some(B64_STD.encode(root_pubkey).as_str())
+                    );
+                    (
+                        "200 OK",
+                        format!(
+                            r#"{{"account_id":1001,"handle":"alice","root_pubkey_b64":"{}","safety_number":"SP44-BGDF-SWJH-YXTV-ZWXT-MNGX-P342-B0TV","devices":[{{"device_id":2002,"pubkey_b64":"{}","label":"laptop","cwt_expires_ms":1900000000000,"generation":1,"pop_verified":true,"created_at_ms":1700000000000,"revoked_at_ms":null}}]}}"#,
+                            B64_STD.encode(root_pubkey),
+                            B64_STD.encode(dev_pubkey)
+                        ),
+                    )
+                }
+                ("POST", "/v1/web-sessions/inspect", "?") => {
+                    assert!(matches!(
+                        verified.keyid,
+                        mp_protocol::KeyId::Device { .. } | mp_protocol::KeyId::Root { .. }
+                    ));
+                    assert_eq!(body_val["user_code"], "W4K9-M2P7");
+                    (
+                        "200 OK",
+                        r#"{"pending":true,"scope":"web_account_portal","browser_fingerprint":"a1b2c3d4","requester_country":"US","requester_client":"Chrome/130","created_at_ms":1795453800000,"expires_at_ms":1795454100000}"#
+                            .to_owned(),
+                    )
+                }
+                ("POST", "/v1/web-sessions/approve", "?") => {
+                    assert_eq!(body_val["user_code"], "W4K9-M2P7");
+                    let is_root = matches!(verified.keyid, mp_protocol::KeyId::Root { .. });
+                    let dev_field = if is_root { "null" } else { "2002" };
+                    (
+                        "200 OK",
+                        format!(
+                            r#"{{"approved":true,"scope":"web_account_portal","account_id":1001,"approved_device_id":{dev_field},"approved_by_root":{is_root},"browser_fingerprint":"a1b2c3d4","requester_country":"US","requester_client":"Chrome/130"}}"#
+                        ),
+                    )
+                }
+                ("POST", "/v1/device-links/create", "?") => {
+                    assert!(matches!(verified.keyid, mp_protocol::KeyId::Root { .. }));
+                    let obj = body_val.as_object().expect("json object");
+                    create_calls += 1;
+                    if create_calls == 1 {
+                        assert!(
+                            obj.is_empty(),
+                            "None device_label must serialize to {{}}, got {obj:?}"
+                        );
+                    } else {
+                        assert_eq!(obj.len(), 1);
+                        assert_eq!(
+                            obj.get("device_label").and_then(serde_json::Value::as_str),
+                            Some("wintermute")
+                        );
+                    }
+                    (
+                        "201 Created",
+                        r#"{"link_code":"W4K9-M2P7","expires_at_ms":1795454100000}"#.to_owned(),
+                    )
+                }
+                ("POST", "/v1/device-links/claim", "?") => {
+                    assert_eq!(verified.keyid.format(), expected_link_keyid);
+                    let obj = body_val.as_object().expect("json object");
+                    assert_eq!(obj.len(), 3);
+                    assert_eq!(body_val["link_code"], "W4K9-M2P7");
+                    assert_eq!(body_val["device_pubkey_b64"], B64_STD.encode(new_dev_pubkey));
+                    assert_eq!(body_val["device_label"], "wintermute");
+                    (
+                        "200 OK",
+                        r#"{"poll_token":"mpdl1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","device_fingerprint":"ad1a8375-03ecc659-ad64922d-16cf6eb6","expires_at_ms":1795454100000}"#
+                            .to_owned(),
+                    )
+                }
+                ("POST", "/v1/device-links/inspect", "?") => {
+                    assert!(matches!(verified.keyid, mp_protocol::KeyId::Root { .. }));
+                    assert_eq!(body_val["link_code"], "W4K9-M2P7");
+                    inspect_calls += 1;
+                    if inspect_calls == 1 {
+                        (
+                            "200 OK",
+                            r#"{"state":"waiting_for_device","suggested_label":"wintermute","created_at_ms":1795453800000,"expires_at_ms":1795454100000}"#
+                                .to_owned(),
+                        )
+                    } else {
+                        (
+                            "200 OK",
+                            format!(
+                                r#"{{"state":"pending_approval","device_pubkey_b64":"{}","device_fingerprint":"ad1a8375-03ecc659-ad64922d-16cf6eb6","device_label":"wintermute","requester_country":"US","created_at_ms":1795453800000,"expires_at_ms":1795454100000}}"#,
+                                B64_STD.encode(new_dev_pubkey)
+                            ),
+                        )
+                    }
+                }
+                ("POST", "/v1/device-links/approve", "?") => {
+                    assert!(matches!(verified.keyid, mp_protocol::KeyId::Root { .. }));
+                    let obj = body_val.as_object().expect("json object");
+                    assert_eq!(obj.len(), 3, "None device_label must be omitted");
+                    assert_eq!(body_val["link_code"], "W4K9-M2P7");
+                    assert_eq!(body_val["device_pubkey_b64"], B64_STD.encode(new_dev_pubkey));
+                    assert_eq!(body_val["device_cwt_b64"], srv_cwt_b64);
+                    (
+                        "200 OK",
+                        r#"{"approved":true,"account_id":1001,"device_id":2004,"device_label":"wintermute","device_fingerprint":"ad1a8375-03ecc659-ad64922d-16cf6eb6","cwt_expires_ms":1900000000000}"#
+                            .to_owned(),
+                    )
+                }
+                ("POST", "/v1/device-links/poll", "?") => {
+                    assert_eq!(verified.keyid.format(), expected_link_keyid);
+                    assert_eq!(body_val["link_code"], "W4K9-M2P7");
+                    assert_eq!(
+                        body_val["poll_token"],
+                        "mpdl1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    );
+                    assert_eq!(body_val["device_pubkey_b64"], B64_STD.encode(new_dev_pubkey));
+                    poll_nonces_srv
+                        .lock()
+                        .expect("lock")
+                        .push(verified.nonce.clone());
+                    poll_calls += 1;
+                    if poll_calls == 1 {
+                        (
+                            "202 Accepted",
+                            r#"{"status":"pending","expires_at_ms":1795454100000}"#.to_owned(),
+                        )
+                    } else {
+                        (
+                            "200 OK",
+                            format!(
+                                r#"{{"status":"approved","account_id":1001,"handle":"alice","device_id":2004,"root_pubkey_b64":"{}","device_cwt_b64":"{}","cwt_expires_ms":1900000000000,"safety_number":"SP44-BGDF-SWJH-YXTV-ZWXT-MNGX-P342-B0TV"}}"#,
+                                B64_STD.encode(root_pubkey),
+                                srv_cwt_b64
+                            ),
+                        )
+                    }
+                }
+                other => panic!("unexpected request: {other:?}"),
+            };
+
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                json.len(),
+                json
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write");
+            tls.shutdown().await.expect("shutdown");
+        }
+    });
+
+    let client =
+        ControlClient::with_device_signer(make_client_config(&pki, addr), dev_signer.clone());
+
+    // Local fail-closed signer guards: .root-only routes MUST reject device, rec., and link. signers!
+    for bad_signer in [&dev_signer, &rec_signer, &link_signer] {
+        assert!(matches!(
+            client.device_link_create(bad_signer, None).await,
+            Err(ControlError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            client.device_link_inspect(bad_signer, "W4K9-M2P7").await,
+            Err(ControlError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            client
+                .device_link_approve(
+                    bad_signer,
+                    &DeviceLinkApproveRequest {
+                        link_code: "W4K9-M2P7".to_owned(),
+                        device_pubkey: new_dev_pubkey,
+                        device_cwt: new_dev_cwt.clone(),
+                        device_label: None,
+                    }
+                )
+                .await,
+            Err(ControlError::InvalidRequest(_))
+        ));
+    }
+    // Web sessions MUST reject rec. and link. signers locally!
+    for bad_signer in [&rec_signer, &link_signer] {
+        assert!(matches!(
+            client
+                .web_session_inspect_with_signer(bad_signer, "W4K9-M2P7")
+                .await,
+            Err(ControlError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            client
+                .web_session_approve_with_signer(bad_signer, "W4K9-M2P7")
+                .await,
+            Err(ControlError::InvalidRequest(_))
+        ));
+    }
+
+    // 1. POST /v1/accounts/recover-lookup (rec.<32hex>)
+    let recovered = client
+        .recover_lookup(root_secret)
+        .await
+        .expect("recover_lookup");
+    assert_eq!(recovered.account_id, 1001);
+    assert_eq!(recovered.handle, "alice");
+    assert_eq!(recovered.root_pubkey_b64, B64_STD.encode(root_pubkey));
+    assert_eq!(
+        recovered.safety_number,
+        "SP44-BGDF-SWJH-YXTV-ZWXT-MNGX-P342-B0TV"
+    );
+    assert_eq!(recovered.devices.len(), 1);
+    assert_eq!(recovered.devices[0].device_id, 2002);
+
+    // 2 & 3. POST /v1/web-sessions/inspect & approve (device signer + .root signer)
+    let web_insp = client
+        .web_session_inspect("W4K9-M2P7")
+        .await
+        .expect("web_session_inspect");
+    assert!(web_insp.pending);
+    assert_eq!(web_insp.scope, "web_account_portal");
+    assert_eq!(web_insp.browser_fingerprint, "a1b2c3d4");
+    assert_eq!(web_insp.requester_country, "US");
+    assert_eq!(web_insp.requester_client, "Chrome/130");
+
+    let web_appr_dev = client
+        .web_session_approve("W4K9-M2P7")
+        .await
+        .expect("web_session_approve device");
+    assert!(web_appr_dev.approved);
+    assert_eq!(web_appr_dev.account_id, 1001);
+    assert_eq!(web_appr_dev.approved_device_id, Some(2002));
+    assert!(!web_appr_dev.approved_by_root);
+
+    let web_insp_root = client
+        .web_session_inspect_with_signer(&root_signer, "W4K9-M2P7")
+        .await
+        .expect("web_session_inspect root");
+    assert!(web_insp_root.pending);
+
+    let web_appr_root = client
+        .web_session_approve_with_signer(&root_signer, "W4K9-M2P7")
+        .await
+        .expect("web_session_approve root");
+    assert!(web_appr_root.approved);
+    assert_eq!(web_appr_root.approved_device_id, None);
+    assert!(web_appr_root.approved_by_root);
+
+    // 4. POST /v1/device-links/create (.root) with None and Some(label)
+    let link_none = client
+        .device_link_create(&root_signer, None)
+        .await
+        .expect("device_link_create None");
+    assert_eq!(link_none.link_code, "W4K9-M2P7");
+    let link_some = client
+        .device_link_create(&root_signer, Some("wintermute"))
+        .await
+        .expect("device_link_create Some");
+    assert_eq!(link_some.expires_at_ms, 1_795_454_100_000);
+
+    // 5. POST /v1/device-links/inspect (.root) -> WaitingForDevice
+    let insp_wait = client
+        .device_link_inspect(&root_signer, "W4K9-M2P7")
+        .await
+        .expect("device_link_inspect waiting");
+    assert_eq!(
+        insp_wait,
+        DeviceLinkInspectResponse::WaitingForDevice {
+            suggested_label: "wintermute".to_owned(),
+            created_at_ms: 1_795_453_800_000,
+            expires_at_ms: 1_795_454_100_000,
+        }
+    );
+
+    // 6. POST /v1/device-links/claim (link.<32hex>)
+    let claimed = client
+        .device_link_claim(new_dev_secret, "W4K9-M2P7", Some("wintermute"))
+        .await
+        .expect("device_link_claim");
+    assert_eq!(
+        claimed.poll_token,
+        "mpdl1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert_eq!(
+        claimed.device_fingerprint,
+        "ad1a8375-03ecc659-ad64922d-16cf6eb6"
+    );
+
+    // 7. POST /v1/device-links/inspect (.root) -> PendingApproval
+    let insp_pending = client
+        .device_link_inspect(&root_signer, "W4K9-M2P7")
+        .await
+        .expect("device_link_inspect pending");
+    assert_eq!(
+        insp_pending,
+        DeviceLinkInspectResponse::PendingApproval {
+            device_pubkey_b64: B64_STD.encode(new_dev_pubkey),
+            device_fingerprint: "ad1a8375-03ecc659-ad64922d-16cf6eb6".to_owned(),
+            device_label: "wintermute".to_owned(),
+            requester_country: "US".to_owned(),
+            created_at_ms: 1_795_453_800_000,
+            expires_at_ms: 1_795_454_100_000,
+        }
+    );
+
+    // 8a. POST /v1/device-links/poll (link.<32hex>) -> 202 Pending
+    let poll_pending = client
+        .device_link_poll(new_dev_secret, "W4K9-M2P7", &claimed.poll_token)
+        .await
+        .expect("device_link_poll 202");
+    assert_eq!(
+        poll_pending,
+        DeviceLinkPollResponse::Pending {
+            expires_at_ms: 1_795_454_100_000
+        }
+    );
+
+    // 9. POST /v1/device-links/approve (.root)
+    let approved = client
+        .device_link_approve(
+            &root_signer,
+            &DeviceLinkApproveRequest {
+                link_code: "W4K9-M2P7".to_owned(),
+                device_pubkey: new_dev_pubkey,
+                device_cwt: new_dev_cwt,
+                device_label: None,
+            },
+        )
+        .await
+        .expect("device_link_approve");
+    assert!(approved.approved);
+    assert_eq!(approved.account_id, 1001);
+    assert_eq!(approved.device_id, 2004);
+    assert_eq!(approved.device_label, "wintermute");
+
+    // 8b. POST /v1/device-links/poll (link.<32hex>) -> 200 Approved
+    let poll_approved = client
+        .device_link_poll(new_dev_secret, "W4K9-M2P7", &claimed.poll_token)
+        .await
+        .expect("device_link_poll 200");
+    assert_eq!(
+        poll_approved,
+        DeviceLinkPollResponse::Approved {
+            account_id: 1001,
+            handle: "alice".to_owned(),
+            device_id: 2004,
+            root_pubkey_b64: B64_STD.encode(root_pubkey),
+            device_cwt_b64: expected_cwt_b64,
+            cwt_expires_ms: 1_900_000_000_000,
+            safety_number: "SP44-BGDF-SWJH-YXTV-ZWXT-MNGX-P342-B0TV".to_owned(),
+        }
+    );
+
+    srv.await.expect("server task");
+    {
+        let nonces = poll_nonces.lock().expect("lock");
+        assert_eq!(nonces.len(), 2);
+        assert_ne!(
+            nonces[0], nonces[1],
+            "each device_link_poll MUST use a fresh RFC 9421 nonce"
+        );
+    }
+
+    // 10. TLS 1.3 relay /ping probe helper
+    let relay_pki = generate_test_pki_for("relay.multiplayer.tech");
+    let relay_acceptor = make_server_acceptor(&relay_pki, &[&rustls::version::TLS13]);
+    let relay_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind relay");
+    let relay_addr = relay_listener.local_addr().expect("relay addr");
+    let relay_srv = tokio::spawn(async move {
+        let (tcp, _) = relay_listener.accept().await.expect("accept relay");
+        let mut tls = relay_acceptor.accept(tcp).await.expect("tls relay");
+        let req = read_http_request(&mut tls).await;
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "/ping");
+        assert_eq!(
+            req.headers.get("host").map(String::as_str),
+            Some("relay.multiplayer.tech")
+        );
+        let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        tls.write_all(resp.as_bytes()).await.expect("write ping");
+        tls.shutdown().await.expect("shutdown relay");
+    });
+
+    let relay_client = ControlClient::new(
+        ControlClientConfig::new("relay.multiplayer.tech")
+            .expect("relay cfg")
+            .with_tls_config(Arc::clone(&relay_pki.client_tls13))
+            .with_connect_addr(relay_addr)
+            .with_request_timeout(Duration::from_secs(5)),
+    );
+    assert!(matches!(
+        relay_client
+            .probe_relay_ping("http://relay.multiplayer.tech")
+            .await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+    let rtt = relay_client
+        .probe_relay_ping(TEST_RELAY_URL)
+        .await
+        .expect("probe_relay_ping must succeed over TLS 1.3");
+    assert!(rtt < Duration::from_secs(5));
+    relay_srv.await.expect("relay srv");
 }

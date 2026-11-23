@@ -18,6 +18,7 @@ pub enum CryptoError {
     InvalidSignature,
     InvalidHandle,
     ReservedHandle,
+    InvalidRecoveryKey,
 }
 
 impl fmt::Display for CryptoError {
@@ -28,6 +29,7 @@ impl fmt::Display for CryptoError {
             Self::InvalidSignature => write!(f, "Ed25519 strict signature verification failed"),
             Self::InvalidHandle => write!(f, "invalid handle format"),
             Self::ReservedHandle => write!(f, "handle is reserved"),
+            Self::InvalidRecoveryKey => write!(f, "invalid recovery key encoding or checksum"),
         }
     }
 }
@@ -134,7 +136,217 @@ pub fn verify_iroh_relay_challenge(
 /// Domain separation string for canonical cross-client Safety Numbers (Blackbird & Outpost).
 pub const SAFETY_NUMBER_DOMAIN_SEP: &str = "mp-safety-v1:";
 
+/// Prefix and domain separation string for canonical cross-client Root Recovery Keys (`mprk1_...`).
+pub const RECOVERY_KEY_PREFIX: &str = "mprk1_";
+pub const RECOVERY_KEY_DOMAIN_SEP: &str = "mp-recovery-v1:";
+
+/// Domain separation string for 128-bit device-link confirmation fingerprints.
+pub const DEVICE_FP_DOMAIN_SEP: &str = "mpdevfp2:";
+
 const CROCKFORD_B32: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+fn crockford_decode_char(b: u8) -> Option<u8> {
+    match b {
+        b'0' | b'O' | b'o' => Some(0),
+        b'1' | b'I' | b'i' | b'L' | b'l' => Some(1),
+        b'2'..=b'9' => Some(b - b'0'),
+        b'A'..=b'H' => Some(b - b'A' + 10),
+        b'a'..=b'h' => Some(b - b'a' + 10),
+        b'J' | b'j' => Some(18),
+        b'K' | b'k' => Some(19),
+        b'M' | b'm' => Some(20),
+        b'N' | b'n' => Some(21),
+        b'P'..=b'T' => Some(b - b'P' + 22),
+        b'p'..=b't' => Some(b - b'p' + 22),
+        b'V'..=b'Z' => Some(b - b'V' + 27),
+        b'v'..=b'z' => Some(b - b'v' + 27),
+        _ => None,
+    }
+}
+
+fn recovery_key_checksum(root_seed: &[u8; 32]) -> [u8; 2] {
+    let mut hasher = Sha256::new();
+    hasher.update(RECOVERY_KEY_DOMAIN_SEP.as_bytes());
+    hasher.update(root_seed);
+    let digest: [u8; 32] = hasher.finalize().into();
+    [
+        digest.first().copied().unwrap_or(0),
+        digest.get(1).copied().unwrap_or(0),
+    ]
+}
+
+fn zeroize_bytes(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = core::hint::black_box(0u8);
+    }
+    core::hint::black_box(buf);
+}
+
+/// Encodes a 32-byte Ed25519 root private seed as a canonical human-copyable Recovery Key:
+/// `payload[34] = root_seed[32] || SHA-256("mp-recovery-v1:" || root_seed)[0..2]`
+/// encoded MSB-first into 55 Crockford Base32 chars (272 payload bits + 3 trailing zero bits)
+/// grouped as `mprk1_XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX`.
+pub fn encode_recovery_key(root_seed: &[u8; 32]) -> String {
+    let chk = recovery_key_checksum(root_seed);
+    let mut payload = [0u8; 34];
+    if let Some(dst) = payload.get_mut(0..32) {
+        dst.copy_from_slice(root_seed);
+    }
+    if let Some(slot) = payload.get_mut(32) {
+        *slot = chk[0];
+    }
+    if let Some(slot) = payload.get_mut(33) {
+        *slot = chk[1];
+    }
+
+    let mut out = String::with_capacity(RECOVERY_KEY_PREFIX.len() + 55 + 10);
+    out.push_str(RECOVERY_KEY_PREFIX);
+
+    let mut bit_buf: u32 = 0;
+    let mut bit_len: u32 = 0;
+    let mut emitted: usize = 0;
+
+    for &byte in &payload {
+        bit_buf = (bit_buf << 8) | u32::from(byte);
+        bit_len += 8;
+        while bit_len >= 5 {
+            bit_len -= 5;
+            let idx = usize::try_from((bit_buf >> bit_len) & 0x1f).unwrap_or(0);
+            if emitted > 0 && emitted.is_multiple_of(5) {
+                out.push('-');
+            }
+            if let Some(&ch) = CROCKFORD_B32.get(idx) {
+                out.push(char::from(ch));
+            }
+            emitted += 1;
+        }
+    }
+    // 272 mod 5 == 2 remaining bits; pad 3 trailing zero bits for the 55th symbol.
+    if bit_len > 0 {
+        let idx = usize::try_from((bit_buf << (5 - bit_len)) & 0x1f).unwrap_or(0);
+        if emitted > 0 && emitted.is_multiple_of(5) {
+            out.push('-');
+        }
+        if let Some(&ch) = CROCKFORD_B32.get(idx) {
+            out.push(char::from(ch));
+        }
+    }
+    zeroize_bytes(&mut payload);
+    out
+}
+
+/// Decodes and validates a canonical `mprk1_...` Recovery Key.
+/// Accepts case-insensitive ASCII (<= 128 chars), optional `-`/ASCII whitespace separators,
+/// and Crockford typo aliases (`O->0`, `I/L->1`). Rejects non-canonical trailing padding bits
+/// and bad checksums.
+pub fn decode_recovery_key(raw: &str) -> Result<[u8; 32], CryptoError> {
+    if raw.len() > 128 || !raw.is_ascii() {
+        return Err(CryptoError::InvalidRecoveryKey);
+    }
+    let trimmed = raw.trim();
+    let body = if let Some(rest) = trimmed.strip_prefix(RECOVERY_KEY_PREFIX) {
+        rest
+    } else if trimmed.len() >= RECOVERY_KEY_PREFIX.len()
+        && trimmed
+            .get(0..RECOVERY_KEY_PREFIX.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(RECOVERY_KEY_PREFIX))
+    {
+        trimmed
+            .get(RECOVERY_KEY_PREFIX.len()..)
+            .ok_or(CryptoError::InvalidRecoveryKey)?
+    } else {
+        return Err(CryptoError::InvalidRecoveryKey);
+    };
+
+    let mut symbols = [0u8; 55];
+    let mut count = 0usize;
+    for &b in body.as_bytes() {
+        if b == b'-' || b.is_ascii_whitespace() {
+            continue;
+        }
+        let Some(val) = crockford_decode_char(b) else {
+            zeroize_bytes(&mut symbols);
+            return Err(CryptoError::InvalidRecoveryKey);
+        };
+        let Some(slot) = symbols.get_mut(count) else {
+            zeroize_bytes(&mut symbols);
+            return Err(CryptoError::InvalidRecoveryKey);
+        };
+        *slot = val;
+        count += 1;
+    }
+    if count != 55 {
+        zeroize_bytes(&mut symbols);
+        return Err(CryptoError::InvalidRecoveryKey);
+    }
+
+    let mut payload = [0u8; 34];
+    let mut out_idx = 0usize;
+    let mut bit_buf: u32 = 0;
+    let mut bit_len: u32 = 0;
+    for &sym in &symbols {
+        bit_buf = (bit_buf << 5) | u32::from(sym);
+        bit_len += 5;
+        while bit_len >= 8 {
+            bit_len -= 8;
+            let Some(slot) = payload.get_mut(out_idx) else {
+                zeroize_bytes(&mut symbols);
+                zeroize_bytes(&mut payload);
+                return Err(CryptoError::InvalidRecoveryKey);
+            };
+            *slot = u8::try_from((bit_buf >> bit_len) & 0xff).unwrap_or(0);
+            out_idx += 1;
+        }
+    }
+    zeroize_bytes(&mut symbols);
+
+    // Enforce canonical zero padding in the final 3 unused bits.
+    if out_idx != 34 || bit_len != 3 || (bit_buf & 0x07) != 0 {
+        zeroize_bytes(&mut payload);
+        return Err(CryptoError::InvalidRecoveryKey);
+    }
+
+    let mut seed = [0u8; 32];
+    let Some(seed_slice) = payload.get(0..32) else {
+        zeroize_bytes(&mut payload);
+        return Err(CryptoError::InvalidRecoveryKey);
+    };
+    seed.copy_from_slice(seed_slice);
+    let expected = recovery_key_checksum(&seed);
+    let c0 = payload.get(32).copied().unwrap_or(0);
+    let c1 = payload.get(33).copied().unwrap_or(0);
+    zeroize_bytes(&mut payload);
+
+    let diff = core::hint::black_box((c0 ^ expected[0]) | (c1 ^ expected[1]));
+    if diff != 0 {
+        zeroize_bytes(&mut seed);
+        return Err(CryptoError::InvalidRecoveryKey);
+    }
+    Ok(seed)
+}
+
+/// Computes the 128-bit device-link confirmation fingerprint (`XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX`):
+/// first 16 bytes of `SHA-256("mpdevfp2:" || device_pubkey)` formatted as 32 lowercase hex chars
+/// in 4 groups of 8 (35 ASCII chars total).
+pub fn compute_device_fingerprint(device_pubkey: &Ed25519PubKey) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(DEVICE_FP_DOMAIN_SEP.as_bytes());
+    hasher.update(device_pubkey);
+    let digest: [u8; 32] = hasher.finalize().into();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(35);
+    for i in 0usize..16 {
+        if i > 0 && i.is_multiple_of(4) {
+            out.push('-');
+        }
+        let b = digest.get(i).copied().unwrap_or(0);
+        if let (Some(&c1), Some(&c2)) = (HEX.get(usize::from(b >> 4)), HEX.get(usize::from(b & 0x0f))) {
+            out.push(char::from(c1));
+            out.push(char::from(c2));
+        }
+    }
+    out
+}
 
 /// Computes the canonical 39-character Crockford Base32 Safety Number shared by Blackbird,
 /// Outpost, and the web account portal:

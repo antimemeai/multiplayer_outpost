@@ -1226,6 +1226,9 @@ fn secret_kind_code(kind: SecretMatchKind) -> &'static str {
         SecretMatchKind::OwnDeviceCwt => "own_device_cwt",
         SecretMatchKind::InviteToken => "invite_token",
         SecretMatchKind::PrivateKeyPem => "private_key_pem",
+        SecretMatchKind::RecoveryKey => "recovery_key",
+        SecretMatchKind::DeviceLinkToken => "device_link_token",
+        SecretMatchKind::RecoveryFile => "recovery_file",
     }
 }
 

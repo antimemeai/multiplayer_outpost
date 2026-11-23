@@ -15,6 +15,7 @@ mod build_info;
 mod cli;
 mod ipc_payloads;
 mod mcp_bridge;
+mod mpkey;
 mod storage;
 
 use std::sync::Arc;

@@ -8,22 +8,27 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
+use std::os::fd::{AsRawFd as _, RawFd};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64U};
 use ed25519_dalek::SigningKey;
 use mp_protocol::{
-    AccountId, DeviceId, MAX_CWT_TTL_SECS, MAX_SAFE_ID, PartyJoinMode, PartyVisibility,
-    RelayPolicy, encode_device_cwt, sha256, verify_device_cwt,
+    AccountId, CwtError, DeviceId, MAX_CWT_TTL_SECS, MAX_SAFE_ID, PartyJoinMode, PartyVisibility,
+    RelayPolicy, compute_device_fingerprint, decode_recovery_key, encode_device_cwt,
+    encode_recovery_key, sha256, validate_ed25519_pubkey_strict, verify_device_cwt,
 };
 use outpost_control::{
-    ControlClient, DEFAULT_API_AUTHORITY, EnrollDeviceRequest, RegisterAccountRequest,
-    RequestSigner, wall_now_ms, wall_now_secs,
+    ControlClient, DEFAULT_API_AUTHORITY, DeviceLinkApproveRequest, DeviceLinkInspectResponse,
+    DeviceLinkPollResponse, EnrollDeviceRequest, RegisterAccountRequest, RequestSigner,
+    wall_now_ms, wall_now_secs,
 };
-use outpost_core::fence::{fence_peer_text, sanitize_peer_text};
+use outpost_core::fence::{
+    contains_device_link_token, contains_recovery_key, fence_peer_text, sanitize_peer_text,
+};
 use outpost_core::ipc_wire::{ClientKind, HelloPayload, IPC_SCHEMA_VER, IpcOpcode};
 use outpost_core::party_state::DEFAULT_POLL_MAX_BYTES;
 use outpost_core::storage_codec::{
@@ -38,6 +43,7 @@ use outpost_daemon::{
     open_or_create_private_dir, read_file_in_dir, resolve_runtime_dir,
 };
 use serde_json::{Value, json};
+use zeroize::Zeroize as _;
 
 use crate::build_info::{
     PKG_VERSION, build_digest, build_order, encode_hex, on_disk_exe_matches_local,
@@ -60,6 +66,7 @@ use crate::ipc_payloads::{
     encode_resolve_handle_req, encode_u64_req, relay_policy_name, trust_state_name,
 };
 use crate::mcp_bridge::build_spawn_command;
+use crate::mpkey::{MAX_PEM_BYTES, decrypt_mpkey, encrypt_mpkey, write_mpkey_atomic_0600};
 use crate::storage::{
     DEFAULT_RELAY_URL, PENDING_DEV_FILE, PENDING_REG_CWT_FILE, PENDING_REG_FILE,
     build_control_client_config, list_enrolled_device_ids, load_device_record, load_peers_store,
@@ -163,10 +170,14 @@ pub fn parse_daemon_subcommand_if_present(
     }))
 }
 
-/// Checks if raw argv invokes `mcp` subcommand and extracts its options.
+/// Checks if raw argv invokes `mcp` stdio proxy subcommand and extracts its options.
+/// `mcp setup ...` is handled as a regular CLI command.
 pub fn parse_mcp_subcommand_if_present(args: &[String]) -> Result<Option<GlobalOpts>, String> {
     let (opts, rest) = extract_global_opts(args)?;
     if rest.first().map(String::as_str) != Some("mcp") {
+        return Ok(None);
+    }
+    if rest.get(1).map(String::as_str) == Some("setup") {
         return Ok(None);
     }
     if rest.len() > 1 {
@@ -180,11 +191,22 @@ pub fn parse_mcp_subcommand_if_present(args: &[String]) -> Result<Option<GlobalO
 
 /// Executes any non-`__daemon`, non-`mcp` CLI command.
 pub async fn run_cli_command(args: &[String]) -> Result<(), String> {
-    // Reject invite tokens anywhere on argv (Spec §6.4: never accept invite secrets on argv).
+    // Reject invite secrets, recovery keys, and device-link poll tokens anywhere on argv!
     for a in args.iter().skip(1) {
         if a.contains("mpinv1_") || a.contains("mppi1_") {
             return Err(
                 "refusing invite secret on argv; pass invite tokens via --invite-stdin only"
+                    .to_string(),
+            );
+        }
+        if a.contains("mpdl1_") || contains_device_link_token(a.as_bytes()) {
+            return Err(
+                "refusing device-link poll token on argv".to_string(),
+            );
+        }
+        if a.to_ascii_lowercase().starts_with("mprk1_") || contains_recovery_key(a.as_bytes()) {
+            return Err(
+                "refusing recovery key on argv; pass recovery keys via --recovery-key-stdin, --root-key-file, --mpkey, or interactive /dev/tty only"
                     .to_string(),
             );
         }
@@ -224,6 +246,9 @@ pub async fn run_cli_command(args: &[String]) -> Result<(), String> {
         "account" => cmd_account(&opts, sub).await,
         "whoami" => cmd_whoami(&opts, sub),
         "device" => cmd_device(&opts, sub).await,
+        "web" => cmd_web(&opts, sub).await,
+        "doctor" => cmd_doctor(&opts, sub).await,
+        "mcp" => cmd_mcp(&opts, sub),
         "peer" => cmd_peer(&opts, sub).await,
         "friend" => cmd_friend(&opts, sub).await,
         "party" => cmd_party(&opts, sub).await,
@@ -244,15 +269,17 @@ Global Flags:\n\
   --device-id <u64>       Select device ID (or OUTPOST_DEVICE_ID)\n\
   --json                  Emit structured JSON output\n\n\
 Commands:\n\
-  account register|rename\n\
+  account register|rename|recovery-key|export-mpkey|recover\n\
   whoami [--safety-number]\n\
-  device init|install-cwt|enroll|renew|revoke\n\
+  device init|install-cwt|enroll|renew|revoke|link <create|join|approve>\n\
+  web approve <XXXX-XXXX>\n\
+  doctor [--api-authority <host>] [--relay-url <url>]\n\
   peer list|trust|revoke\n\
   friend list|add|remove|block\n\
   party create|join|invite|requests|approve|reject|leave|disband|kick|promote|status|list|members|say|read|wait\n\
   board post|read\n\
   daemon status|start|stop|restart|logs\n\
-  mcp"
+  mcp [setup [--client claude|codex|cursor|antigravity|all]]"
     );
 }
 
@@ -311,11 +338,111 @@ fn parse_relay_policy(raw: &str) -> Result<RelayPolicy, String> {
     match raw {
         "allow" | "allow_relays" => Ok(RelayPolicy::AllowRelays),
         "force" | "force_relays" => Ok(RelayPolicy::ForceRelays),
-        "none" | "no_relays" => Ok(RelayPolicy::NoRelays),
+        "no" | "none" | "no_relays" => Ok(RelayPolicy::NoRelays),
         _ => Err(format!(
-            "invalid --relay-policy '{raw}' (expected allow|force|none)"
+            "invalid --relay-policy '{raw}' (expected allow|force|no)"
         )),
     }
+}
+
+fn validate_device_label(label: &str) -> Result<(), String> {
+    if label.is_empty()
+        || label.len() > 64
+        || !label.bytes().all(|b| (0x20..=0x7e).contains(&b))
+    {
+        return Err(
+            "device_label must be 1..=64 printable ASCII characters (0x20..=0x7e)".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn strip_trailing_line_ending(s: &mut String) {
+    if s.ends_with('\n') {
+        s.pop();
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+}
+
+struct TermiosEchoGuard {
+    fd: RawFd,
+    saved: libc::termios,
+}
+
+impl TermiosEchoGuard {
+    fn disable_echo(fd: RawFd) -> Result<Self, String> {
+        let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
+            return Err(format!("tcgetattr failed: {}", io::Error::last_os_error()));
+        }
+        let mut noecho = orig;
+        noecho.c_lflag &= !libc::ECHO;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &noecho) } != 0 {
+            return Err(format!("tcsetattr failed: {}", io::Error::last_os_error()));
+        }
+        Ok(Self { fd, saved: orig })
+    }
+}
+
+impl Drop for TermiosEchoGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved);
+        }
+    }
+}
+
+fn open_interactive_tty(op: &str) -> Result<File, String> {
+    let stdin_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+    let stdout_tty = unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 };
+    if !stdin_tty || !stdout_tty {
+        return Err(format!(
+            "`{op}` requires an interactive terminal (TTY stdin/stdout); headless/piped execution is refused"
+        ));
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|e| format!("failed to open controlling /dev/tty: {e}"))
+}
+
+fn read_secret_from_tty(op: &str, prompt: &str) -> Result<String, String> {
+    let mut tty = open_interactive_tty(op)?;
+    tty.write_all(prompt.as_bytes())
+        .map_err(|e| format!("failed writing to /dev/tty: {e}"))?;
+    tty.flush()
+        .map_err(|e| format!("failed flushing /dev/tty: {e}"))?;
+
+    let mut reader = BufReader::new(
+        tty.try_clone()
+            .map_err(|e| format!("failed cloning /dev/tty handle: {e}"))?,
+    );
+    let _guard = TermiosEchoGuard::disable_echo(tty.as_raw_fd())?;
+    let mut line = String::new();
+    let read_res = reader.read_line(&mut line);
+    drop(_guard);
+    let _ = tty.write_all(b"\n");
+    let _ = tty.flush();
+    read_res.map_err(|e| format!("failed reading from /dev/tty: {e}"))?;
+    strip_trailing_line_ending(&mut line);
+    Ok(line)
+}
+
+fn read_passphrase_from_stdin() -> Result<String, String> {
+    let mut raw = read_all_stdin_trimmed(1024)?;
+    let mut s = match String::from_utf8(raw.clone()) {
+        Ok(text) => text,
+        Err(_) => {
+            raw.zeroize();
+            return Err("passphrase on stdin must be valid UTF-8".to_string());
+        }
+    };
+    raw.zeroize();
+    strip_trailing_line_ending(&mut s);
+    Ok(s)
 }
 
 fn print_json(val: &Value) {
@@ -361,27 +488,40 @@ fn read_all_stdin_trimmed(max_bytes: usize) -> Result<Vec<u8>, String> {
 }
 
 fn read_root_key_file(path: &Path) -> Result<[u8; 32], String> {
-    let raw = std::fs::read(path)
+    let mut raw = std::fs::read(path)
         .map_err(|e| format!("failed to read root key file '{}': {e}", path.display()))?;
     if raw.len() == 32 {
         let mut out = [0u8; 32];
         out.copy_from_slice(&raw);
+        raw.zeroize();
         return Ok(out);
     }
-    let text = core::str::from_utf8(&raw)
-        .map_err(|_| "root key file must be 32 raw bytes or base64/hex text".to_string())?
-        .trim();
-    if let Ok(decoded) = B64.decode(text.as_bytes())
-        && decoded.len() == 32
-    {
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&decoded);
-        return Ok(out);
-    }
-    if let Some(arr) = crate::build_info::decode_hex_32(text) {
-        return Ok(arr);
-    }
-    Err("root key file must contain 32-byte Ed25519 seed (raw, base64, or 64-char hex)".to_string())
+    let res = (|| -> Result<[u8; 32], String> {
+        let text = core::str::from_utf8(&raw)
+            .map_err(|_| {
+                "root key file must be 32 raw bytes, base64, 64-char hex, or mprk1_ recovery key"
+                    .to_string()
+            })?
+            .trim();
+        if let Ok(seed) = decode_recovery_key(text) {
+            return Ok(seed);
+        }
+        if let Ok(mut decoded) = B64.decode(text.as_bytes()) {
+            if decoded.len() == 32 {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&decoded);
+                decoded.zeroize();
+                return Ok(out);
+            }
+            decoded.zeroize();
+        }
+        if let Some(arr) = crate::build_info::decode_hex_32(text) {
+            return Ok(arr);
+        }
+        Err("root key file must contain 32-byte Ed25519 seed (raw, base64, 64-char hex, or mprk1_ recovery key)".to_string())
+    })();
+    raw.zeroize();
+    res
 }
 
 fn write_root_key_file(path: &Path, secret: &[u8; 32]) -> Result<(), String> {
@@ -466,12 +606,18 @@ async fn notify_daemon_reload_if_running(opts: &GlobalOpts, device_id: u64) {
 
 async fn cmd_account(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     let Some(sub) = args.first().map(String::as_str) else {
-        return Err("usage: mp-outpost account <register|rename> ...".to_string());
+        return Err(
+            "usage: mp-outpost account <register|rename|recovery-key|export-mpkey|recover> ..."
+                .to_string(),
+        );
     };
     let rest = args.get(1..).unwrap_or_default();
     match sub {
         "register" => cmd_account_register(opts, rest).await,
         "rename" => cmd_account_rename(opts, rest).await,
+        "recovery-key" => cmd_account_recovery_key(opts, rest),
+        "export-mpkey" => cmd_account_export_mpkey(opts, rest),
+        "recover" => cmd_account_recover(opts, rest).await,
         other => Err(format!("unknown account subcommand '{other}'")),
     }
 }
@@ -510,10 +656,12 @@ async fn cmd_account_register(opts: &GlobalOpts, args: &[String]) -> Result<(), 
         }
     }
 
+    validate_device_label(&device_label)?;
+
     let state_dir_path = resolve_effective_state_dir(opts.state_dir.as_deref())?;
     let state_dir = open_state_dir(&state_dir_path)?;
 
-    let (pending, root_secret, device_cwt) = if resume {
+    let (pending, mut root_secret, device_cwt) = if resume {
         let lock = lock_state(&state_dir)?;
         let pending = load_pending_reg(&state_dir)?
             .ok_or_else(|| "no pending_reg.bin found to resume".to_string())?;
@@ -610,10 +758,14 @@ async fn cmd_account_register(opts: &GlobalOpts, args: &[String]) -> Result<(), 
             .trim()
             .to_string()
     } else {
+        root_secret.zeroize();
         return Err("account register requires --invite-stdin (secrets never accepted on argv)".to_string());
     };
 
-    let cfg = build_control_client_config(&pending.api_authority).map_err(|e| e.to_string())?;
+    let cfg = build_control_client_config(&pending.api_authority).map_err(|e| {
+        root_secret.zeroize();
+        e.to_string()
+    })?;
     let client = ControlClient::new(cfg);
     let idem_str = B64U.encode(pending.idempotency_key);
     let resp = client
@@ -628,8 +780,16 @@ async fn cmd_account_register(opts: &GlobalOpts, args: &[String]) -> Result<(), 
                 device_cwt: device_cwt.clone(),
             },
         )
-        .await
-        .map_err(|e| e.to_string())?;
+        .await;
+    let mut recovery_key = encode_recovery_key(&root_secret);
+    root_secret.zeroize();
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            recovery_key.zeroize();
+            return Err(e.to_string());
+        }
+    };
 
     let dev_rec = DeviceRecord {
         account_id: resp.account_id,
@@ -658,12 +818,445 @@ async fn cmd_account_register(opts: &GlobalOpts, args: &[String]) -> Result<(), 
             "device_id": resp.device_id,
             "handle": resp.handle,
             "safety_number": sn,
+            "recovery_key": recovery_key,
         }));
     } else {
         println!(
-            "Registered account_id={} device_id={} handle={}\nSafety Number: {}",
-            resp.account_id, resp.device_id, resp.handle, sn
+            "Registered account_id={} device_id={} handle=@{}\n\
+             Safety Number: {}\n\n\
+             ========================================================================\n\
+             IMPORTANT — SAVE YOUR RECOVERY KEY NOW:\n  {}\n\
+             Store this Recovery Key in a password manager or offline backup.\n\
+             Anyone with this key controls your account; multiplayer.tech cannot\n\
+             recover it for you. You can also export a passphrase-protected file\n\
+             with `mp-outpost account export-mpkey`.\n\
+             ========================================================================",
+            resp.account_id, resp.device_id, resp.handle, sn, recovery_key
         );
+    }
+    recovery_key.zeroize();
+    Ok(())
+}
+
+fn cmd_account_recovery_key(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let mut root_key_file: Option<PathBuf> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--root-key-file" => {
+                root_key_file = Some(PathBuf::from(next_val(args, &mut i, "--root-key-file")?))
+            }
+            other => return Err(format!("unknown argument to `account recovery-key`: {other}")),
+        }
+    }
+    let root_path = root_key_file
+        .ok_or_else(|| "account recovery-key requires --root-key-file <path>".to_string())?;
+    let mut root_secret = read_root_key_file(&root_path)?;
+    let root_pubkey = SigningKey::from_bytes(&root_secret)
+        .verifying_key()
+        .to_bytes();
+    let mut recovery_key = encode_recovery_key(&root_secret);
+    root_secret.zeroize();
+    let root_pubkey_b64 = B64.encode(root_pubkey);
+
+    if opts.json {
+        print_json(&json!({
+            "recovery_key": recovery_key,
+            "root_pubkey_b64": root_pubkey_b64,
+        }));
+    } else {
+        println!("{recovery_key}");
+    }
+    recovery_key.zeroize();
+    Ok(())
+}
+
+fn cmd_account_export_mpkey(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let mut root_key_file: Option<PathBuf> = None;
+    let mut out_path: Option<PathBuf> = None;
+    let mut account_id: Option<u64> = None;
+    let mut handle: Option<String> = None;
+    let mut passphrase_stdin = false;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--root-key-file" => {
+                root_key_file = Some(PathBuf::from(next_val(args, &mut i, "--root-key-file")?))
+            }
+            "--out" => out_path = Some(PathBuf::from(next_val(args, &mut i, "--out")?)),
+            "--account-id" => {
+                account_id = Some(parse_safe_id(
+                    next_val(args, &mut i, "--account-id")?,
+                    "--account-id",
+                )?)
+            }
+            "--handle" => handle = Some(next_val(args, &mut i, "--handle")?.to_string()),
+            "--passphrase-stdin" => {
+                passphrase_stdin = true;
+                i += 1;
+            }
+            "--passphrase" => {
+                return Err(
+                    "refusing --passphrase on argv; use --passphrase-stdin or interactive /dev/tty"
+                        .to_string(),
+                );
+            }
+            other => return Err(format!("unknown argument to `account export-mpkey`: {other}")),
+        }
+    }
+
+    let root_path = root_key_file
+        .ok_or_else(|| "account export-mpkey requires --root-key-file <path>".to_string())?;
+    let out_path =
+        out_path.ok_or_else(|| "account export-mpkey requires --out <file.mpkey>".to_string())?;
+    let mut root_secret = read_root_key_file(&root_path)?;
+    let root_pubkey = SigningKey::from_bytes(&root_secret)
+        .verifying_key()
+        .to_bytes();
+
+    let mut passphrase = if passphrase_stdin {
+        match read_passphrase_from_stdin() {
+            Ok(p) => p,
+            Err(e) => {
+                root_secret.zeroize();
+                return Err(e);
+            }
+        }
+    } else {
+        let mut p1 = match read_secret_from_tty("account export-mpkey", "Enter passphrase: ") {
+            Ok(p) => p,
+            Err(e) => {
+                root_secret.zeroize();
+                return Err(e);
+            }
+        };
+        let mut p2 = match read_secret_from_tty("account export-mpkey", "Confirm passphrase: ") {
+            Ok(p) => p,
+            Err(e) => {
+                p1.zeroize();
+                root_secret.zeroize();
+                return Err(e);
+            }
+        };
+        let matched = p1 == p2;
+        p2.zeroize();
+        if !matched {
+            p1.zeroize();
+            root_secret.zeroize();
+            return Err("passphrases do not match".to_string());
+        }
+        p1
+    };
+
+    if passphrase.is_empty() {
+        passphrase.zeroize();
+        root_secret.zeroize();
+        return Err("passphrase must not be empty".to_string());
+    }
+    if passphrase.chars().count() < 12 {
+        eprintln!(
+            "WARNING: Passphrase is shorter than 12 characters; consider using a stronger passphrase."
+        );
+    }
+
+    let pem_res = encrypt_mpkey(&root_secret, &passphrase, account_id, handle.as_deref());
+    passphrase.zeroize();
+    root_secret.zeroize();
+    let pem = pem_res?;
+
+    write_mpkey_atomic_0600(&out_path, &pem)?;
+
+    let root_pubkey_b64 = B64.encode(root_pubkey);
+    if opts.json {
+        print_json(&json!({
+            "exported": true,
+            "path": out_path.display().to_string(),
+            "account_id": account_id,
+            "handle": handle,
+            "root_pubkey_b64": root_pubkey_b64,
+        }));
+    } else {
+        println!(
+            "Exported encrypted .mpkey recovery file to '{}' (mode 0600).",
+            out_path.display()
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_account_recover(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let mut recovery_key_stdin = false;
+    let mut mpkey_path: Option<PathBuf> = None;
+    let mut passphrase_stdin = false;
+    let mut root_key_file: Option<PathBuf> = None;
+    let mut device_label: Option<String> = None;
+    let mut root_key_out: Option<PathBuf> = None;
+    let mut relay_policy = RelayPolicy::AllowRelays;
+    let mut api_authority = DEFAULT_API_AUTHORITY.to_string();
+    let mut relay_url = DEFAULT_RELAY_URL.to_string();
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--recovery-key-stdin" => {
+                recovery_key_stdin = true;
+                i += 1;
+            }
+            "--mpkey" => mpkey_path = Some(PathBuf::from(next_val(args, &mut i, "--mpkey")?)),
+            "--passphrase-stdin" => {
+                passphrase_stdin = true;
+                i += 1;
+            }
+            "--root-key-file" => {
+                root_key_file = Some(PathBuf::from(next_val(args, &mut i, "--root-key-file")?))
+            }
+            "--device-label" => {
+                device_label = Some(next_val(args, &mut i, "--device-label")?.to_string())
+            }
+            "--root-key-out" => {
+                root_key_out = Some(PathBuf::from(next_val(args, &mut i, "--root-key-out")?))
+            }
+            "--relay-policy" => {
+                relay_policy = parse_relay_policy(next_val(args, &mut i, "--relay-policy")?)?
+            }
+            "--api-authority" => {
+                api_authority = next_val(args, &mut i, "--api-authority")?.to_string()
+            }
+            "--relay-url" => relay_url = next_val(args, &mut i, "--relay-url")?.to_string(),
+            "--recovery-key" | "--passphrase" => {
+                return Err(format!(
+                    "refusing {a} on argv; use --recovery-key-stdin, --mpkey [--passphrase-stdin], --root-key-file, or interactive /dev/tty"
+                ));
+            }
+            other => return Err(format!("unknown argument to `account recover`: {other}")),
+        }
+    }
+
+    let device_label = device_label
+        .ok_or_else(|| "account recover requires --device-label <name>".to_string())?;
+    validate_device_label(&device_label)?;
+
+    let source_count =
+        usize::from(recovery_key_stdin) + usize::from(mpkey_path.is_some()) + usize::from(root_key_file.is_some());
+    if source_count > 1 {
+        return Err(
+            "specify at most one of --recovery-key-stdin, --mpkey, or --root-key-file".to_string(),
+        );
+    }
+    if passphrase_stdin && mpkey_path.is_none() {
+        return Err("--passphrase-stdin requires --mpkey <path>".to_string());
+    }
+
+    let mut root_secret: [u8; 32] = if recovery_key_stdin {
+        let mut raw = read_all_stdin_trimmed(256)?;
+        let res = core::str::from_utf8(&raw)
+            .map_err(|_| "recovery key on stdin must be valid ASCII/UTF-8".to_string())
+            .and_then(|s| decode_recovery_key(s.trim()).map_err(|e| e.to_string()));
+        raw.zeroize();
+        res?
+    } else if let Some(path) = mpkey_path {
+        let pem = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read .mpkey file '{}': {e}", path.display()))?;
+        if pem.len() > MAX_PEM_BYTES {
+            return Err(format!(
+                ".mpkey file exceeds maximum allowed size ({MAX_PEM_BYTES} bytes)"
+            ));
+        }
+        let mut passphrase = if passphrase_stdin {
+            read_passphrase_from_stdin()?
+        } else {
+            read_secret_from_tty("account recover", "Enter .mpkey passphrase: ")?
+        };
+        let payload_res = decrypt_mpkey(&pem, &passphrase);
+        passphrase.zeroize();
+        let payload = payload_res?;
+        payload.root_seed
+    } else if let Some(path) = root_key_file {
+        read_root_key_file(&path)?
+    } else {
+        let mut rk = read_secret_from_tty("account recover", "Enter Recovery Key (mprk1_...): ")?;
+        let res = decode_recovery_key(rk.trim()).map_err(|e| e.to_string());
+        rk.zeroize();
+        res?
+    };
+
+    let root_sk = SigningKey::from_bytes(&root_secret);
+    let root_pubkey = root_sk.verifying_key().to_bytes();
+
+    let cfg = build_control_client_config(&api_authority).map_err(|e| {
+        root_secret.zeroize();
+        e.to_string()
+    })?;
+    let client = ControlClient::new(cfg);
+
+    let lookup = match client.recover_lookup(root_secret).await {
+        Ok(r) => r,
+        Err(e) => {
+            root_secret.zeroize();
+            return Err(e.to_string());
+        }
+    };
+
+    let srv_root_pk = B64
+        .decode(lookup.root_pubkey_b64.trim().as_bytes())
+        .map_err(|e| {
+            root_secret.zeroize();
+            format!("invalid server root_pubkey_b64: {e}")
+        })?;
+    if srv_root_pk.as_slice() != root_pubkey.as_slice() {
+        root_secret.zeroize();
+        return Err(
+            "REFUSING recovery: server returned a different root_pubkey than local Recovery Key!"
+                .to_string(),
+        );
+    }
+
+    let local_sn = compute_safety_number(lookup.account_id, &root_pubkey);
+    if lookup.safety_number != local_sn {
+        root_secret.zeroize();
+        return Err(format!(
+            "REFUSING recovery: server safety_number '{}' disagrees with locally computed '{local_sn}'!",
+            sanitize_cli_meta(&lookup.safety_number)
+        ));
+    }
+
+    let device_secret = match random_bytes_32() {
+        Ok(b) => b,
+        Err(e) => {
+            root_secret.zeroize();
+            return Err(e);
+        }
+    };
+    let device_pubkey = SigningKey::from_bytes(&device_secret)
+        .verifying_key()
+        .to_bytes();
+    let now_s = wall_now_secs();
+    let device_cwt = match encode_device_cwt(
+        &root_sk,
+        &device_pubkey,
+        now_s,
+        now_s.saturating_add(MAX_CWT_TTL_SECS),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            root_secret.zeroize();
+            return Err(format!("failed signing device CWT: {e}"));
+        }
+    };
+
+    let aid = match AccountId::new(lookup.account_id) {
+        Ok(a) => a,
+        Err(e) => {
+            root_secret.zeroize();
+            return Err(e.to_string());
+        }
+    };
+    let root_signer = RequestSigner::root(aid, root_secret);
+    let enroll_resp = match client
+        .enroll_device(
+            &root_signer,
+            &EnrollDeviceRequest {
+                device_pubkey,
+                device_label: device_label.clone(),
+                device_cwt: device_cwt.clone(),
+            },
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            root_secret.zeroize();
+            return Err(e.to_string());
+        }
+    };
+
+    if let Some(out_path) = root_key_out.as_ref() {
+        if let Err(e) = write_root_key_file(out_path, &root_secret) {
+            root_secret.zeroize();
+            return Err(e);
+        }
+        eprintln!(
+            "WARNING: Root private key written to '{}' (mode 0600). Move it to cold offline storage!",
+            out_path.display()
+        );
+    }
+    root_secret.zeroize();
+
+    let state_dir_path = resolve_effective_state_dir(opts.state_dir.as_deref())?;
+    let state_dir = open_state_dir(&state_dir_path)?;
+    let dev_rec = DeviceRecord {
+        account_id: lookup.account_id,
+        device_id: enroll_resp.device_id,
+        root_pubkey,
+        device_secret,
+        device_pubkey,
+        device_cwt,
+        local_relay_policy: relay_policy,
+        api_authority,
+        default_relay_url: relay_url,
+        device_label,
+    };
+    let lock = lock_state(&state_dir)?;
+    save_device_record(&state_dir_path, &lock, &dev_rec)?;
+    save_default_device_id(&state_dir, &lock, enroll_resp.device_id)?;
+    drop(lock);
+
+    notify_daemon_reload_if_running(opts, enroll_resp.device_id).await;
+
+    let active_existing: Vec<Value> = lookup
+        .devices
+        .iter()
+        .filter(|d| d.revoked_at_ms.is_none())
+        .map(|d| {
+            json!({
+                "device_id": d.device_id,
+                "label": sanitize_cli_meta(&d.label),
+                "cwt_expires_ms": d.cwt_expires_ms,
+                "created_at_ms": d.created_at_ms,
+            })
+        })
+        .collect();
+
+    if opts.json {
+        print_json(&json!({
+            "account_id": lookup.account_id,
+            "handle": lookup.handle,
+            "device_id": enroll_resp.device_id,
+            "cwt_expires_ms": enroll_resp.cwt_expires_ms,
+            "safety_number": local_sn,
+            "active_devices": active_existing,
+        }));
+    } else {
+        println!(
+            "Recovered @{} (account_id={})\nNew device_id: {}\nSafety Number: {}",
+            sanitize_cli_meta(&lookup.handle),
+            lookup.account_id,
+            enroll_resp.device_id,
+            local_sn
+        );
+        let active_list: Vec<_> = lookup
+            .devices
+            .iter()
+            .filter(|d| d.revoked_at_ms.is_none())
+            .collect();
+        if !active_list.is_empty() {
+            println!("\nPreviously active devices on this account:");
+            for d in active_list {
+                println!(
+                    "  - device_id={} label={} (cwt_expires_ms={})",
+                    d.device_id,
+                    sanitize_cli_meta(&d.label),
+                    d.cwt_expires_ms
+                );
+            }
+            println!(
+                "To revoke a lost or stolen machine, run:\n  mp-outpost device revoke --device-id <id> --root-key-file <path>"
+            );
+        }
     }
     Ok(())
 }
@@ -766,7 +1359,7 @@ fn cmd_whoami(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
 async fn cmd_device(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     let Some(sub) = args.first().map(String::as_str) else {
         return Err(
-            "usage: mp-outpost device <init|install-cwt|enroll|renew|revoke> ...".to_string(),
+            "usage: mp-outpost device <init|install-cwt|enroll|renew|revoke|link> ...".to_string(),
         );
     };
     let rest = args.get(1..).unwrap_or_default();
@@ -776,8 +1369,530 @@ async fn cmd_device(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
         "enroll" => cmd_device_enroll(opts, rest).await,
         "renew" => cmd_device_renew(opts, rest).await,
         "revoke" => cmd_device_revoke(opts, rest).await,
+        "link" => cmd_device_link(opts, rest).await,
         other => Err(format!("unknown device subcommand '{other}'")),
     }
+}
+
+async fn cmd_device_link(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let Some(sub) = args.first().map(String::as_str) else {
+        return Err("usage: mp-outpost device link <create|join|approve> ...".to_string());
+    };
+    let rest = args.get(1..).unwrap_or_default();
+    match sub {
+        "create" => cmd_device_link_create(opts, rest).await,
+        "join" => cmd_device_link_join(opts, rest).await,
+        "approve" => cmd_device_link_approve(opts, rest).await,
+        other => Err(format!("unknown device link subcommand '{other}'")),
+    }
+}
+
+async fn cmd_device_link_create(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let mut root_key_file: Option<PathBuf> = None;
+    let mut device_label: Option<String> = None;
+    let mut account_id_opt: Option<u64> = None;
+    let mut api_authority_opt: Option<String> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--root-key-file" => {
+                root_key_file = Some(PathBuf::from(next_val(args, &mut i, "--root-key-file")?))
+            }
+            "--device-label" => {
+                device_label = Some(next_val(args, &mut i, "--device-label")?.to_string())
+            }
+            "--account-id" => {
+                account_id_opt = Some(parse_safe_id(
+                    next_val(args, &mut i, "--account-id")?,
+                    "--account-id",
+                )?)
+            }
+            "--api-authority" => {
+                api_authority_opt = Some(next_val(args, &mut i, "--api-authority")?.to_string())
+            }
+            other => return Err(format!("unknown argument to `device link create`: {other}")),
+        }
+    }
+
+    if let Some(lbl) = device_label.as_deref() {
+        validate_device_label(lbl)?;
+    }
+    let root_path = root_key_file
+        .ok_or_else(|| "device link create requires --root-key-file <path>".to_string())?;
+    let mut root_secret = read_root_key_file(&root_path)?;
+
+    let (account_id, api_authority) = match resolve_account_and_authority(
+        opts,
+        account_id_opt,
+        api_authority_opt.as_deref(),
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            root_secret.zeroize();
+            return Err(e);
+        }
+    };
+
+    let aid = match AccountId::new(account_id) {
+        Ok(a) => a,
+        Err(e) => {
+            root_secret.zeroize();
+            return Err(e.to_string());
+        }
+    };
+    let root_signer = RequestSigner::root(aid, root_secret);
+    root_secret.zeroize();
+
+    let cfg = build_control_client_config(&api_authority).map_err(|e| e.to_string())?;
+    let client = ControlClient::new(cfg);
+    let resp = client
+        .device_link_create(&root_signer, device_label.as_deref())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if opts.json {
+        print_json(&json!({
+            "link_code": resp.link_code,
+            "expires_at_ms": resp.expires_at_ms,
+            "account_id": account_id,
+        }));
+    } else {
+        let safe_code = sanitize_cli_meta(&resp.link_code);
+        println!(
+            "Created device link code: {safe_code} (expires_at_ms={})\n\n\
+             Run this on your new machine:\n  mp-outpost device link join {safe_code} --device-label <name>\n\n\
+             Then approve on this machine:\n  mp-outpost device link approve {safe_code} --root-key-file {} --wait",
+            resp.expires_at_ms,
+            root_path.display()
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_device_link_join(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let link_code = args
+        .first()
+        .map(String::as_str)
+        .filter(|s| !s.starts_with('-'))
+        .ok_or_else(|| {
+            "usage: mp-outpost device link join <XXXX-XXXX> [--device-label <name>] [--relay-policy <allow|force|no>] [--api-authority <host>] [--relay-url <url>] [--timeout-secs <n>]"
+                .to_string()
+        })?
+        .to_string();
+
+    let mut device_label = "outpost".to_string();
+    let mut relay_policy = RelayPolicy::AllowRelays;
+    let mut api_authority = DEFAULT_API_AUTHORITY.to_string();
+    let mut relay_url = DEFAULT_RELAY_URL.to_string();
+    let mut timeout_secs: u64 = 300;
+
+    let mut i = 1usize;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--device-label" => {
+                device_label = next_val(args, &mut i, "--device-label")?.to_string()
+            }
+            "--relay-policy" => {
+                relay_policy = parse_relay_policy(next_val(args, &mut i, "--relay-policy")?)?
+            }
+            "--api-authority" => {
+                api_authority = next_val(args, &mut i, "--api-authority")?.to_string()
+            }
+            "--relay-url" => relay_url = next_val(args, &mut i, "--relay-url")?.to_string(),
+            "--timeout-secs" => {
+                let raw = next_val(args, &mut i, "--timeout-secs")?;
+                timeout_secs = raw
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --timeout-secs '{raw}'"))?;
+                if timeout_secs == 0 || timeout_secs > 600 {
+                    return Err("--timeout-secs must be in 1..=600".to_string());
+                }
+            }
+            other => return Err(format!("unknown argument to `device link join`: {other}")),
+        }
+    }
+
+    validate_device_label(&device_label)?;
+
+    let device_secret = random_bytes_32()?;
+    let device_pubkey = SigningKey::from_bytes(&device_secret)
+        .verifying_key()
+        .to_bytes();
+
+    // ALWAYS compute the 128-bit mpdevfp2: fingerprint LOCALLY (never trust server copy!).
+    let local_fp = compute_device_fingerprint(&device_pubkey);
+
+    let cfg = build_control_client_config(&api_authority).map_err(|e| e.to_string())?;
+    let client = ControlClient::new(cfg);
+
+    let claim = client
+        .device_link_claim(device_secret, &link_code, Some(&device_label))
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if opts.json {
+        eprintln!("Device fingerprint (verify on primary): {local_fp}");
+    } else {
+        println!("Device fingerprint (verify on primary): {local_fp}");
+        println!("Waiting for approval on primary machine...");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let approved = loop {
+        match client
+            .device_link_poll(device_secret, &link_code, &claim.poll_token)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            DeviceLinkPollResponse::Approved {
+                account_id,
+                handle,
+                device_id,
+                root_pubkey_b64,
+                device_cwt_b64,
+                cwt_expires_ms,
+                safety_number,
+            } => {
+                break (
+                    account_id,
+                    handle,
+                    device_id,
+                    root_pubkey_b64,
+                    device_cwt_b64,
+                    cwt_expires_ms,
+                    safety_number,
+                );
+            }
+            DeviceLinkPollResponse::Pending { .. } => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(format!(
+                        "timed out after {timeout_secs}s waiting for primary approval"
+                    ));
+                }
+                let sleep_dur = (deadline - now).min(Duration::from_secs(2));
+                tokio::time::sleep(sleep_dur).await;
+            }
+        }
+    };
+
+    let (
+        account_id,
+        handle,
+        device_id,
+        root_pubkey_b64,
+        device_cwt_b64,
+        cwt_expires_ms,
+        server_sn,
+    ) = approved;
+
+    let root_raw = B64
+        .decode(root_pubkey_b64.trim().as_bytes())
+        .map_err(|e| format!("invalid root_pubkey_b64 from server: {e}"))?;
+    let root_pubkey: [u8; 32] = root_raw
+        .try_into()
+        .map_err(|_| "server root_pubkey_b64 did not decode to 32 bytes".to_string())?;
+    let _ = validate_ed25519_pubkey_strict(&root_pubkey)
+        .map_err(|e| format!("invalid server root_pubkey: {e}"))?;
+
+    let device_cwt = B64
+        .decode(device_cwt_b64.trim().as_bytes())
+        .map_err(|e| format!("invalid device_cwt_b64 from server: {e}"))?;
+
+    // Strictly verify returned CWT against root_pubkey and our own device_pubkey!
+    let _claims = verify_device_cwt(
+        &device_cwt,
+        &root_pubkey,
+        Some(&device_pubkey),
+        wall_now_secs(),
+    )
+    .map_err(|e| format!("REFUSING link completion: CWT verification failed: {e}"))?;
+
+    // Recompute canonical Safety Number locally!
+    let local_sn = compute_safety_number(account_id, &root_pubkey);
+    if !server_sn.is_empty() && server_sn != local_sn {
+        return Err(format!(
+            "REFUSING link completion: server safety_number '{}' disagrees with locally computed '{local_sn}'",
+            sanitize_cli_meta(&server_sn)
+        ));
+    }
+
+    let state_dir_path = resolve_effective_state_dir(opts.state_dir.as_deref())?;
+    let state_dir = open_state_dir(&state_dir_path)?;
+    let dev_rec = DeviceRecord {
+        account_id,
+        device_id,
+        root_pubkey,
+        device_secret,
+        device_pubkey,
+        device_cwt,
+        local_relay_policy: relay_policy,
+        api_authority,
+        default_relay_url: relay_url,
+        device_label,
+    };
+
+    let lock = lock_state(&state_dir)?;
+    save_device_record(&state_dir_path, &lock, &dev_rec)?;
+    save_default_device_id(&state_dir, &lock, device_id)?;
+    drop(lock);
+
+    notify_daemon_reload_if_running(opts, device_id).await;
+
+    if opts.json {
+        print_json(&json!({
+            "linked": true,
+            "account_id": account_id,
+            "handle": handle,
+            "device_id": device_id,
+            "cwt_expires_ms": cwt_expires_ms,
+            "safety_number": local_sn,
+            "device_fingerprint": local_fp,
+        }));
+    } else {
+        println!(
+            "Linked device_id={} to @{} (account_id={})\nSafety Number: {}",
+            device_id,
+            sanitize_cli_meta(&handle),
+            account_id,
+            local_sn
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_device_link_approve(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let link_code = args
+        .first()
+        .map(String::as_str)
+        .filter(|s| !s.starts_with('-'))
+        .ok_or_else(|| {
+            "usage: mp-outpost device link approve <XXXX-XXXX> --root-key-file <path> [--device-label <override>] [--account-id <u64>] [--api-authority <host>] [--wait] [--yes-fingerprint <fp>]"
+                .to_string()
+        })?
+        .to_string();
+
+    let mut root_key_file: Option<PathBuf> = None;
+    let mut device_label_override: Option<String> = None;
+    let mut account_id_opt: Option<u64> = None;
+    let mut api_authority_opt: Option<String> = None;
+    let mut wait = false;
+    let mut yes_fingerprint: Option<String> = None;
+
+    let mut i = 1usize;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--root-key-file" => {
+                root_key_file = Some(PathBuf::from(next_val(args, &mut i, "--root-key-file")?))
+            }
+            "--device-label" => {
+                device_label_override = Some(next_val(args, &mut i, "--device-label")?.to_string())
+            }
+            "--account-id" => {
+                account_id_opt = Some(parse_safe_id(
+                    next_val(args, &mut i, "--account-id")?,
+                    "--account-id",
+                )?)
+            }
+            "--api-authority" => {
+                api_authority_opt = Some(next_val(args, &mut i, "--api-authority")?.to_string())
+            }
+            "--wait" => {
+                wait = true;
+                i += 1;
+            }
+            "--yes-fingerprint" => {
+                yes_fingerprint = Some(next_val(args, &mut i, "--yes-fingerprint")?.to_string())
+            }
+            other => return Err(format!("unknown argument to `device link approve`: {other}")),
+        }
+    }
+
+    if let Some(lbl) = device_label_override.as_deref() {
+        validate_device_label(lbl)?;
+    }
+    let root_path = root_key_file
+        .ok_or_else(|| "device link approve requires --root-key-file <path>".to_string())?;
+    let mut root_secret = read_root_key_file(&root_path)?;
+
+    let (account_id, api_authority) = match resolve_account_and_authority(
+        opts,
+        account_id_opt,
+        api_authority_opt.as_deref(),
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            root_secret.zeroize();
+            return Err(e);
+        }
+    };
+
+    let aid = match AccountId::new(account_id) {
+        Ok(a) => a,
+        Err(e) => {
+            root_secret.zeroize();
+            return Err(e.to_string());
+        }
+    };
+    let root_signer = RequestSigner::root(aid, root_secret);
+    let cfg = match build_control_client_config(&api_authority) {
+        Ok(c) => c,
+        Err(e) => {
+            root_secret.zeroize();
+            return Err(e.to_string());
+        }
+    };
+    let client = ControlClient::new(cfg);
+
+    let wait_deadline = Instant::now() + Duration::from_secs(300);
+    let (device_pubkey_b64, claimed_label, requester_country) = loop {
+        match client.device_link_inspect(&root_signer, &link_code).await {
+            Ok(DeviceLinkInspectResponse::PendingApproval {
+                device_pubkey_b64,
+                device_fingerprint: _ignored_server_fp,
+                device_label,
+                requester_country,
+                ..
+            }) => break (device_pubkey_b64, device_label, requester_country),
+            Ok(DeviceLinkInspectResponse::WaitingForDevice { expires_at_ms, .. }) => {
+                if !wait {
+                    root_secret.zeroize();
+                    return Err(
+                        "link code is waiting for the new device to claim it; pass --wait to poll until claimed"
+                            .to_string(),
+                    );
+                }
+                if wall_now_ms() >= expires_at_ms || Instant::now() >= wait_deadline {
+                    root_secret.zeroize();
+                    return Err("link code expired before new device claimed it".to_string());
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(e) => {
+                root_secret.zeroize();
+                return Err(e.to_string());
+            }
+        }
+    };
+
+    let pub_raw = match B64.decode(device_pubkey_b64.trim().as_bytes()) {
+        Ok(v) => v,
+        Err(e) => {
+            root_secret.zeroize();
+            return Err(format!("invalid device_pubkey_b64 from server: {e}"));
+        }
+    };
+    let device_pubkey: [u8; 32] = match pub_raw.try_into() {
+        Ok(arr) => arr,
+        Err(_) => {
+            root_secret.zeroize();
+            return Err("server device_pubkey_b64 did not decode to 32 bytes".to_string());
+        }
+    };
+    if let Err(e) = validate_ed25519_pubkey_strict(&device_pubkey) {
+        root_secret.zeroize();
+        return Err(format!("invalid claimed device_pubkey: {e}"));
+    }
+
+    // ALWAYS compute the 128-bit mpdevfp2: fingerprint LOCALLY from device_pubkey!
+    let local_fp = compute_device_fingerprint(&device_pubkey);
+    let safe_label = sanitize_cli_meta(&claimed_label);
+    let safe_country = sanitize_cli_meta(&requester_country);
+
+    if let Some(expected_fp) = yes_fingerprint {
+        if expected_fp.trim() != local_fp {
+            root_secret.zeroize();
+            return Err(format!(
+                "REFUSING approval: --yes-fingerprint '{}' does not match locally computed fingerprint '{local_fp}'",
+                sanitize_cli_meta(expected_fp.trim())
+            ));
+        }
+    } else {
+        let mut tty = match open_interactive_tty("device link approve") {
+            Ok(f) => f,
+            Err(e) => {
+                root_secret.zeroize();
+                return Err(format!(
+                    "{e} (or pass exact --yes-fingerprint <local_fp> after verifying on new machine)"
+                ));
+            }
+        };
+        let prompt = format!(
+            "Approve new device link:\n\
+               Device label:        {safe_label}\n\
+               Requester country:   {safe_country}\n\
+               Device fingerprint:  {local_fp}\n\
+             Verify the fingerprint matches the new machine, then type 'yes' to sign its 30-day CWT: "
+        );
+        if let Err(e) = tty.write_all(prompt.as_bytes()).and_then(|_| tty.flush()) {
+            root_secret.zeroize();
+            return Err(format!("failed writing to /dev/tty: {e}"));
+        }
+        let mut reader = match tty.try_clone() {
+            Ok(cloned) => BufReader::new(cloned),
+            Err(e) => {
+                root_secret.zeroize();
+                return Err(format!("failed cloning /dev/tty: {e}"));
+            }
+        };
+        let mut confirm = String::new();
+        if let Err(e) = reader.read_line(&mut confirm) {
+            root_secret.zeroize();
+            return Err(format!("failed reading from /dev/tty: {e}"));
+        }
+        if confirm.trim() != "yes" {
+            root_secret.zeroize();
+            return Err("device link approval aborted by operator".to_string());
+        }
+    }
+
+    let now_s = wall_now_secs();
+    let root_sk = SigningKey::from_bytes(&root_secret);
+    let device_cwt = encode_device_cwt(
+        &root_sk,
+        &device_pubkey,
+        now_s,
+        now_s.saturating_add(MAX_CWT_TTL_SECS),
+    );
+    root_secret.zeroize();
+    let device_cwt = device_cwt.map_err(|e| format!("failed signing device CWT: {e}"))?;
+
+    let resp = client
+        .device_link_approve(
+            &root_signer,
+            &DeviceLinkApproveRequest {
+                link_code,
+                device_pubkey,
+                device_cwt,
+                device_label: device_label_override,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if opts.json {
+        print_json(&json!({
+            "approved": resp.approved,
+            "account_id": resp.account_id,
+            "device_id": resp.device_id,
+            "device_label": resp.device_label,
+            "device_fingerprint": local_fp,
+            "cwt_expires_ms": resp.cwt_expires_ms,
+        }));
+    } else {
+        println!(
+            "Approved device_id={} (label={}, fingerprint={}, cwt_expires_ms={})",
+            resp.device_id,
+            sanitize_cli_meta(&resp.device_label),
+            local_fp,
+            resp.cwt_expires_ms
+        );
+    }
+    Ok(())
 }
 
 fn cmd_device_init(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
@@ -3076,6 +4191,558 @@ async fn wait_daemon_lock_free(
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// `web` Commands
+// ---------------------------------------------------------------------------
+
+async fn cmd_web(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let Some(sub) = args.first().map(String::as_str) else {
+        return Err("usage: mp-outpost web approve <XXXX-XXXX> ...".to_string());
+    };
+    let rest = args.get(1..).unwrap_or_default();
+    match sub {
+        "approve" => cmd_web_approve(opts, rest).await,
+        other => Err(format!("unknown web subcommand '{other}'")),
+    }
+}
+
+async fn cmd_web_approve(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let user_code = args
+        .first()
+        .map(String::as_str)
+        .filter(|s| !s.starts_with('-'))
+        .ok_or_else(|| {
+            "usage: mp-outpost web approve <XXXX-XXXX> [--root-key-file <path>] [--account-id <u64>] [--api-authority <host>] [--yes-browser-fingerprint <hex>]"
+                .to_string()
+        })?
+        .to_string();
+
+    let mut root_key_file: Option<PathBuf> = None;
+    let mut account_id_opt: Option<u64> = None;
+    let mut api_authority_opt: Option<String> = None;
+    let mut yes_browser_fp: Option<String> = None;
+
+    let mut i = 1usize;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--root-key-file" => {
+                root_key_file = Some(PathBuf::from(next_val(args, &mut i, "--root-key-file")?))
+            }
+            "--account-id" => {
+                account_id_opt = Some(parse_safe_id(
+                    next_val(args, &mut i, "--account-id")?,
+                    "--account-id",
+                )?)
+            }
+            "--api-authority" => {
+                api_authority_opt = Some(next_val(args, &mut i, "--api-authority")?.to_string())
+            }
+            "--yes-browser-fingerprint" => {
+                yes_browser_fp =
+                    Some(next_val(args, &mut i, "--yes-browser-fingerprint")?.to_string())
+            }
+            other => return Err(format!("unknown argument to `web approve`: {other}")),
+        }
+    }
+
+    let (signer, api_authority) = if let Some(root_path) = root_key_file {
+        let mut root_secret = read_root_key_file(&root_path)?;
+        let (account_id, authority) = match resolve_account_and_authority(
+            opts,
+            account_id_opt,
+            api_authority_opt.as_deref(),
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                root_secret.zeroize();
+                return Err(e);
+            }
+        };
+        let aid = match AccountId::new(account_id) {
+            Ok(a) => a,
+            Err(e) => {
+                root_secret.zeroize();
+                return Err(e.to_string());
+            }
+        };
+        let s = RequestSigner::root(aid, root_secret);
+        root_secret.zeroize();
+        (s, authority)
+    } else {
+        let state_dir_path = resolve_effective_state_dir(opts.state_dir.as_deref())?;
+        let device_id = resolve_active_device_id(&state_dir_path, opts.device_id)?;
+        let dev = load_device_record(&state_dir_path, device_id)?;
+        let aid = AccountId::new(dev.account_id).map_err(|e| e.to_string())?;
+        let did = DeviceId::new(dev.device_id).map_err(|e| e.to_string())?;
+        let authority = api_authority_opt.unwrap_or(dev.api_authority);
+        (RequestSigner::device(aid, did, dev.device_secret), authority)
+    };
+
+    let cfg = build_control_client_config(&api_authority).map_err(|e| e.to_string())?;
+    let client = ControlClient::new(cfg);
+
+    let inspect = client
+        .web_session_inspect_with_signer(&signer, &user_code)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !inspect.pending {
+        return Err("web session code is not pending approval".to_string());
+    }
+
+    let safe_fp = sanitize_cli_meta(&inspect.browser_fingerprint);
+    let safe_country = sanitize_cli_meta(&inspect.requester_country);
+    let safe_client = sanitize_cli_meta(&inspect.requester_client);
+    let safe_scope = sanitize_cli_meta(&inspect.scope);
+
+    if let Some(expected_fp) = yes_browser_fp {
+        if expected_fp.trim() != inspect.browser_fingerprint.trim() {
+            return Err(format!(
+                "REFUSING web session approval: --yes-browser-fingerprint '{}' does not match '{}'",
+                sanitize_cli_meta(expected_fp.trim()),
+                safe_fp
+            ));
+        }
+    } else {
+        let mut tty = open_interactive_tty("web approve").map_err(|e| {
+            format!("{e} (or pass exact --yes-browser-fingerprint <hex> after verifying in browser)")
+        })?;
+        let prompt = format!(
+            "Approve web portal sign-in:\n\
+               Browser fingerprint: {safe_fp}\n\
+               Requester country:   {safe_country}\n\
+               Requester client:    {safe_client}\n\
+               Scope:               {safe_scope}\n\
+             Verify the browser fingerprint matches your browser, then type 'yes' to approve: "
+        );
+        tty.write_all(prompt.as_bytes())
+            .and_then(|_| tty.flush())
+            .map_err(|e| format!("failed writing to /dev/tty: {e}"))?;
+        let mut reader = BufReader::new(
+            tty.try_clone()
+                .map_err(|e| format!("failed cloning /dev/tty: {e}"))?,
+        );
+        let mut confirm = String::new();
+        reader
+            .read_line(&mut confirm)
+            .map_err(|e| format!("failed reading from /dev/tty: {e}"))?;
+        if confirm.trim() != "yes" {
+            return Err("web session approval aborted by operator".to_string());
+        }
+    }
+
+    let resp = client
+        .web_session_approve_with_signer(&signer, &user_code)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if opts.json {
+        print_json(&json!({
+            "approved": resp.approved,
+            "scope": resp.scope,
+            "account_id": resp.account_id,
+            "approved_device_id": resp.approved_device_id,
+            "approved_by_root": resp.approved_by_root,
+            "browser_fingerprint": resp.browser_fingerprint,
+            "requester_country": resp.requester_country,
+            "requester_client": resp.requester_client,
+        }));
+    } else {
+        println!(
+            "Approved web session for account_id={} (scope={}, browser_fingerprint={}, approved_by_root={})",
+            resp.account_id,
+            sanitize_cli_meta(&resp.scope),
+            sanitize_cli_meta(&resp.browser_fingerprint),
+            resp.approved_by_root
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `doctor` Command (Read-Only Diagnostic Health Report)
+// ---------------------------------------------------------------------------
+
+async fn cmd_doctor(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let mut api_authority_override: Option<String> = None;
+    let mut relay_url_override: Option<String> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--api-authority" => {
+                api_authority_override =
+                    Some(next_val(args, &mut i, "--api-authority")?.to_string())
+            }
+            "--relay-url" => {
+                relay_url_override = Some(next_val(args, &mut i, "--relay-url")?.to_string())
+            }
+            other => return Err(format!("unknown argument to `doctor`: {other}")),
+        }
+    }
+
+    // 1. Binary check
+    let exe_path = std::env::current_exe()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let exe_matches = on_disk_exe_matches_local();
+
+    // 2. Enrolled device check (read-only)
+    let state_dir_res = resolve_effective_state_dir(opts.state_dir.as_deref());
+    let device_opt = state_dir_res.as_ref().ok().and_then(|st_dir| {
+        let dev_id = resolve_active_device_id(st_dir, opts.device_id).ok()?;
+        load_device_record(st_dir, dev_id).ok()
+    });
+
+    let now_s = wall_now_secs();
+    let mut cwt_warning: Option<String> = None;
+    let device_json = if let Some(dev) = device_opt.as_ref() {
+        let sn = compute_safety_number(dev.account_id, &dev.root_pubkey);
+        let (cwt_valid, cwt_remaining_secs, cwt_remaining_days, cwt_status) = match verify_device_cwt(
+            &dev.device_cwt,
+            &dev.root_pubkey,
+            Some(&dev.device_pubkey),
+            now_s,
+        ) {
+            Ok(claims) => {
+                let rem_secs = claims.exp.saturating_sub(now_s);
+                let rem_days = rem_secs / 86_400;
+                if rem_secs < 5 * 86_400 {
+                    cwt_warning = Some(format!(
+                        "Device CWT expires in {rem_days} day(s) ({rem_secs}s); renew with `mp-outpost device renew`"
+                    ));
+                }
+                (true, Some(rem_secs), Some(rem_days), "valid".to_string())
+            }
+            Err(CwtError::Expired) => {
+                cwt_warning = Some(
+                    "Device CWT is EXPIRED; renew with `mp-outpost device renew`".to_string(),
+                );
+                (false, Some(0), Some(0), "expired".to_string())
+            }
+            Err(e) => {
+                cwt_warning = Some(format!("Device CWT invalid: {e}"));
+                (false, None, None, format!("invalid: {e}"))
+            }
+        };
+        json!({
+            "enrolled": true,
+            "account_id": dev.account_id,
+            "device_id": dev.device_id,
+            "api_authority": dev.api_authority,
+            "local_relay_policy": relay_policy_name(dev.local_relay_policy as u8),
+            "default_relay_url": dev.default_relay_url,
+            "safety_number": sn,
+            "cwt_valid": cwt_valid,
+            "cwt_status": cwt_status,
+            "cwt_remaining_secs": cwt_remaining_secs,
+            "cwt_remaining_days": cwt_remaining_days,
+            "cwt_warning": cwt_warning,
+        })
+    } else {
+        json!({ "enrolled": false })
+    };
+
+    // 3. Local daemon probe (strictly read-only, auto_spawn = false)
+    let daemon_json = match connect_daemon_cli(opts, true, false).await {
+        Ok((mut client, _)) => match client.request(IpcOpcode::GetStatus, Vec::new()).await {
+            Ok(raw) => match decode_status_resp(&raw) {
+                Ok(st) => json!({
+                    "running": true,
+                    "daemon_pid": st.daemon_pid,
+                    "daemon_epoch": st.daemon_epoch,
+                    "control_ws_connected": st.control_ws_connected,
+                    "dual_host_churn_alert": st.dual_host_churn_alert,
+                    "active_party_id": st.active_party.as_ref().map(|p| p.party_id),
+                }),
+                Err(e) => json!({ "running": false, "detail": e.to_string() }),
+            },
+            Err(e) => json!({ "running": false, "detail": e.to_string() }),
+        },
+        Err(msg) => json!({ "running": false, "detail": msg }),
+    };
+
+    // 4. Live TLS 1.3 GET /v1/health RTT + clock skew ms
+    let effective_authority = api_authority_override
+        .or_else(|| device_opt.as_ref().map(|d| d.api_authority.clone()))
+        .unwrap_or_else(|| DEFAULT_API_AUTHORITY.to_string());
+    let effective_relay_url = relay_url_override
+        .or_else(|| device_opt.as_ref().map(|d| d.default_relay_url.clone()))
+        .unwrap_or_else(|| DEFAULT_RELAY_URL.to_string());
+
+    let (control_json, relay_json) = match build_control_client_config(&effective_authority) {
+        Ok(cfg) => {
+            let client = ControlClient::new(cfg.with_request_timeout(Duration::from_secs(10)));
+            let t0 = Instant::now();
+            let health_j = match client.health().await {
+                Ok(h) => {
+                    let rtt_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let local_ms = i64::try_from(wall_now_ms()).unwrap_or(i64::MAX);
+                    let server_ms = i64::try_from(h.server_now_ms).unwrap_or(i64::MAX);
+                    let clock_skew_ms = server_ms.saturating_sub(local_ms);
+                    json!({
+                        "ok": h.ok,
+                        "authority": effective_authority,
+                        "rtt_ms": rtt_ms,
+                        "server_now_ms": h.server_now_ms,
+                        "clock_skew_ms": clock_skew_ms,
+                    })
+                }
+                Err(e) => json!({
+                    "ok": false,
+                    "authority": effective_authority,
+                    "error": e.to_string(),
+                }),
+            };
+
+            let relay_j = match client.probe_relay_ping(&effective_relay_url).await {
+                Ok(rtt) => json!({
+                    "ok": true,
+                    "relay_url": effective_relay_url,
+                    "rtt_ms": u64::try_from(rtt.as_millis()).unwrap_or(u64::MAX),
+                }),
+                Err(e) => json!({
+                    "ok": false,
+                    "relay_url": effective_relay_url,
+                    "error": e.to_string(),
+                }),
+            };
+            (health_j, relay_j)
+        }
+        Err(e) => (
+            json!({ "ok": false, "authority": effective_authority, "error": e.to_string() }),
+            json!({ "ok": false, "relay_url": effective_relay_url, "error": e.to_string() }),
+        ),
+    };
+
+    if opts.json {
+        print_json(&json!({
+            "binary": {
+                "version": PKG_VERSION,
+                "exe_path": exe_path,
+                "on_disk_exe_matches_local": exe_matches,
+                "build_order": build_order(),
+                "build_digest": crate::build_info::BUILD_DIGEST_HEX,
+            },
+            "device": device_json,
+            "daemon": daemon_json,
+            "control_plane": control_json,
+            "relay": relay_json,
+        }));
+    } else {
+        println!("mp-outpost doctor (v{PKG_VERSION})");
+        println!("  binary:        {exe_path}");
+        println!("  on_disk_match: {exe_matches}");
+        if let Some(dev) = device_opt.as_ref() {
+            println!("  account_id:    {}", dev.account_id);
+            println!("  device_id:     {}", dev.device_id);
+            println!("  api_authority: {}", dev.api_authority);
+            println!(
+                "  relay_policy:  {}",
+                relay_policy_name(dev.local_relay_policy as u8)
+            );
+            println!(
+                "  safety_number: {}",
+                compute_safety_number(dev.account_id, &dev.root_pubkey)
+            );
+            if let Some(days) = device_json.get("cwt_remaining_days").and_then(Value::as_u64)
+                && let Some(secs) = device_json.get("cwt_remaining_secs").and_then(Value::as_u64)
+            {
+                println!("  cwt_remaining: {days}d ({secs}s)");
+            } else {
+                println!(
+                    "  cwt_status:    {}",
+                    device_json
+                        .get("cwt_status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                );
+            }
+            if let Some(warn) = cwt_warning.as_deref() {
+                println!("  WARNING:       {warn}");
+            }
+        } else {
+            println!("  device:        not enrolled");
+        }
+        if daemon_json.get("running").and_then(Value::as_bool) == Some(true) {
+            println!(
+                "  daemon:        running (pid={}, ws_connected={})",
+                daemon_json
+                    .get("daemon_pid")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                daemon_json
+                    .get("control_ws_connected")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            );
+        } else {
+            println!("  daemon:        stopped");
+        }
+        if control_json.get("ok").and_then(Value::as_bool) == Some(true) {
+            println!(
+                "  control_plane: ok ({}, rtt={}ms, clock_skew={}ms)",
+                effective_authority,
+                control_json
+                    .get("rtt_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                control_json
+                    .get("clock_skew_ms")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+            );
+        } else {
+            println!(
+                "  control_plane: ERROR ({}: {})",
+                effective_authority,
+                control_json
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            );
+        }
+        if relay_json.get("ok").and_then(Value::as_bool) == Some(true) {
+            println!(
+                "  relay_ping:    ok ({}, rtt={}ms)",
+                effective_relay_url,
+                relay_json
+                    .get("rtt_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            );
+        } else {
+            println!(
+                "  relay_ping:    ERROR ({}: {})",
+                effective_relay_url,
+                relay_json
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            );
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `mcp setup` Command
+// ---------------------------------------------------------------------------
+
+fn cmd_mcp(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let Some(sub) = args.first().map(String::as_str) else {
+        return Err("usage: mp-outpost mcp setup [--client claude|codex|cursor|antigravity|all]".to_string());
+    };
+    if sub != "setup" {
+        return Err(format!("unknown mcp subcommand '{sub}'"));
+    }
+    let rest = args.get(1..).unwrap_or_default();
+    let mut client = "all".to_string();
+    let mut i = 0usize;
+    while i < rest.len() {
+        let a = rest.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--client" => client = next_val(rest, &mut i, "--client")?.to_ascii_lowercase(),
+            other => return Err(format!("unknown argument to `mcp setup`: {other}")),
+        }
+    }
+    if !matches!(
+        client.as_str(),
+        "claude" | "codex" | "cursor" | "antigravity" | "all"
+    ) {
+        return Err(format!(
+            "invalid --client '{client}' (expected claude|codex|cursor|antigravity|all)"
+        ));
+    }
+
+    let bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "mp-outpost".to_string());
+
+    let stdio_json = json!({
+        "mcpServers": {
+            "multiplayer": {
+                "command": bin,
+                "args": ["mcp"]
+            }
+        }
+    });
+    let claude_cmd = format!("claude mcp add multiplayer -- {bin} mcp");
+    let codex_cmd = format!("codex mcp add multiplayer -- {bin} mcp");
+    let codex_toml = format!(
+        "[mcp_servers.multiplayer]\ncommand = {bin:?}\nargs = [\"mcp\"]"
+    );
+
+    if opts.json {
+        let mut configs = serde_json::Map::new();
+        if client == "all" || client == "claude" {
+            configs.insert(
+                "claude".to_string(),
+                json!({
+                    "command": claude_cmd,
+                    "mcp_json": stdio_json,
+                }),
+            );
+        }
+        if client == "all" || client == "codex" {
+            configs.insert(
+                "codex".to_string(),
+                json!({
+                    "command": codex_cmd,
+                    "config_toml": codex_toml,
+                }),
+            );
+        }
+        if client == "all" || client == "cursor" {
+            configs.insert(
+                "cursor".to_string(),
+                json!({
+                    "config_path": ".cursor/mcp.json",
+                    "mcp_json": stdio_json,
+                }),
+            );
+        }
+        if client == "all" || client == "antigravity" {
+            configs.insert(
+                "antigravity".to_string(),
+                json!({
+                    "mcp_json": stdio_json,
+                }),
+            );
+        }
+        print_json(&json!({
+            "binary": bin,
+            "client": client,
+            "configs": Value::Object(configs),
+        }));
+        return Ok(());
+    }
+
+    let pretty_json = serde_json::to_string_pretty(&stdio_json).unwrap_or_default();
+    if client == "all" || client == "claude" {
+        println!("=== Claude Code ===");
+        println!("Run:\n  {claude_cmd}\n");
+        println!("Or add to .mcp.json:\n{pretty_json}\n");
+    }
+    if client == "all" || client == "codex" {
+        println!("=== Codex CLI ===");
+        println!("Run:\n  {codex_cmd}\n");
+        println!("Or add to ~/.codex/config.toml:\n{codex_toml}\n");
+    }
+    if client == "all" || client == "cursor" {
+        println!("=== Cursor ===");
+        println!("Add to .cursor/mcp.json (or ~/.cursor/mcp.json):\n{pretty_json}\n");
+    }
+    if client == "all" || client == "antigravity" {
+        println!("=== Antigravity ===");
+        println!("Add to your MCP server configuration:\n{pretty_json}\n");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

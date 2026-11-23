@@ -5,7 +5,7 @@ use core::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as B64_STD, URL_SAFE_NO_PAD as B64_URL};
@@ -102,7 +102,8 @@ impl From<Rfc9421Error> for ControlError {
 }
 
 /// Ed25519 request-signing identity (`<account_id>.<device_id>`, `<account_id>.root`,
-/// or `reg.<sha256(root_pubkey)[..16]>`).
+/// `reg.<sha256(root_pubkey)[..16]>`, `rec.<sha256(root_pubkey)[..16]>`,
+/// or `link.<sha256(device_pubkey)[..16]>`).
 #[derive(Clone)]
 pub struct RequestSigner {
     key_id: KeyId,
@@ -115,6 +116,15 @@ impl fmt::Debug for RequestSigner {
             .field("key_id", &self.key_id)
             .finish_non_exhaustive()
     }
+}
+
+fn sha256_prefix16(pubkey: &[u8; 32]) -> [u8; 16] {
+    let digest = sha256(pubkey);
+    let mut prefix = [0u8; 16];
+    if let Some(head) = digest.get(..16) {
+        prefix.copy_from_slice(head);
+    }
+    prefix
 }
 
 impl RequestSigner {
@@ -141,14 +151,33 @@ impl RequestSigner {
     pub fn registration(root_secret: [u8; 32]) -> Self {
         let signing_key = SigningKey::from_bytes(&root_secret);
         let pubkey = signing_key.verifying_key().to_bytes();
-        let digest = sha256(&pubkey);
-        let mut prefix = [0u8; 16];
-        if let Some(head) = digest.get(..16) {
-            prefix.copy_from_slice(head);
-        }
         Self {
             key_id: KeyId::Registration {
-                root_pubkey_sha256_prefix: prefix,
+                root_pubkey_sha256_prefix: sha256_prefix16(&pubkey),
+            },
+            signing_key,
+        }
+    }
+
+    /// Creates an account recovery lookup signer (`rec.<sha256(root_pubkey)[..16]>`).
+    pub fn recovery(root_secret: [u8; 32]) -> Self {
+        let signing_key = SigningKey::from_bytes(&root_secret);
+        let pubkey = signing_key.verifying_key().to_bytes();
+        Self {
+            key_id: KeyId::Recovery {
+                root_pubkey_sha256_prefix: sha256_prefix16(&pubkey),
+            },
+            signing_key,
+        }
+    }
+
+    /// Creates a device-link PoP signer (`link.<sha256(device_pubkey)[..16]>`).
+    pub fn device_link(device_secret: [u8; 32]) -> Self {
+        let signing_key = SigningKey::from_bytes(&device_secret);
+        let pubkey = signing_key.verifying_key().to_bytes();
+        Self {
+            key_id: KeyId::DeviceLink {
+                device_pubkey_sha256_prefix: sha256_prefix16(&pubkey),
             },
             signing_key,
         }
@@ -510,129 +539,19 @@ impl ControlClient {
         signed: Option<&SignedHeaders>,
         idempotency_key: Option<&str>,
     ) -> Result<RawHttpResponse, ControlError> {
-        let timeout = self.config.request_timeout;
-        tokio::time::timeout(timeout, async {
-            let tls = connect_tls13(
-                &self.config.authority,
-                self.config.connect_addr,
-                &self.config.tls_config,
-                timeout,
-            )
-            .await?;
-
-            let io = TokioIo::new(tls);
-            let mut h1 = hyper::client::conn::http1::Builder::new();
-            h1.max_buf_size(MAX_RESPONSE_HEADERS_BYTES + MAX_RESPONSE_BODY_BYTES);
-            let (mut sender, conn) = h1.handshake(io).await.map_err(ControlError::Http)?;
-
-            let _conn_guard = AbortOnDrop(tokio::spawn(async move {
-                let _ = conn.await;
-            }));
-
-            let uri = if query.len() > 1 {
-                format!("{path}{query}")
-            } else {
-                path.to_owned()
-            };
-
-            let canonical_authority = canonicalize_authority(&self.config.authority)?;
-
-            let mut req_builder = Request::builder()
-                .method(to_http_method(method))
-                .uri(&uri)
-                .header(http::header::HOST, &canonical_authority)
-                .header(http::header::CONNECTION, "close");
-
-            if let Some(s) = signed {
-                req_builder = req_builder
-                    .header(
-                        HeaderName::from_static("signature-input"),
-                        HeaderValue::from_str(&s.signature_input).map_err(|e| {
-                            ControlError::InvalidRequest(format!("invalid Signature-Input: {e}"))
-                        })?,
-                    )
-                    .header(
-                        HeaderName::from_static("signature"),
-                        HeaderValue::from_str(&s.signature).map_err(|e| {
-                            ControlError::InvalidRequest(format!("invalid Signature: {e}"))
-                        })?,
-                    );
-                if let Some(ct) = s.content_type {
-                    req_builder = req_builder.header(http::header::CONTENT_TYPE, ct);
-                }
-                if let Some(cd) = &s.content_digest {
-                    req_builder = req_builder.header(
-                        HeaderName::from_static("content-digest"),
-                        HeaderValue::from_str(cd).map_err(|e| {
-                            ControlError::InvalidRequest(format!("invalid Content-Digest: {e}"))
-                        })?,
-                    );
-                }
-            }
-
-            if let Some(idem) = idempotency_key {
-                req_builder = req_builder.header(
-                    HeaderName::from_static("idempotency-key"),
-                    HeaderValue::from_str(idem).map_err(|_| ControlError::InvalidIdempotencyKey)?,
-                );
-            }
-
-            let req = req_builder
-                .body(Full::new(body))
-                .map_err(|e| ControlError::InvalidRequest(e.to_string()))?;
-
-            let resp = sender.send_request(req).await.map_err(ControlError::Http)?;
-            let status = resp.status();
-
-            if status.is_redirection() {
-                return Err(ControlError::UnexpectedRedirect {
-                    status: status.as_u16(),
-                });
-            }
-
-            let mut header_bytes: usize = 0;
-            for (name, value) in resp.headers() {
-                header_bytes = header_bytes
-                    .saturating_add(name.as_str().len())
-                    .saturating_add(value.as_bytes().len())
-                    .saturating_add(4);
-                if header_bytes > MAX_RESPONSE_HEADERS_BYTES {
-                    return Err(ControlError::ResponseHeadersTooLarge);
-                }
-            }
-
-            if let Some(cl_val) = resp.headers().get(http::header::CONTENT_LENGTH) {
-                let parsed = cl_val
-                    .to_str()
-                    .ok()
-                    .and_then(|s| s.trim().parse::<usize>().ok());
-                match parsed {
-                    Some(n) if n <= MAX_RESPONSE_BODY_BYTES => {}
-                    _ => {
-                        return Err(ControlError::ResponseTooLarge);
-                    }
-                }
-            }
-
-            let mut incoming = resp.into_body();
-            let mut buf = BytesMut::new();
-            while let Some(frame_res) = incoming.frame().await {
-                let frame = frame_res.map_err(ControlError::Http)?;
-                if let Some(data) = frame.data_ref() {
-                    if buf.len().saturating_add(data.len()) > MAX_RESPONSE_BODY_BYTES {
-                        return Err(ControlError::ResponseTooLarge);
-                    }
-                    buf.extend_from_slice(data);
-                }
-            }
-
-            Ok(RawHttpResponse {
-                status: status.as_u16(),
-                body: buf.freeze(),
-            })
-        })
+        send_http1_raw(
+            &self.config.authority,
+            self.config.connect_addr,
+            &self.config.tls_config,
+            self.config.request_timeout,
+            method,
+            path,
+            query,
+            body,
+            signed,
+            idempotency_key,
+        )
         .await
-        .map_err(|_| ControlError::Timeout)?
     }
 
     fn decode_json_response<T: serde::de::DeserializeOwned>(
@@ -1087,6 +1006,447 @@ impl ControlClient {
             .await?;
         Self::decode_json_response(resp, &[200])
     }
+
+    // -----------------------------------------------------------------------
+    // Identity Portability & Web Portal Endpoints
+    // -----------------------------------------------------------------------
+
+    /// `POST /v1/accounts/recover-lookup` (`rec.<sha256(root_pubkey)[..16]>` PoP).
+    pub async fn recover_lookup(
+        &self,
+        root_secret: [u8; 32],
+    ) -> Result<RecoverLookupResponse, ControlError> {
+        let signer = RequestSigner::recovery(root_secret);
+        let root_pubkey = signer.verifying_pubkey();
+        let body = encode_json(&RecoverLookupWire {
+            root_pubkey_b64: B64_STD.encode(root_pubkey),
+        })?;
+        let resp = self
+            .execute_signed(
+                &signer,
+                HttpMethod::Post,
+                "/v1/accounts/recover-lookup",
+                "?",
+                body,
+                None,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
+    /// `POST /v1/web-sessions/inspect` (using the client's device signer).
+    pub async fn web_session_inspect(
+        &self,
+        user_code: &str,
+    ) -> Result<WebSessionInspectResponse, ControlError> {
+        let signer = self.require_device_signer()?;
+        self.web_session_inspect_with_signer(signer, user_code)
+            .await
+    }
+
+    /// `POST /v1/web-sessions/inspect` with an explicit device or `.root` signer.
+    pub async fn web_session_inspect_with_signer(
+        &self,
+        signer: &RequestSigner,
+        user_code: &str,
+    ) -> Result<WebSessionInspectResponse, ControlError> {
+        require_device_or_root_signer(signer)?;
+        let body = encode_json(&WebSessionCodeWire { user_code })?;
+        let resp = self
+            .execute_signed(
+                signer,
+                HttpMethod::Post,
+                "/v1/web-sessions/inspect",
+                "?",
+                body,
+                None,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
+    /// `POST /v1/web-sessions/approve` (using the client's device signer).
+    pub async fn web_session_approve(
+        &self,
+        user_code: &str,
+    ) -> Result<WebSessionApproveResponse, ControlError> {
+        let signer = self.require_device_signer()?;
+        self.web_session_approve_with_signer(signer, user_code)
+            .await
+    }
+
+    /// `POST /v1/web-sessions/approve` with an explicit device or `.root` signer.
+    pub async fn web_session_approve_with_signer(
+        &self,
+        signer: &RequestSigner,
+        user_code: &str,
+    ) -> Result<WebSessionApproveResponse, ControlError> {
+        require_device_or_root_signer(signer)?;
+        let body = encode_json(&WebSessionCodeWire { user_code })?;
+        let resp = self
+            .execute_signed(
+                signer,
+                HttpMethod::Post,
+                "/v1/web-sessions/approve",
+                "?",
+                body,
+                None,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
+    /// `POST /v1/device-links/create` (`.root` required).
+    pub async fn device_link_create(
+        &self,
+        root_signer: &RequestSigner,
+        device_label: Option<&str>,
+    ) -> Result<DeviceLinkCreateResponse, ControlError> {
+        require_root_signer(root_signer)?;
+        let body = encode_json(&DeviceLinkCreateWire { device_label })?;
+        let resp = self
+            .execute_signed(
+                root_signer,
+                HttpMethod::Post,
+                "/v1/device-links/create",
+                "?",
+                body,
+                None,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[201])
+    }
+
+    /// `POST /v1/device-links/claim` (`link.<sha256(device_pubkey)[..16]>` PoP).
+    pub async fn device_link_claim(
+        &self,
+        device_secret: [u8; 32],
+        link_code: &str,
+        device_label: Option<&str>,
+    ) -> Result<DeviceLinkClaimResponse, ControlError> {
+        let signer = RequestSigner::device_link(device_secret);
+        let device_pubkey = signer.verifying_pubkey();
+        let body = encode_json(&DeviceLinkClaimWire {
+            link_code,
+            device_pubkey_b64: B64_STD.encode(device_pubkey),
+            device_label,
+        })?;
+        let resp = self
+            .execute_signed(
+                &signer,
+                HttpMethod::Post,
+                "/v1/device-links/claim",
+                "?",
+                body,
+                None,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
+    /// `POST /v1/device-links/inspect` (`.root` required).
+    pub async fn device_link_inspect(
+        &self,
+        root_signer: &RequestSigner,
+        link_code: &str,
+    ) -> Result<DeviceLinkInspectResponse, ControlError> {
+        require_root_signer(root_signer)?;
+        let body = encode_json(&DeviceLinkInspectWire { link_code })?;
+        let resp = self
+            .execute_signed(
+                root_signer,
+                HttpMethod::Post,
+                "/v1/device-links/inspect",
+                "?",
+                body,
+                None,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
+    /// `POST /v1/device-links/approve` (`.root` required).
+    pub async fn device_link_approve(
+        &self,
+        root_signer: &RequestSigner,
+        req: &DeviceLinkApproveRequest,
+    ) -> Result<DeviceLinkApproveResponse, ControlError> {
+        require_root_signer(root_signer)?;
+        let body = encode_json(&DeviceLinkApproveWire {
+            link_code: &req.link_code,
+            device_pubkey_b64: B64_STD.encode(req.device_pubkey),
+            device_cwt_b64: B64_STD.encode(&req.device_cwt),
+            device_label: req.device_label.as_deref(),
+        })?;
+        let resp = self
+            .execute_signed(
+                root_signer,
+                HttpMethod::Post,
+                "/v1/device-links/approve",
+                "?",
+                body,
+                None,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
+    /// `POST /v1/device-links/poll` (`link.<sha256(device_pubkey)[..16]>` PoP).
+    ///
+    /// Handles both `202 Accepted` (`Pending`) and `200 OK` (`Approved`).
+    pub async fn device_link_poll(
+        &self,
+        device_secret: [u8; 32],
+        link_code: &str,
+        poll_token: &str,
+    ) -> Result<DeviceLinkPollResponse, ControlError> {
+        let signer = RequestSigner::device_link(device_secret);
+        let device_pubkey = signer.verifying_pubkey();
+        let body = encode_json(&DeviceLinkPollWire {
+            link_code,
+            poll_token,
+            device_pubkey_b64: B64_STD.encode(device_pubkey),
+        })?;
+        let resp = self
+            .execute_signed(
+                &signer,
+                HttpMethod::Post,
+                "/v1/device-links/poll",
+                "?",
+                body,
+                None,
+            )
+            .await?;
+        let status = resp.status;
+        let decoded: DeviceLinkPollResponse = Self::decode_json_response(resp, &[200, 202])?;
+        match (&decoded, status) {
+            (DeviceLinkPollResponse::Pending { .. }, 202)
+            | (DeviceLinkPollResponse::Approved { .. }, 200) => Ok(decoded),
+            _ => Err(ControlError::InvalidJsonResponse(format!(
+                "unexpected HTTP {status} for device_link_poll response status"
+            ))),
+        }
+    }
+
+    /// Probes `<relay_url>/ping` over TLS 1.3 + HTTP/1.1 using this client's TLS config and
+    /// timeout, returning the measured round-trip duration on HTTP 200 or 204.
+    pub async fn probe_relay_ping(&self, relay_url: &str) -> Result<Duration, ControlError> {
+        let trimmed = relay_url.trim_end_matches('/');
+        let Some(after_scheme) = trimmed.strip_prefix("https://") else {
+            return Err(ControlError::InvalidRequest(
+                "relay_url must be a valid https:// origin".to_owned(),
+            ));
+        };
+        if after_scheme.contains('/') || after_scheme.contains('?') || after_scheme.contains('#') {
+            return Err(ControlError::InvalidRequest(
+                "relay_url must be an origin without path, query, or fragment".to_owned(),
+            ));
+        }
+        let ping_url = format!("{trimmed}/ping");
+        let (status, rtt) = probe_https_get_with_transport(
+            &ping_url,
+            &self.config.tls_config,
+            self.config.connect_addr,
+            self.config.request_timeout,
+        )
+        .await?;
+        if status == 200 || status == 204 {
+            Ok(rtt)
+        } else {
+            Err(ControlError::Api {
+                status,
+                error: format!("relay_ping_http_{status}"),
+                server_now_ms: None,
+                retry_after_ms: None,
+                raw_body: String::new(),
+            })
+        }
+    }
+}
+
+/// Performs an unsigned TLS 1.3-only HTTP/1.1 `GET` probe against an `https://` URL
+/// (for example `https://relay.multiplayer.tech/ping`) and returns `(http_status, rtt)`.
+pub async fn probe_https_get(
+    url: &str,
+    timeout: Duration,
+) -> Result<(u16, Duration), ControlError> {
+    let tls_config = default_tls13_client_config()?;
+    probe_https_get_with_transport(url, &tls_config, None, timeout).await
+}
+
+async fn probe_https_get_with_transport(
+    url: &str,
+    tls_config: &Arc<rustls::ClientConfig>,
+    connect_addr: Option<SocketAddr>,
+    timeout: Duration,
+) -> Result<(u16, Duration), ControlError> {
+    let (canonical_authority, path) = parse_https_url(url)?;
+    let started = Instant::now();
+    let resp = send_http1_raw(
+        &canonical_authority,
+        connect_addr,
+        tls_config,
+        timeout,
+        HttpMethod::Get,
+        &path,
+        "?",
+        Bytes::new(),
+        None,
+        None,
+    )
+    .await?;
+    Ok((resp.status, started.elapsed()))
+}
+
+fn parse_https_url(url: &str) -> Result<(String, String), ControlError> {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return Err(ControlError::InvalidRequest(
+            "probe URL must start with https://".to_owned(),
+        ));
+    };
+    if rest.contains('?') || rest.contains('#') {
+        return Err(ControlError::InvalidRequest(
+            "probe URL must not contain query or fragment".to_owned(),
+        ));
+    }
+    let (raw_authority, path) = match rest.split_once('/') {
+        Some((auth, tail)) => (auth, format!("/{tail}")),
+        None => (rest, "/".to_owned()),
+    };
+    let canonical_authority = canonicalize_authority(raw_authority)?;
+    validate_path_and_query(HttpMethod::Get, &path, "?")?;
+    Ok((canonical_authority, path))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_http1_raw(
+    authority: &str,
+    connect_addr: Option<SocketAddr>,
+    tls_config: &Arc<rustls::ClientConfig>,
+    timeout: Duration,
+    method: HttpMethod,
+    path: &str,
+    query: &str,
+    body: Bytes,
+    signed: Option<&SignedHeaders>,
+    idempotency_key: Option<&str>,
+) -> Result<RawHttpResponse, ControlError> {
+    tokio::time::timeout(timeout, async {
+        let tls = connect_tls13(authority, connect_addr, tls_config, timeout).await?;
+
+        let io = TokioIo::new(tls);
+        let mut h1 = hyper::client::conn::http1::Builder::new();
+        h1.max_buf_size(MAX_RESPONSE_HEADERS_BYTES + MAX_RESPONSE_BODY_BYTES);
+        let (mut sender, conn) = h1.handshake(io).await.map_err(ControlError::Http)?;
+
+        let _conn_guard = AbortOnDrop(tokio::spawn(async move {
+            let _ = conn.await;
+        }));
+
+        let uri = if query.len() > 1 {
+            format!("{path}{query}")
+        } else {
+            path.to_owned()
+        };
+
+        let canonical_authority = canonicalize_authority(authority)?;
+
+        let mut req_builder = Request::builder()
+            .method(to_http_method(method))
+            .uri(&uri)
+            .header(http::header::HOST, &canonical_authority)
+            .header(http::header::CONNECTION, "close");
+
+        if let Some(s) = signed {
+            req_builder = req_builder
+                .header(
+                    HeaderName::from_static("signature-input"),
+                    HeaderValue::from_str(&s.signature_input).map_err(|e| {
+                        ControlError::InvalidRequest(format!("invalid Signature-Input: {e}"))
+                    })?,
+                )
+                .header(
+                    HeaderName::from_static("signature"),
+                    HeaderValue::from_str(&s.signature).map_err(|e| {
+                        ControlError::InvalidRequest(format!("invalid Signature: {e}"))
+                    })?,
+                );
+            if let Some(ct) = s.content_type {
+                req_builder = req_builder.header(http::header::CONTENT_TYPE, ct);
+            }
+            if let Some(cd) = &s.content_digest {
+                req_builder = req_builder.header(
+                    HeaderName::from_static("content-digest"),
+                    HeaderValue::from_str(cd).map_err(|e| {
+                        ControlError::InvalidRequest(format!("invalid Content-Digest: {e}"))
+                    })?,
+                );
+            }
+        }
+
+        if let Some(idem) = idempotency_key {
+            req_builder = req_builder.header(
+                HeaderName::from_static("idempotency-key"),
+                HeaderValue::from_str(idem).map_err(|_| ControlError::InvalidIdempotencyKey)?,
+            );
+        }
+
+        let req = req_builder
+            .body(Full::new(body))
+            .map_err(|e| ControlError::InvalidRequest(e.to_string()))?;
+
+        let resp = sender.send_request(req).await.map_err(ControlError::Http)?;
+        let status = resp.status();
+
+        if status.is_redirection() {
+            return Err(ControlError::UnexpectedRedirect {
+                status: status.as_u16(),
+            });
+        }
+
+        let mut header_bytes: usize = 0;
+        for (name, value) in resp.headers() {
+            header_bytes = header_bytes
+                .saturating_add(name.as_str().len())
+                .saturating_add(value.as_bytes().len())
+                .saturating_add(4);
+            if header_bytes > MAX_RESPONSE_HEADERS_BYTES {
+                return Err(ControlError::ResponseHeadersTooLarge);
+            }
+        }
+
+        if let Some(cl_val) = resp.headers().get(http::header::CONTENT_LENGTH) {
+            let parsed = cl_val
+                .to_str()
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok());
+            match parsed {
+                Some(n) if n <= MAX_RESPONSE_BODY_BYTES => {}
+                _ => {
+                    return Err(ControlError::ResponseTooLarge);
+                }
+            }
+        }
+
+        let mut incoming = resp.into_body();
+        let mut buf = BytesMut::new();
+        while let Some(frame_res) = incoming.frame().await {
+            let frame = frame_res.map_err(ControlError::Http)?;
+            if let Some(data) = frame.data_ref() {
+                if buf.len().saturating_add(data.len()) > MAX_RESPONSE_BODY_BYTES {
+                    return Err(ControlError::ResponseTooLarge);
+                }
+                buf.extend_from_slice(data);
+            }
+        }
+
+        Ok(RawHttpResponse {
+            status: status.as_u16(),
+            body: buf.freeze(),
+        })
+    })
+    .await
+    .map_err(|_| ControlError::Timeout)?
 }
 
 fn require_root_signer(signer: &RequestSigner) -> Result<(), ControlError> {
@@ -1095,6 +1455,16 @@ fn require_root_signer(signer: &RequestSigner) -> Result<(), ControlError> {
     } else {
         Err(ControlError::InvalidRequest(
             "endpoint requires a .root RequestSigner".to_owned(),
+        ))
+    }
+}
+
+fn require_device_or_root_signer(signer: &RequestSigner) -> Result<(), ControlError> {
+    if matches!(signer.key_id(), KeyId::Device { .. } | KeyId::Root { .. }) {
+        Ok(())
+    } else {
+        Err(ControlError::InvalidRequest(
+            "endpoint requires a device or .root RequestSigner".to_owned(),
         ))
     }
 }
@@ -1511,4 +1881,153 @@ struct RejectPartyRequestWire {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RejectPartyRequestResponse {
     pub rejected: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Identity Portability & Web Portal Request / Response Models
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct RecoverLookupWire {
+    root_pubkey_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RecoverLookupResponse {
+    pub account_id: u64,
+    pub handle: String,
+    pub root_pubkey_b64: String,
+    pub safety_number: String,
+    pub devices: Vec<AccountDeviceInfo>,
+}
+
+#[derive(Serialize)]
+struct WebSessionCodeWire<'a> {
+    user_code: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WebSessionInspectResponse {
+    pub pending: bool,
+    pub scope: String,
+    pub browser_fingerprint: String,
+    pub requester_country: String,
+    pub requester_client: String,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WebSessionApproveResponse {
+    pub approved: bool,
+    pub scope: String,
+    pub account_id: u64,
+    pub approved_device_id: Option<u64>,
+    pub approved_by_root: bool,
+    pub browser_fingerprint: String,
+    pub requester_country: String,
+    pub requester_client: String,
+}
+
+#[derive(Serialize)]
+struct DeviceLinkCreateWire<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_label: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DeviceLinkCreateResponse {
+    pub link_code: String,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Serialize)]
+struct DeviceLinkClaimWire<'a> {
+    link_code: &'a str,
+    device_pubkey_b64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_label: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DeviceLinkClaimResponse {
+    pub poll_token: String,
+    pub device_fingerprint: String,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Serialize)]
+struct DeviceLinkInspectWire<'a> {
+    link_code: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "state")]
+pub enum DeviceLinkInspectResponse {
+    #[serde(rename = "waiting_for_device")]
+    WaitingForDevice {
+        suggested_label: String,
+        created_at_ms: u64,
+        expires_at_ms: u64,
+    },
+    #[serde(rename = "pending_approval")]
+    PendingApproval {
+        device_pubkey_b64: String,
+        device_fingerprint: String,
+        device_label: String,
+        requester_country: String,
+        created_at_ms: u64,
+        expires_at_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceLinkApproveRequest {
+    pub link_code: String,
+    pub device_pubkey: [u8; 32],
+    pub device_cwt: Vec<u8>,
+    pub device_label: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DeviceLinkApproveWire<'a> {
+    link_code: &'a str,
+    device_pubkey_b64: String,
+    device_cwt_b64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_label: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DeviceLinkApproveResponse {
+    pub approved: bool,
+    pub account_id: u64,
+    pub device_id: u64,
+    pub device_label: String,
+    pub device_fingerprint: String,
+    pub cwt_expires_ms: u64,
+}
+
+#[derive(Serialize)]
+struct DeviceLinkPollWire<'a> {
+    link_code: &'a str,
+    poll_token: &'a str,
+    device_pubkey_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DeviceLinkPollResponse {
+    Pending {
+        expires_at_ms: u64,
+    },
+    Approved {
+        account_id: u64,
+        handle: String,
+        device_id: u64,
+        root_pubkey_b64: String,
+        device_cwt_b64: String,
+        cwt_expires_ms: u64,
+        safety_number: String,
+    },
 }

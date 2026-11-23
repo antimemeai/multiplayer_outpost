@@ -1223,4 +1223,159 @@ fn gate1_ipc_wire_rejects_zero_and_oversized_request_ids() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 10. v0.2.0 Identity Portability Golden Vectors & Outbound Secret Guard
+// ---------------------------------------------------------------------------
+
+#[test]
+fn identity_portability_golden_vectors_and_secret_guard() {
+    // 1. Frozen cross-client golden mprk1_ recovery key vector
+    let golden_seed: [u8; 32] =
+        from_hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+            .try_into()
+            .unwrap();
+    let expected_rk =
+        "mprk1_000G4-0R40M-30E20-9185G-R38E1-W8124-GK2GA-HC5RR-34D1P-70X3R-FPD00";
+    assert_eq!(mp_protocol::encode_recovery_key(&golden_seed), expected_rk);
+    assert_eq!(mp_protocol::decode_recovery_key(expected_rk), Ok(golden_seed));
+
+    // 2. Frozen cross-client golden 128-bit mpdevfp2: device fingerprint vector
+    let golden_pk: [u8; 32] =
+        from_hex("d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737")
+            .try_into()
+            .unwrap();
+    assert_eq!(
+        mp_protocol::compute_device_fingerprint(&golden_pk),
+        "ad1a8375-03ecc659-ad64922d-16cf6eb6"
+    );
+
+    let dev_secret = [0x42u8; 32];
+    let dev_cwt = vec![0xd2, 0x84, 0x43, 0xa1, 0x01, 0x32, 0xaa, 0xbb, 0xcc, 0xdd];
+
+    // 3. RecoveryKey: canonical, lowercase, space/newline-folded, and unprefixed valid 55-char Crockford
+    assert_eq!(
+        scan_outbound_secrets(expected_rk.as_bytes(), &dev_secret, &dev_cwt),
+        Some(SecretMatchKind::RecoveryKey)
+    );
+    let lowered_folded = expected_rk
+        .to_ascii_lowercase()
+        .replace('-', " \n ");
+    assert_eq!(
+        scan_outbound_secrets(
+            format!("backup key:\n{lowered_folded}\nend").as_bytes(),
+            &dev_secret,
+            &dev_cwt
+        ),
+        Some(SecretMatchKind::RecoveryKey)
+    );
+    let unprefixed = "000G4-0R40M-30E20-9185G-R38E1-W8124-GK2GA-HC5RR-34D1P-70X3R-FPD00";
+    assert_eq!(
+        scan_outbound_secrets(unprefixed.as_bytes(), &dev_secret, &dev_cwt),
+        Some(SecretMatchKind::RecoveryKey)
+    );
+    assert_eq!(
+        scan_outbound_secrets(
+            format!("my key is {unprefixed} please store it").as_bytes(),
+            &dev_secret,
+            &dev_cwt
+        ),
+        Some(SecretMatchKind::RecoveryKey)
+    );
+    let unprefixed_compact = unprefixed.replace('-', "");
+    assert_eq!(
+        scan_outbound_secrets(
+            format!("{{\"seed\":\"{unprefixed_compact}\"}}").as_bytes(),
+            &dev_secret,
+            &dev_cwt
+        ),
+        Some(SecretMatchKind::RecoveryKey)
+    );
+
+    // 4. DeviceLinkToken: exact-grammar mpdl1_<43 base64url chars>
+    let valid_link_tok = format!("poll token: mpdl1_{}", "aB9-_".repeat(8) + "XYZ");
+    assert_eq!(
+        scan_outbound_secrets(valid_link_tok.as_bytes(), &dev_secret, &dev_cwt),
+        Some(SecretMatchKind::DeviceLinkToken)
+    );
+    // 42 or 44 chars MUST NOT false-positive
+    let short_link_tok = format!("mpdl1_{}", "A".repeat(42));
+    let long_link_tok = format!("mpdl1_{}", "A".repeat(44));
+    assert_eq!(
+        scan_outbound_secrets(short_link_tok.as_bytes(), &dev_secret, &dev_cwt),
+        None
+    );
+    assert_eq!(
+        scan_outbound_secrets(long_link_tok.as_bytes(), &dev_secret, &dev_cwt),
+        None
+    );
+
+    // 5. RecoveryFile: PEM header, raw MPKEY1\0\0, and Base64-encoded MPKEY1\0\0 (all alignments)
+    assert_eq!(
+        scan_outbound_secrets(
+            b"-----BEGIN MULTIPLAYER RECOVERY KEY-----\nAAAA\n-----END MULTIPLAYER RECOVERY KEY-----",
+            &dev_secret,
+            &dev_cwt
+        ),
+        Some(SecretMatchKind::RecoveryFile)
+    );
+    let mut raw_mpkey = b"MPKEY1\0\0".to_vec();
+    raw_mpkey.extend_from_slice(&[0xfe; 24]);
+    assert_eq!(
+        scan_outbound_secrets(&raw_mpkey, &dev_secret, &dev_cwt),
+        Some(SecretMatchKind::RecoveryFile)
+    );
+    for enc in [
+        B64.encode(&raw_mpkey),
+        B64_NO_PAD.encode(&raw_mpkey),
+        B64U_PAD.encode(&raw_mpkey),
+        B64U.encode(&raw_mpkey),
+    ] {
+        assert_eq!(
+            scan_outbound_secrets(enc.as_bytes(), &dev_secret, &dev_cwt),
+            Some(SecretMatchKind::RecoveryFile),
+            "missed base64 MPKEY1 header: {enc}"
+        );
+    }
+    // Misaligned Base64 offsets 1 and 2 (both 0x00 and 0xff prefix/suffix edge values)
+    for prefix in [
+        &[0x00u8][..],
+        &[0xffu8][..],
+        &[0x00u8, 0x00u8][..],
+        &[0xffu8, 0xffu8][..],
+    ] {
+        let mut blob = prefix.to_vec();
+        blob.extend_from_slice(b"MPKEY1\0\0");
+        blob.extend_from_slice(&[0xff, 0x01, 0x02]);
+        for enc in [B64.encode(&blob), B64_NO_PAD.encode(&blob), B64U.encode(&blob)] {
+            assert_eq!(
+                scan_outbound_secrets(enc.as_bytes(), &dev_secret, &dev_cwt),
+                Some(SecretMatchKind::RecoveryFile),
+                "missed misaligned MPKEY1 base64 (prefix_len={})",
+                prefix.len()
+            );
+        }
+    }
+
+    // 6. No false positives on normal code, JSON, protocol prose, SHA-256 hex, or invalid 55-char checksum!
+    let bad_checksum_55 = "000G4-0R40M-30E20-9185G-R38E1-W8124-GK2GA-HC5RR-34D1P-70X3R-FPD08";
+    assert_eq!(
+        scan_outbound_secrets(bad_checksum_55.as_bytes(), &dev_secret, &dev_cwt),
+        None
+    );
+    let safe_samples: &[&[u8]] = &[
+        br#"{"status":"ok","account_id":1001,"safety_number":"SP44-BGDF-SWJH-YXTV-ZWXT-MNGX-P342-B0TV"}"#,
+        b"fn main() { println!(\"mpdl1_ tokens are 43 base64url chars and mprk1_ uses Crockford Base32\"); }",
+        b"sha256: d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+        b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA\n-----END PUBLIC KEY-----",
+    ];
+    for sample in safe_samples {
+        assert_eq!(
+            scan_outbound_secrets(sample, &dev_secret, &dev_cwt),
+            None,
+            "unexpected false positive on safe sample: {}",
+            String::from_utf8_lossy(sample)
+        );
+    }
+}
+
 

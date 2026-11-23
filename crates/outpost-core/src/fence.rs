@@ -118,6 +118,9 @@ pub enum SecretMatchKind {
     OwnDeviceCwt,
     InviteToken,
     PrivateKeyPem,
+    RecoveryKey,
+    DeviceLinkToken,
+    RecoveryFile,
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
@@ -278,11 +281,171 @@ fn matches_secret_bytes(payload: &[u8], secret: &[u8]) -> bool {
     false
 }
 
+const fn is_crockford_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() && !matches!(b, b'U' | b'u')
+}
+
+/// Canonical 55th Crockford Base32 symbol of a 34-byte recovery payload must have
+/// its 3 trailing unused padding bits set to zero (symbol value in {0, 8, 16, 24}).
+const fn crockford_trailing_bits_zero(b: u8) -> bool {
+    matches!(b, b'0' | b'O' | b'o' | b'8' | b'G' | b'g' | b'R' | b'r')
+}
+
+struct CrockfordRunSym {
+    byte: u8,
+    offset: usize,
+    starts_after_boundary: bool,
+    ends_before_boundary: bool,
+}
+
+fn check_crockford_run(syms: &mut Vec<CrockfordRunSym>, candidate: &mut String) -> bool {
+    if let Some(last) = syms.last_mut() {
+        last.ends_before_boundary = true;
+    }
+    if syms.len() >= 55 {
+        for win in syms.windows(55) {
+            let (Some(first), Some(last)) = (win.first(), win.last()) else {
+                continue;
+            };
+            if !first.starts_after_boundary || !last.ends_before_boundary {
+                continue;
+            }
+            if last.offset.saturating_sub(first.offset) > 160 {
+                continue;
+            }
+            if !crockford_trailing_bits_zero(last.byte) {
+                continue;
+            }
+            candidate.clear();
+            candidate.push_str(mp_protocol::RECOVERY_KEY_PREFIX);
+            for s in win {
+                candidate.push(char::from(s.byte));
+            }
+            if let Ok(mut seed) = mp_protocol::decode_recovery_key(candidate) {
+                for b in &mut seed {
+                    *b = core::hint::black_box(0u8);
+                }
+                return true;
+            }
+        }
+    }
+    syms.clear();
+    false
+}
+
+/// Detects canonical, lowercase, whitespace/newline-folded `mprk1_...` recovery keys,
+/// as well as unprefixed 55-symbol Crockford Base32 recovery keys whose canonical
+/// padding and 16-bit SHA-256 checksum verify under `mp_protocol::decode_recovery_key`.
+pub fn contains_recovery_key(payload: &[u8]) -> bool {
+    // 1. Case-insensitive `mprk1_` followed by >= 40 Crockford-ish chars (allowing `-` and ASCII whitespace).
+    const PREFIX: &[u8] = b"mprk1_";
+    const MAX_PREFIX_LOOKAHEAD: usize = 256;
+    for (idx, win) in payload.windows(PREFIX.len()).enumerate() {
+        if !win.eq_ignore_ascii_case(PREFIX) {
+            continue;
+        }
+        let tail_start = idx + PREFIX.len();
+        let tail_end = (tail_start + MAX_PREFIX_LOOKAHEAD).min(payload.len());
+        if let Some(tail) = payload.get(tail_start..tail_end) {
+            let mut crockford_count = 0usize;
+            for &b in tail {
+                if is_crockford_char(b) {
+                    crockford_count += 1;
+                    if crockford_count >= 40 {
+                        return true;
+                    }
+                } else if b == b'-' || b.is_ascii_whitespace() {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // 2. Unprefixed 55-symbol Crockford Base32 runs passing checksum verification.
+    let mut syms: Vec<CrockfordRunSym> = Vec::new();
+    let mut candidate = String::with_capacity(mp_protocol::RECOVERY_KEY_PREFIX.len() + 55);
+    let mut at_boundary = true;
+
+    for (offset, &b) in payload.iter().enumerate() {
+        if is_crockford_char(b) {
+            syms.push(CrockfordRunSym {
+                byte: b,
+                offset,
+                starts_after_boundary: at_boundary,
+                ends_before_boundary: false,
+            });
+            at_boundary = false;
+        } else if b == b'-' || b.is_ascii_whitespace() {
+            if let Some(last) = syms.last_mut() {
+                last.ends_before_boundary = true;
+            }
+            at_boundary = true;
+        } else {
+            if check_crockford_run(&mut syms, &mut candidate) {
+                return true;
+            }
+            at_boundary = true;
+        }
+    }
+
+    check_crockford_run(&mut syms, &mut candidate)
+}
+
+/// Detects exact-grammar device-link poll tokens (`mpdl1_<43 base64url chars>`).
+pub fn contains_device_link_token(payload: &[u8]) -> bool {
+    const PREFIX: &[u8] = b"mpdl1_";
+    for (idx, win) in payload.windows(PREFIX.len()).enumerate() {
+        if win == PREFIX {
+            let prev_ok = idx == 0
+                || payload
+                    .get(idx - 1)
+                    .is_none_or(|&b| !is_b64u_char(b));
+            let body_start = idx + PREFIX.len();
+            let body_end = body_start + 43;
+            let body_ok = payload
+                .get(body_start..body_end)
+                .is_some_and(|s| s.iter().all(|&b| is_b64u_char(b)));
+            let next_ok = payload
+                .get(body_end)
+                .is_none_or(|&b| !is_b64u_char(b));
+            if prev_ok && body_ok && next_ok {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Detects portable encrypted `.mpkey` recovery files via PEM header
+/// (`-----BEGIN MULTIPLAYER RECOVERY KEY-----`), raw binary magic (`MPKEY1\0\0`),
+/// or standard/URL-safe Base64 encodings of `MPKEY1\0\0` at 0/1/2-byte alignment offsets.
+pub fn contains_recovery_file(payload: &[u8]) -> bool {
+    const PEM_HEADER: &[u8] = b"-----BEGIN MULTIPLAYER RECOVERY KEY-----";
+    const RAW_MAGIC: &[u8] = b"MPKEY1\0\0";
+    // Alignment-invariant 10-char Base64 slices for `b"MPKEY1\0\0"` (identical in standard & URL-safe alphabets):
+    // offset 0: B64("MPKEY1\0\0" || ..)        -> "TVBLRVkxAA.."
+    // offset 1: B64(xx || "MPKEY1\0\0" || ..)  -> "..1QS0VZMQAA.."
+    // offset 2: B64(xx || yy || "MPKEY1\0\0")  -> "...NUEtFWTEAA.."
+    const B64_MAGIC_OFF0: &[u8] = b"TVBLRVkxAA";
+    const B64_MAGIC_OFF1: &[u8] = b"1QS0VZMQAA";
+    const B64_MAGIC_OFF2: &[u8] = b"NUEtFWTEAA";
+
+    contains_subslice(payload, PEM_HEADER)
+        || contains_subslice(payload, RAW_MAGIC)
+        || contains_subslice(payload, B64_MAGIC_OFF0)
+        || contains_subslice(payload, B64_MAGIC_OFF1)
+        || contains_subslice(payload, B64_MAGIC_OFF2)
+}
+
 /// Accidental-disclosure guard for outbound chat & board payloads:
 /// 1. Exact-matches our own `device_secret` and `device_cwt` across raw, hex (case-insensitive),
 ///    standard/URL-safe base64 (padded & unpadded), plus alignment-invariant inner base64 chunks
 ///    for 0/1/2-byte offsets (zero false positives).
-/// 2. Refuses exact-grammar `mpinv1_` / `mppi1_` invite tokens and `-----BEGIN * PRIVATE KEY-----`.
+/// 2. Refuses exact-grammar `mpinv1_` / `mppi1_` invite tokens, `mpdl1_` device-link tokens,
+///    `.mpkey` recovery files (PEM / raw / base64), `mprk1_` & unprefixed checksum-verified
+///    recovery keys, and `-----BEGIN * PRIVATE KEY-----`.
 pub fn scan_outbound_secrets(
     payload: &[u8],
     own_device_secret: &[u8; 32],
@@ -303,7 +466,22 @@ pub fn scan_outbound_secrets(
         return Some(SecretMatchKind::InviteToken);
     }
 
-    // 4. Private key PEM headers
+    // 4. Exact-grammar device-link poll tokens (`mpdl1_<43 b64u>`)
+    if contains_device_link_token(payload) {
+        return Some(SecretMatchKind::DeviceLinkToken);
+    }
+
+    // 5. Portable `.mpkey` recovery files (PEM header, raw magic, Base64 magic)
+    if contains_recovery_file(payload) {
+        return Some(SecretMatchKind::RecoveryFile);
+    }
+
+    // 6. Recovery keys (`mprk1_...`, space/newline-folded, and unprefixed checksum-verified 55-char Crockford)
+    if contains_recovery_key(payload) {
+        return Some(SecretMatchKind::RecoveryKey);
+    }
+
+    // 7. Private key PEM headers
     if contains_private_pem_header(payload) {
         return Some(SecretMatchKind::PrivateKeyPem);
     }

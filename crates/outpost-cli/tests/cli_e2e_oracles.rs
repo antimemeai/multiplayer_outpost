@@ -481,6 +481,66 @@ fn oracle_1_custody_lazy_mcp_eof_and_tty_gate() -> Result<(), String> {
     Ok(())
 }
 
+#[test]
+fn oracle_4_mcp_setup_and_recovery_key_argv_rejection() -> Result<(), String> {
+    let root_tmp = make_short_tempdir("mpo4")?;
+    let state_dir = make_private_subdir(root_tmp.path(), "st")?;
+    let runtime_dir = make_private_subdir(root_tmp.path(), "rt")?;
+
+    // 1. `mcp setup --json` offline check for all clients
+    let setup_all = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &["mcp", "setup", "--json"],
+        None,
+        &[],
+    )?;
+    if !setup_all.status_ok {
+        return Err(format!("mcp setup --json failed: {}", setup_all.stderr));
+    }
+    let j: Value =
+        serde_json::from_str(&setup_all.stdout).map_err(|e| format!("mcp setup json: {e}"))?;
+    let configs = j
+        .get("configs")
+        .and_then(Value::as_object)
+        .ok_or("missing configs object")?;
+    for client in ["claude", "codex", "cursor", "antigravity"] {
+        if !configs.contains_key(client) {
+            return Err(format!("missing client '{client}' in mcp setup output"));
+        }
+    }
+
+    // 2. Single client filter (`--client claude`)
+    let setup_claude = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &["mcp", "setup", "--client", "claude"],
+        None,
+        &[],
+    )?;
+    if !setup_claude.status_ok || !setup_claude.stdout.contains("claude mcp add multiplayer") {
+        return Err(format!(
+            "mcp setup --client claude unexpected output: {}",
+            setup_claude.stdout
+        ));
+    }
+
+    // 3. Passing a recovery key (`mprk1_...`) anywhere on argv MUST be refused!
+    let fake_rk = mp_protocol::encode_recovery_key(&[0x55u8; 32]);
+    let rk_argv = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &["account", "recover", "--device-label", "test", &fake_rk],
+        None,
+        &[],
+    )?;
+    if rk_argv.status_ok {
+        return Err("CLI MUST refuse mprk1_ recovery key on argv!".to_string());
+    }
+
+    Ok(())
+}
+
 // ===========================================================================
 // Oracle 3 (default production build): MUST ignore OUTPOST_TEST_* overrides
 // ===========================================================================
@@ -1509,5 +1569,933 @@ async fn oracle_2_two_outpost_live_e2e_iroh_quic_and_mcp() -> Result<(), String>
     }
 
     Ok(())
+}
+
+// ===========================================================================
+// Oracle 5 (v0.2.0 Identity Portability + Web Portal + Doctor E2E Oracle)
+// ===========================================================================
+
+struct MockLinkEntry {
+    account_id: u64,
+    link_code: String,
+    suggested_label: String,
+    claimed_pubkey: Option<[u8; 32]>,
+    claimed_label: Option<String>,
+    poll_token: Option<String>,
+    approved_device_id: Option<u64>,
+    approved_cwt_b64: Option<String>,
+    approved_cwt_expires_ms: Option<u64>,
+}
+
+struct MockPortabilityState {
+    next_account_id: u64,
+    next_device_id: u64,
+    accounts: HashMap<u64, MockPortabilityAccount>,
+    links: HashMap<String, MockLinkEntry>,
+    web_approved: bool,
+    web_browser_fp: String,
+}
+
+struct MockPortabilityAccount {
+    account_id: u64,
+    handle: String,
+    root_pubkey: [u8; 32],
+    devices: Vec<(u64, [u8; 32], String, u64)>,
+}
+
+async fn spawn_mock_portability_server(
+    state: Arc<Mutex<MockPortabilityState>>,
+) -> Result<(SocketAddr, String, tokio::task::JoinHandle<()>), String> {
+    let (acceptor, cert_pem) = generate_mock_tls()?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("bind mock portability server: {e}"))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("mock portability local_addr: {e}"))?;
+
+    let handle = tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor_c = acceptor.clone();
+            let state_c = Arc::clone(&state);
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor_c.accept(tcp).await else {
+                    return;
+                };
+                let Ok(req) = read_http_req(&mut tls).await else {
+                    return;
+                };
+                handle_portability_req(tls, req, state_c).await;
+            });
+        }
+    });
+
+    Ok((addr, cert_pem, handle))
+}
+
+async fn handle_portability_req<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut stream: S,
+    req: ParsedReq,
+    state: Arc<Mutex<MockPortabilityState>>,
+) {
+    let now_ms = outpost_control::wall_now_ms();
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/v1/health") => {
+            write_http_json(
+                &mut stream,
+                200,
+                "OK",
+                &json!({ "ok": true, "server_now_ms": now_ms }),
+            )
+            .await;
+        }
+        ("GET", "/ping") => {
+            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+            let _ = stream.write_all(resp.as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+        ("POST", "/v1/accounts/register") => {
+            let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
+                write_http_json(&mut stream, 400, "Bad Request", &json!({ "error": "bad_json" })).await;
+                return;
+            };
+            let handle = body
+                .get("handle")
+                .and_then(Value::as_str)
+                .unwrap_or("alice")
+                .to_string();
+            let label = body
+                .get("device_label")
+                .and_then(Value::as_str)
+                .unwrap_or("primary")
+                .to_string();
+            let Some(root_pk_b64) = body.get("root_pubkey_b64").and_then(Value::as_str) else {
+                write_http_json(&mut stream, 400, "Bad Request", &json!({ "error": "missing_root_pk" })).await;
+                return;
+            };
+            let Some(dev_pk_b64) = body.get("device_pubkey_b64").and_then(Value::as_str) else {
+                write_http_json(&mut stream, 400, "Bad Request", &json!({ "error": "missing_dev_pk" })).await;
+                return;
+            };
+            let Ok(root_vec) = B64.decode(root_pk_b64.as_bytes()) else {
+                return;
+            };
+            let Ok(dev_vec) = B64.decode(dev_pk_b64.as_bytes()) else {
+                return;
+            };
+            let (Ok(root_pk), Ok(dev_pk)) = (
+                <[u8; 32]>::try_from(root_vec),
+                <[u8; 32]>::try_from(dev_vec),
+            ) else {
+                return;
+            };
+
+            let resp = {
+                let mut st = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let aid = st.next_account_id;
+                st.next_account_id += 1;
+                let did = st.next_device_id;
+                st.next_device_id += 1;
+                st.accounts.insert(
+                    aid,
+                    MockPortabilityAccount {
+                        account_id: aid,
+                        handle: handle.clone(),
+                        root_pubkey: root_pk,
+                        devices: vec![(did, dev_pk, label, now_ms + 30 * 86_400_000)],
+                    },
+                );
+                json!({
+                    "account_id": aid,
+                    "device_id": did,
+                    "handle": handle,
+                })
+            };
+            write_http_json(&mut stream, 201, "Created", &resp).await;
+        }
+        ("POST", "/v1/accounts/recover-lookup") => {
+            let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
+                write_http_json(&mut stream, 400, "Bad Request", &json!({ "error": "bad_json" })).await;
+                return;
+            };
+            let Some(root_pk_b64) = body.get("root_pubkey_b64").and_then(Value::as_str) else {
+                write_http_json(&mut stream, 400, "Bad Request", &json!({ "error": "missing_root_pk" })).await;
+                return;
+            };
+            let Ok(root_vec) = B64.decode(root_pk_b64.as_bytes()) else {
+                return;
+            };
+            let Ok(root_pk) = <[u8; 32]>::try_from(root_vec) else {
+                return;
+            };
+
+            let found = {
+                let st = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                st.accounts
+                    .values()
+                    .find(|a| a.root_pubkey == root_pk)
+                    .map(|a| {
+                        let sn = compute_safety_number(a.account_id, &a.root_pubkey);
+                        let devs: Vec<Value> = a
+                            .devices
+                            .iter()
+                            .map(|(did, dpk, lbl, exp_ms)| {
+                                json!({
+                                    "device_id": did,
+                                    "pubkey_b64": B64.encode(dpk),
+                                    "label": lbl,
+                                    "cwt_expires_ms": exp_ms,
+                                    "generation": 1,
+                                    "pop_verified": true,
+                                    "created_at_ms": now_ms,
+                                    "revoked_at_ms": null,
+                                })
+                            })
+                            .collect();
+                        json!({
+                            "account_id": a.account_id,
+                            "handle": a.handle,
+                            "root_pubkey_b64": B64.encode(a.root_pubkey),
+                            "safety_number": sn,
+                            "devices": devs,
+                        })
+                    })
+            };
+            if let Some(val) = found {
+                write_http_json(&mut stream, 200, "OK", &val).await;
+            } else {
+                write_http_json(&mut stream, 404, "Not Found", &json!({ "error": "not_found" })).await;
+            }
+        }
+        ("POST", "/v1/devices") => {
+            let caller_acc = extract_caller_account_id(&req.headers).unwrap_or(0);
+            let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
+                return;
+            };
+            let label = body
+                .get("device_label")
+                .and_then(Value::as_str)
+                .unwrap_or("recovered")
+                .to_string();
+            let Some(dev_pk_b64) = body.get("device_pubkey_b64").and_then(Value::as_str) else {
+                return;
+            };
+            let Ok(dev_vec) = B64.decode(dev_pk_b64.as_bytes()) else {
+                return;
+            };
+            let Ok(dev_pk) = <[u8; 32]>::try_from(dev_vec) else {
+                return;
+            };
+            let exp_ms = now_ms + 30 * 86_400_000;
+            let resp = {
+                let mut st = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let did = st.next_device_id;
+                st.next_device_id += 1;
+                if let Some(acc) = st.accounts.get_mut(&caller_acc) {
+                    acc.devices.push((did, dev_pk, label, exp_ms));
+                }
+                json!({
+                    "device_id": did,
+                    "cwt_expires_ms": exp_ms,
+                })
+            };
+            write_http_json(&mut stream, 201, "Created", &resp).await;
+        }
+        ("POST", "/v1/device-links/create") => {
+            let caller_acc = extract_caller_account_id(&req.headers).unwrap_or(0);
+            let body = serde_json::from_slice::<Value>(&req.body).unwrap_or_default();
+            let label = body
+                .get("device_label")
+                .and_then(Value::as_str)
+                .unwrap_or("laptop")
+                .to_string();
+            let code = "W4K9-M2P7".to_string();
+            let expires_at_ms = now_ms + 300_000;
+            {
+                let mut st = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                st.links.insert(
+                    code.clone(),
+                    MockLinkEntry {
+                        account_id: caller_acc,
+                        link_code: code.clone(),
+                        suggested_label: label,
+                        claimed_pubkey: None,
+                        claimed_label: None,
+                        poll_token: None,
+                        approved_device_id: None,
+                        approved_cwt_b64: None,
+                        approved_cwt_expires_ms: None,
+                    },
+                );
+            }
+            write_http_json(
+                &mut stream,
+                201,
+                "Created",
+                &json!({ "link_code": code, "expires_at_ms": expires_at_ms }),
+            )
+            .await;
+        }
+        ("POST", "/v1/device-links/claim") => {
+            let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
+                return;
+            };
+            let code = body
+                .get("link_code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let dev_pk_b64 = body
+                .get("device_pubkey_b64")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let label = body
+                .get("device_label")
+                .and_then(Value::as_str)
+                .unwrap_or("new-dev")
+                .to_string();
+            let Ok(dev_vec) = B64.decode(dev_pk_b64.as_bytes()) else {
+                return;
+            };
+            let Ok(dev_pk) = <[u8; 32]>::try_from(dev_vec) else {
+                return;
+            };
+
+            let resp = {
+                let mut st = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(link) = st.links.get_mut(code) {
+                    let tok = "mpdl1_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG".to_string();
+                    link.claimed_pubkey = Some(dev_pk);
+                    link.claimed_label = Some(label);
+                    link.poll_token = Some(tok.clone());
+                    Some(json!({
+                        "poll_token": tok,
+                        // Deliberately send a BOGUS server fingerprint to prove clients ignore it!
+                        "device_fingerprint": "00000000-00000000-00000000-00000000",
+                        "expires_at_ms": now_ms + 300_000,
+                    }))
+                } else {
+                    None
+                }
+            };
+            if let Some(v) = resp {
+                write_http_json(&mut stream, 200, "OK", &v).await;
+            } else {
+                write_http_json(&mut stream, 404, "Not Found", &json!({ "error": "invalid_or_expired_link" })).await;
+            }
+        }
+        ("POST", "/v1/device-links/inspect") => {
+            let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
+                return;
+            };
+            let code = body
+                .get("link_code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let resp = {
+                let st = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                st.links.get(code).map(|link| {
+                    if let Some(dpk) = link.claimed_pubkey {
+                        json!({
+                            "state": "pending_approval",
+                            "device_pubkey_b64": B64.encode(dpk),
+                            // Deliberately BOGUS server fingerprint — primary MUST compute locally!
+                            "device_fingerprint": "ffffffff-ffffffff-ffffffff-ffffffff",
+                            "device_label": link.claimed_label.clone().unwrap_or_default(),
+                            "requester_country": "US",
+                            "created_at_ms": now_ms,
+                            "expires_at_ms": now_ms + 300_000,
+                        })
+                    } else {
+                        json!({
+                            "state": "waiting_for_device",
+                            "suggested_label": link.suggested_label,
+                            "created_at_ms": now_ms,
+                            "expires_at_ms": now_ms + 300_000,
+                        })
+                    }
+                })
+            };
+            if let Some(v) = resp {
+                write_http_json(&mut stream, 200, "OK", &v).await;
+            } else {
+                write_http_json(&mut stream, 404, "Not Found", &json!({ "error": "invalid_or_expired_link" })).await;
+            }
+        }
+        ("POST", "/v1/device-links/approve") => {
+            let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
+                return;
+            };
+            let code = body
+                .get("link_code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let cwt_b64 = body
+                .get("device_cwt_b64")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let label_override = body
+                .get("device_label")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+
+            let resp = {
+                let mut st = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let did = st.next_device_id;
+                st.next_device_id += 1;
+                let exp_ms = now_ms + 30 * 86_400_000;
+                if let Some(link) = st.links.get_mut(code) {
+                    let aid = link.account_id;
+                    let dpk = link.claimed_pubkey.unwrap_or([0u8; 32]);
+                    let lbl = label_override
+                        .or_else(|| link.claimed_label.clone())
+                        .unwrap_or_else(|| link.suggested_label.clone());
+                    let fp = mp_protocol::compute_device_fingerprint(&dpk);
+                    link.approved_device_id = Some(did);
+                    link.approved_cwt_b64 = Some(cwt_b64);
+                    link.approved_cwt_expires_ms = Some(exp_ms);
+                    let _ = &link.link_code;
+                    if let Some(acc) = st.accounts.get_mut(&aid) {
+                        acc.devices.push((did, dpk, lbl.clone(), exp_ms));
+                    }
+                    Some(json!({
+                        "approved": true,
+                        "account_id": aid,
+                        "device_id": did,
+                        "device_label": lbl,
+                        "device_fingerprint": fp,
+                        "cwt_expires_ms": exp_ms,
+                    }))
+                } else {
+                    None
+                }
+            };
+            if let Some(v) = resp {
+                write_http_json(&mut stream, 200, "OK", &v).await;
+            } else {
+                write_http_json(&mut stream, 404, "Not Found", &json!({ "error": "invalid_or_expired_link" })).await;
+            }
+        }
+        ("POST", "/v1/device-links/poll") => {
+            let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
+                return;
+            };
+            let code = body
+                .get("link_code")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let poll_tok = body
+                .get("poll_token")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            let (status, reason, val) = {
+                let st = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(link) = st.links.get(code)
+                    && link.poll_token.as_deref() == Some(poll_tok)
+                {
+                    if let (Some(did), Some(cwt_b64), Some(exp_ms)) = (
+                        link.approved_device_id,
+                        link.approved_cwt_b64.as_ref(),
+                        link.approved_cwt_expires_ms,
+                    ) && let Some(acc) = st.accounts.get(&link.account_id)
+                    {
+                        let sn = compute_safety_number(acc.account_id, &acc.root_pubkey);
+                        (
+                            200u16,
+                            "OK",
+                            json!({
+                                "status": "approved",
+                                "account_id": acc.account_id,
+                                "handle": acc.handle,
+                                "device_id": did,
+                                "root_pubkey_b64": B64.encode(acc.root_pubkey),
+                                "device_cwt_b64": cwt_b64,
+                                "cwt_expires_ms": exp_ms,
+                                "safety_number": sn,
+                            }),
+                        )
+                    } else {
+                        (
+                            202u16,
+                            "Accepted",
+                            json!({
+                                "status": "pending",
+                                "expires_at_ms": now_ms + 300_000,
+                            }),
+                        )
+                    }
+                } else {
+                    (
+                        404u16,
+                        "Not Found",
+                        json!({ "error": "invalid_or_expired_link" }),
+                    )
+                }
+            };
+            write_http_json(&mut stream, status, reason, &val).await;
+        }
+        ("POST", "/v1/web-sessions/inspect") => {
+            let fp = {
+                let st = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                st.web_browser_fp.clone()
+            };
+            write_http_json(
+                &mut stream,
+                200,
+                "OK",
+                &json!({
+                    "pending": true,
+                    "scope": "account:read",
+                    "browser_fingerprint": fp,
+                    "requester_country": "US",
+                    "requester_client": "Firefox 132 / macOS",
+                    "created_at_ms": now_ms,
+                    "expires_at_ms": now_ms + 300_000,
+                }),
+            )
+            .await;
+        }
+        ("POST", "/v1/web-sessions/approve") => {
+            let caller_acc = extract_caller_account_id(&req.headers).unwrap_or(1001);
+            let fp = {
+                let mut st = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                st.web_approved = true;
+                st.web_browser_fp.clone()
+            };
+            write_http_json(
+                &mut stream,
+                200,
+                "OK",
+                &json!({
+                    "approved": true,
+                    "scope": "account:read",
+                    "account_id": caller_acc,
+                    "approved_device_id": 2001,
+                    "approved_by_root": false,
+                    "browser_fingerprint": fp,
+                    "requester_country": "US",
+                    "requester_client": "Firefox 132 / macOS",
+                }),
+            )
+            .await;
+        }
+        _ => {
+            write_http_json(&mut stream, 404, "Not Found", &json!({ "error": "not_found" })).await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> Result<(), String> {
+    let root_tmp = make_short_tempdir("mpo5")?;
+    let primary_st = make_private_subdir(root_tmp.path(), "ps")?;
+    let primary_rt = make_private_subdir(root_tmp.path(), "pr")?;
+    let recover_st = make_private_subdir(root_tmp.path(), "rs")?;
+    let recover_rt = make_private_subdir(root_tmp.path(), "rr")?;
+    let linked_st = make_private_subdir(root_tmp.path(), "ls")?;
+    let linked_rt = make_private_subdir(root_tmp.path(), "lr")?;
+
+    let mock_state = Arc::new(Mutex::new(MockPortabilityState {
+        next_account_id: 5001,
+        next_device_id: 6001,
+        accounts: HashMap::new(),
+        links: HashMap::new(),
+        web_approved: false,
+        web_browser_fp: "a1b2c3d4-e5f60718".to_string(),
+    }));
+    let (server_addr, cert_pem, server_task) =
+        spawn_mock_portability_server(Arc::clone(&mock_state)).await?;
+    let ca_path = root_tmp.path().join("mock_ca.pem");
+    std::fs::write(&ca_path, cert_pem).map_err(|e| format!("write ca pem: {e}"))?;
+
+    let addr_str = server_addr.to_string();
+    let ca_str = ca_path.to_string_lossy().into_owned();
+    let env_vars = [
+        ("OUTPOST_TEST_CONNECT_ADDR", addr_str.as_str()),
+        ("OUTPOST_TEST_CA_PEM", ca_str.as_str()),
+    ];
+
+    let root_key_path = root_tmp.path().join("root.key");
+    let root_key_str = root_key_path.to_string_lossy().into_owned();
+    let mpkey_path = root_tmp.path().join("backup.mpkey");
+    let mpkey_str = mpkey_path.to_string_lossy().into_owned();
+
+    let result: Result<(), String> = async {
+        // 1. `account register` -> returns valid `mprk1_...` Recovery Key!
+        let reg_out = run_bin(
+            &primary_st,
+            &primary_rt,
+            &[
+                "--json",
+                "account",
+                "register",
+                "--handle",
+                "antimeme",
+                "--device-label",
+                "primary-box",
+                "--root-key-out",
+                &root_key_str,
+                "--invite-stdin",
+            ],
+            Some(b"mpinv1_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG\n"),
+            &env_vars,
+        )?;
+        if !reg_out.status_ok {
+            return Err(format!("account register failed: {}", reg_out.stderr));
+        }
+        let reg_json: Value =
+            serde_json::from_str(&reg_out.stdout).map_err(|e| format!("reg json: {e}"))?;
+        let account_id = reg_json
+            .get("account_id")
+            .and_then(Value::as_u64)
+            .ok_or("missing account_id")?;
+        let reg_sn = reg_json
+            .get("safety_number")
+            .and_then(Value::as_str)
+            .ok_or("missing safety_number")?
+            .to_string();
+        let reg_rk = reg_json
+            .get("recovery_key")
+            .and_then(Value::as_str)
+            .ok_or("missing recovery_key")?
+            .to_string();
+        if !reg_rk.starts_with("mprk1_") {
+            return Err(format!("invalid recovery_key format: {reg_rk}"));
+        }
+        let decoded_seed = mp_protocol::decode_recovery_key(&reg_rk)
+            .map_err(|e| format!("decode registered recovery_key: {e}"))?;
+
+        // 2. `account recovery-key --root-key-file` matches!
+        let rk_out = run_bin(
+            &primary_st,
+            &primary_rt,
+            &["account", "recovery-key", "--root-key-file", &root_key_str],
+            None,
+            &env_vars,
+        )?;
+        if !rk_out.status_ok || rk_out.stdout.trim() != reg_rk {
+            return Err(format!(
+                "account recovery-key mismatch: ok={} stdout={}",
+                rk_out.status_ok, rk_out.stdout
+            ));
+        }
+
+        // 3. `account export-mpkey` -> mode 0600 -> `account recover --mpkey ... --passphrase-stdin`!
+        let pass = "correct-horse-battery-staple\n";
+        let export_out = run_bin(
+            &primary_st,
+            &primary_rt,
+            &[
+                "--json",
+                "account",
+                "export-mpkey",
+                "--root-key-file",
+                &root_key_str,
+                "--out",
+                &mpkey_str,
+                "--account-id",
+                &account_id.to_string(),
+                "--handle",
+                "antimeme",
+                "--passphrase-stdin",
+            ],
+            Some(pass.as_bytes()),
+            &env_vars,
+        )?;
+        if !export_out.status_ok {
+            return Err(format!("account export-mpkey failed: {}", export_out.stderr));
+        }
+        let mpkey_meta =
+            std::fs::metadata(&mpkey_path).map_err(|e| format!("mpkey stat: {e}"))?;
+        if (mpkey_meta.permissions().mode() & 0o777) != 0o600 {
+            return Err("exported .mpkey does not have mode 0600!".to_string());
+        }
+
+        let rec_out = run_bin(
+            &recover_st,
+            &recover_rt,
+            &[
+                "--json",
+                "account",
+                "recover",
+                "--mpkey",
+                &mpkey_str,
+                "--passphrase-stdin",
+                "--device-label",
+                "recovered-laptop",
+                "--relay-policy",
+                "no",
+            ],
+            Some(pass.as_bytes()),
+            &env_vars,
+        )?;
+        if !rec_out.status_ok {
+            return Err(format!("account recover failed: {}", rec_out.stderr));
+        }
+        let rec_json: Value =
+            serde_json::from_str(&rec_out.stdout).map_err(|e| format!("recover json: {e}"))?;
+        if rec_json.get("account_id").and_then(Value::as_u64) != Some(account_id)
+            || rec_json.get("safety_number").and_then(Value::as_str) != Some(reg_sn.as_str())
+        {
+            return Err(format!("account recover mismatch: {rec_json}"));
+        }
+        let _ = decoded_seed;
+
+        // 4. Full concurrent Device Link flow:
+        //    Primary `device link create` -> New device `device link join` (background)
+        //    -> Primary `device link approve --yes-fingerprint <local_fp>` -> New device finishes!
+        let create_out = run_bin(
+            &primary_st,
+            &primary_rt,
+            &[
+                "--json",
+                "device",
+                "link",
+                "create",
+                "--root-key-file",
+                &root_key_str,
+                "--device-label",
+                "wintermute",
+            ],
+            None,
+            &env_vars,
+        )?;
+        if !create_out.status_ok {
+            return Err(format!("device link create failed: {}", create_out.stderr));
+        }
+        let create_json: Value =
+            serde_json::from_str(&create_out.stdout).map_err(|e| format!("create json: {e}"))?;
+        let link_code = create_json
+            .get("link_code")
+            .and_then(Value::as_str)
+            .ok_or("missing link_code")?
+            .to_string();
+
+        // Spawn `device link join` concurrently as a real child process!
+        let mut join_cmd = Command::new(BIN_PATH);
+        join_cmd
+            .arg("--state-dir")
+            .arg(&linked_st)
+            .arg("--runtime-dir")
+            .arg(&linked_rt)
+            .arg("--json")
+            .args([
+                "device",
+                "link",
+                "join",
+                &link_code,
+                "--device-label",
+                "wintermute",
+                "--relay-policy",
+                "no",
+                "--timeout-secs",
+                "20",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for &(k, v) in &env_vars {
+            join_cmd.env(k, v);
+        }
+        let mut join_child = join_cmd
+            .spawn()
+            .map_err(|e| format!("spawn device link join: {e}"))?;
+        let join_stderr = join_child.stderr.take().ok_or("missing join stderr")?;
+
+        // Read the locally computed 128-bit fingerprint printed by the new machine!
+        let join_fp = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let mut reader = BufReader::new(join_stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader
+                    .read_line(&mut line)
+                    .map_err(|e| format!("read join stderr: {e}"))?;
+                if n == 0 {
+                    return Err("EOF before device fingerprint was printed".to_string());
+                }
+                if let Some(fp) = line
+                    .trim()
+                    .strip_prefix("Device fingerprint (verify on primary): ")
+                {
+                    return Ok(fp.trim().to_string());
+                }
+            }
+        })
+        .await
+        .map_err(|e| format!("join stderr task: {e}"))??;
+
+        // Primary refuses wrong fingerprint!
+        let bad_approve = run_bin(
+            &primary_st,
+            &primary_rt,
+            &[
+                "device",
+                "link",
+                "approve",
+                &link_code,
+                "--root-key-file",
+                &root_key_str,
+                "--yes-fingerprint",
+                "ffffffff-ffffffff-ffffffff-ffffffff",
+            ],
+            None,
+            &env_vars,
+        )?;
+        if bad_approve.status_ok {
+            return Err("device link approve MUST reject bogus server fingerprint!".to_string());
+        }
+
+        // Primary approves using the exact locally computed fingerprint!
+        let approve_out = run_bin(
+            &primary_st,
+            &primary_rt,
+            &[
+                "--json",
+                "device",
+                "link",
+                "approve",
+                &link_code,
+                "--root-key-file",
+                &root_key_str,
+                "--yes-fingerprint",
+                &join_fp,
+            ],
+            None,
+            &env_vars,
+        )?;
+        if !approve_out.status_ok {
+            return Err(format!("device link approve failed: {}", approve_out.stderr));
+        }
+
+        // Wait for `device link join` to collect the verified CWT and save its device record!
+        let join_output = tokio::task::spawn_blocking(move || join_child.wait_with_output())
+            .await
+            .map_err(|e| format!("wait join task: {e}"))?
+            .map_err(|e| format!("wait join output: {e}"))?;
+        if !join_output.status.success() {
+            return Err(format!(
+                "device link join failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&join_output.stdout),
+                String::from_utf8_lossy(&join_output.stderr)
+            ));
+        }
+        let join_json: Value = serde_json::from_slice(&join_output.stdout)
+            .map_err(|e| format!("join json: {e}"))?;
+        if join_json.get("linked").and_then(Value::as_bool) != Some(true)
+            || join_json.get("account_id").and_then(Value::as_u64) != Some(account_id)
+            || join_json.get("safety_number").and_then(Value::as_str) != Some(reg_sn.as_str())
+        {
+            return Err(format!("unexpected device link join result: {join_json}"));
+        }
+
+        // Verify linked device can immediately run offline `whoami --safety-number`!
+        let linked_who = run_bin(
+            &linked_st,
+            &linked_rt,
+            &["whoami", "--safety-number"],
+            None,
+            &env_vars,
+        )?;
+        if !linked_who.status_ok || linked_who.stdout.trim() != reg_sn {
+            return Err(format!(
+                "linked device whoami mismatch: ok={} out={}",
+                linked_who.status_ok, linked_who.stdout
+            ));
+        }
+
+        // 5. `web approve` rejects mismatched fingerprint and succeeds with exact match!
+        let bad_web = run_bin(
+            &primary_st,
+            &primary_rt,
+            &[
+                "web",
+                "approve",
+                "ABCD-EFGH",
+                "--yes-browser-fingerprint",
+                "00000000-00000000",
+            ],
+            None,
+            &env_vars,
+        )?;
+        if bad_web.status_ok {
+            return Err("web approve MUST reject mismatched browser fingerprint!".to_string());
+        }
+        let ok_web = run_bin(
+            &primary_st,
+            &primary_rt,
+            &[
+                "--json",
+                "web",
+                "approve",
+                "ABCD-EFGH",
+                "--yes-browser-fingerprint",
+                "a1b2c3d4-e5f60718",
+            ],
+            None,
+            &env_vars,
+        )?;
+        if !ok_web.status_ok {
+            return Err(format!("web approve failed: {}", ok_web.stderr));
+        }
+        let web_json: Value =
+            serde_json::from_str(&ok_web.stdout).map_err(|e| format!("web json: {e}"))?;
+        if web_json.get("approved").and_then(Value::as_bool) != Some(true) {
+            return Err(format!("expected approved=true: {web_json}"));
+        }
+
+        // 6. `doctor --json` non-destructive health check against local TLS 1.3 mock server!
+        let doc_out = run_bin(
+            &primary_st,
+            &primary_rt,
+            &[
+                "--json",
+                "doctor",
+                "--relay-url",
+                "https://api.multiplayer.tech",
+            ],
+            None,
+            &env_vars,
+        )?;
+        if !doc_out.status_ok {
+            return Err(format!("doctor failed: {}", doc_out.stderr));
+        }
+        let doc_json: Value =
+            serde_json::from_str(&doc_out.stdout).map_err(|e| format!("doctor json: {e}"))?;
+        if doc_json.pointer("/device/enrolled").and_then(Value::as_bool) != Some(true)
+            || doc_json.pointer("/device/cwt_valid").and_then(Value::as_bool) != Some(true)
+            || doc_json.pointer("/control_plane/ok").and_then(Value::as_bool) != Some(true)
+            || doc_json.pointer("/relay/ok").and_then(Value::as_bool) != Some(true)
+        {
+            return Err(format!("unexpected doctor report: {doc_json}"));
+        }
+
+        Ok(())
+    }
+    .await;
+
+    server_task.abort();
+    result
 }
 }
