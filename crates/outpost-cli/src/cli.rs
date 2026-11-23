@@ -216,7 +216,7 @@ pub async fn run_cli_command(args: &[String]) -> Result<(), String> {
                     PKG_VERSION,
                     IPC_SCHEMA_VER,
                     build_order(),
-                    &crate::build_info::BUILD_DIGEST_HEX
+                    crate::build_info::BUILD_DIGEST_HEX
                 );
             }
             Ok(())

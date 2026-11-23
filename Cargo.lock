@@ -2065,7 +2065,6 @@ dependencies = [
  "hyper-util",
  "libc",
  "mp-protocol",
- "outpost-core",
  "rcgen",
  "rustls",
  "serde",
