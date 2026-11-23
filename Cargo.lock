@@ -2031,7 +2031,12 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "ed25519-dalek 2.2.0",
+ "futures-util",
+ "getrandom 0.2.17",
+ "http",
+ "http-body-util",
  "hyper",
+ "hyper-util",
  "libc",
  "mp-protocol",
  "outpost-core",
@@ -2056,6 +2061,29 @@ dependencies = [
  "proptest",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "outpost-daemon"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "mp-protocol",
+ "outpost-core",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "outpost-mcp"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "mp-protocol",
+ "outpost-core",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -1,0 +1,20 @@
+[package]
+name = "outpost-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc.workspace = true
+mp-protocol.workspace = true
+outpost-core = { path = "../outpost-core" }
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[[test]]
+name = "daemon_oracles"
+harness = false

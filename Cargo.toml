@@ -4,6 +4,8 @@ members = [
     "crates/outpost-core",
     "crates/outpost-control",
     "crates/outpost-p2p",
+    "crates/outpost-daemon",
+    "crates/outpost-mcp",
 ]
 
 [workspace.package]

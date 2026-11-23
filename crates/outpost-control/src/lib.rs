@@ -1,0 +1,39 @@
+//! TLS 1.3-only HTTP/1.1 + RFC 6455 WebSocket `MP1` control-plane client.
+
+#![deny(
+    unsafe_code,
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing
+)]
+
+pub mod clock;
+pub mod http;
+pub mod tls;
+pub mod ws;
+
+pub use clock::{sleep_aware_now_ms, wall_now_ms, wall_now_secs};
+pub use http::{
+    AccountDeviceInfo, AccountMeResponse, ApprovePartyRequest, ApprovePartyRequestResponse,
+    BlockAccountResponse, ControlClient, ControlClientConfig, ControlError, CreatePartyRequest,
+    CreatePartyResponse, DEFAULT_REQUEST_TIMEOUT, DisbandPartyResponse, EnrollDeviceRequest,
+    EnrollDeviceResponse, FriendEdge, FriendRequestResponse, HealthResponse, JoinPartyRequest,
+    JoinPartyResponse, KickMemberResponse, LeavePartyResponse, ListFriendsResponse,
+    ListPartyRequestsResponse, MAX_CLOCK_OFFSET_MS, MAX_RESPONSE_BODY_BYTES,
+    MAX_RESPONSE_HEADERS_BYTES, MintPartyInviteRequest, MintPartyInviteResponse,
+    PartyJoinRequestItem, PartySummaryResponse, PromoteMemberResponse, PublicAccountResponse,
+    PublicDeviceInfo, RawHttpResponse, RegisterAccountRequest, RegisterAccountResponse,
+    RejectPartyRequestResponse, RemoveFriendResponse, RenameHandleResponse,
+    RenewDeviceCwtResponse, RequestSigner, ResolvedHandleResponse, RevokeDeviceResponse,
+    RevokePartyInviteResponse, SIGNATURE_LIFETIME_SECS, SignedHeaders, generate_nonce,
+    sign_request,
+};
+pub use tls::{
+    DEFAULT_API_AUTHORITY, build_tls13_client_config_with_roots, default_tls13_client_config,
+};
+pub use ws::{
+    CHURN_THRESHOLD, CHURN_WINDOW_MS, ChurnStatus, EndpointUpdateCoalescer, EvictionChurnDetector,
+    MIN_ENDPOINT_UPDATE_INTERVAL_MS, MP1_PING_TEXT, MP1_PONG_TEXT, Mp1WsClient, Mp1WsEvent,
+    Mp1WsTarget, WsConnectError, WsError,
+};
