@@ -29,22 +29,26 @@
 use core::fmt;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
 use iroh::address_lookup::AddrFilter;
 use iroh::endpoint::{
-    AfterHandshakeOutcome, BeforeConnectOutcome, ConnectError, ConnectWithOptsError,
-    ConnectingError, Connection, ConnectionError, EndpointHooks, Incoming, QuicTransportConfig,
-    RecvStream, SendDatagramError, SendStream, VarInt, presets,
+    AfterHandshakeOutcome, BeforeConnectOutcome, BindOpts, ConnectError, ConnectWithOptsError,
+    ConnectingError, Connection, ConnectionError, EndpointHooks, Incoming, IncomingAddr,
+    QuicTransportConfig, RecvStream, SendDatagramError, SendStream, VarInt, presets,
 };
 pub use iroh::{Endpoint, EndpointAddr, Watcher};
 use iroh::{EndpointId, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use mp_protocol::{
     DirectAddr, EndpointDescriptor, MAX_DIRECT_ADDRS, MAX_RELAY_URL_BYTES, RelayPolicy,
     TransportKind,
+};
+use outpost_core::lan_protocol::{
+    LanHandshakeMessage, LanProtocolError, decode_lan_handshake_frame, encode_lan_handshake_frame,
+    is_lan_handshake_frame,
 };
 use outpost_core::p2p_wire::{
     P2pLane, P2pPartyFrame, P2pWireError, decode_p2p_party_frame, encode_p2p_party_frame,
@@ -56,6 +60,8 @@ use url::Url;
 
 pub const ALPN: &[u8] = b"blackbird-mp/1";
 pub const STREAM_INIT_MARKER: u32 = u32::MAX;
+pub const MAX_PENDING_LAN_PEERS: usize = 16;
+pub const MAX_ALLOWED_PEERS: usize = 1024;
 
 pub const CLOSE_SHUTDOWN: u32 = 4000;
 pub const CLOSE_PROTOCOL_VIOLATION: u32 = 4400;
@@ -95,6 +101,21 @@ pub struct PartyP2pConfig {
     pub pinned_relay_url: Option<String>,
 }
 
+/// Explicit opt-in LAN (`NoRelays`) transport options for [`PartyP2pTransport::spawn_with_lan`].
+///
+/// Online mode uses [`PartyP2pTransport::spawn`] (no LAN config) and remains 100% unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LanTransportConfig {
+    /// Explicitly opts into `NoRelays` local direct UDP transport (zero relays, zero internet).
+    pub no_relays: bool,
+    /// When `true` (ONLY valid with `no_relays == true` and `RelayPolicy::NoRelays`), admits up
+    /// to [`MAX_PENDING_LAN_PEERS`] un-allowlisted peers on Lane 0 (`Control`) only until
+    /// promoted via [`PartyP2pHandle::allow_peer`] or rejected.
+    pub lan_open_admission: bool,
+    /// Optional local UDP bind port for direct LAN transport (`None` = ephemeral port `0`).
+    pub lan_bind_port: Option<u16>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerDialTarget {
     pub device_id: u64,
@@ -117,6 +138,10 @@ pub enum P2pTransportEvent {
         lane: P2pLane,
         frame: P2pPartyFrame,
     },
+    LanHandshakeReceived {
+        peer_pubkey: [u8; 32],
+        message: LanHandshakeMessage,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +153,7 @@ pub enum P2pError {
     PolicyViolation(String),
     PeerNotAllowed,
     PeerNotConnected,
+    Capacity,
     WireError(P2pWireError),
     FrameTooLarge,
     Timeout,
@@ -145,6 +171,7 @@ impl fmt::Display for P2pError {
             Self::PolicyViolation(msg) => write!(f, "relay policy violation: {msg}"),
             Self::PeerNotAllowed => write!(f, "peer not in allowlist"),
             Self::PeerNotConnected => write!(f, "peer not connected"),
+            Self::Capacity => write!(f, "peer allowlist capacity exceeded"),
             Self::WireError(err) => write!(f, "wire codec error: {err}"),
             Self::FrameTooLarge => write!(f, "frame exceeds lane limit"),
             Self::Timeout => write!(f, "operation timed out"),
@@ -170,6 +197,8 @@ struct ActivePeer {
     conn_id: u64,
     is_outbound: bool,
     conn: Connection,
+    remote_addr: Option<SocketAddr>,
+    is_pending: Arc<AtomicBool>,
     control_tx: mpsc::Sender<BudgetedFrame>,
     control_budget: Arc<Semaphore>,
     causal_tx: mpsc::Sender<BudgetedFrame>,
@@ -187,11 +216,25 @@ impl ActivePeer {
     }
 }
 
+struct InFlightPendingGuard {
+    shared: Arc<SharedState>,
+}
+
+impl Drop for InFlightPendingGuard {
+    fn drop(&mut self) {
+        self.shared
+            .in_flight_pending_lan
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct SharedState {
     local_id: EndpointId,
     relay_policy: RelayPolicy,
     pinned_relay_url: Option<RelayUrl>,
     pinned_relay_url_str: Option<String>,
+    lan_open_admission: AtomicBool,
+    in_flight_pending_lan: AtomicUsize,
     allowed_peers: RwLock<HashSet<EndpointId>>,
     peers: RwLock<HashMap<EndpointId, ActivePeer>>,
     next_conn_id: AtomicU64,
@@ -213,6 +256,62 @@ impl SharedState {
             .read()
             .unwrap_or_else(PoisonError::into_inner);
         guard.contains(id)
+    }
+
+    fn is_lan_open_admission(&self) -> bool {
+        self.relay_policy == RelayPolicy::NoRelays
+            && self.lan_open_admission.load(Ordering::Acquire)
+    }
+
+    fn pending_lan_slots_full(&self, candidate: &EndpointId) -> bool {
+        let active_pending = {
+            let peers = self.peers.read().unwrap_or_else(PoisonError::into_inner);
+            if let Some(existing) = peers.get(candidate)
+                && existing.is_pending.load(Ordering::Acquire)
+            {
+                return false;
+            }
+            peers
+                .values()
+                .filter(|p| p.is_pending.load(Ordering::Acquire))
+                .count()
+        };
+        let in_flight = self.in_flight_pending_lan.load(Ordering::Acquire);
+        active_pending.saturating_add(in_flight) >= MAX_PENDING_LAN_PEERS
+    }
+
+    fn try_reserve_in_flight_pending(
+        self: &Arc<Self>,
+        candidate: &EndpointId,
+    ) -> Option<InFlightPendingGuard> {
+        let peers = self.peers.read().unwrap_or_else(PoisonError::into_inner);
+        let already_pending_self = peers
+            .get(candidate)
+            .is_some_and(|p| p.is_pending.load(Ordering::Acquire));
+        let active_pending = peers
+            .values()
+            .filter(|p| p.is_pending.load(Ordering::Acquire))
+            .count();
+        let effective_active = if already_pending_self {
+            active_pending.saturating_sub(1)
+        } else {
+            active_pending
+        };
+        loop {
+            let current = self.in_flight_pending_lan.load(Ordering::Acquire);
+            if effective_active.saturating_add(current) >= MAX_PENDING_LAN_PEERS {
+                return None;
+            }
+            if self
+                .in_flight_pending_lan
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(InFlightPendingGuard {
+                    shared: Arc::clone(self),
+                });
+            }
+        }
     }
 
     fn close_and_remove_peer(
@@ -301,10 +400,18 @@ impl EndpointHooks for AllowlistHooks {
         }
         let remote_id = conn.remote_id();
         if !self.shared.is_allowed(&remote_id) {
-            return AfterHandshakeOutcome::Reject {
-                error_code: VarInt::from_u32(CLOSE_UNAUTHORIZED),
-                reason: b"peer_not_allowed".to_vec(),
-            };
+            if !self.shared.is_lan_open_admission() {
+                return AfterHandshakeOutcome::Reject {
+                    error_code: VarInt::from_u32(CLOSE_UNAUTHORIZED),
+                    reason: b"peer_not_allowed".to_vec(),
+                };
+            }
+            if self.shared.pending_lan_slots_full(&remote_id) {
+                return AfterHandshakeOutcome::Reject {
+                    error_code: VarInt::from_u32(CLOSE_UNAUTHORIZED),
+                    reason: b"pending_lan_cap_reached".to_vec(),
+                };
+            }
         }
         AfterHandshakeOutcome::Accept
     }
@@ -368,20 +475,15 @@ impl PartyP2pHandle {
             .is_some_and(|active| active.conn.close_reason().is_none())
     }
 
-    pub fn local_endpoint_descriptor(&self) -> EndpointDescriptor {
+    /// Returns the endpoint's bound and discovered local direct UDP socket addresses.
+    ///
+    /// Always returns an empty vector under [`RelayPolicy::ForceRelays`].
+    pub fn local_direct_addrs(&self) -> Vec<SocketAddr> {
         if self.shared.relay_policy == RelayPolicy::ForceRelays {
-            return EndpointDescriptor {
-                transport_kind: TransportKind::IrohQuic,
-                relay_url: self
-                    .shared
-                    .pinned_relay_url_str
-                    .clone()
-                    .unwrap_or_default(),
-                direct_addrs: Vec::new(),
-            };
+            return Vec::new();
         }
 
-        let mut collected: Vec<DirectAddr> = Vec::new();
+        let mut collected: Vec<SocketAddr> = Vec::new();
         let mut seen: HashSet<SocketAddr> = HashSet::new();
 
         for bound in self.endpoint.bound_sockets() {
@@ -395,16 +497,53 @@ impl PartyP2pHandle {
                 other => other,
             };
             if candidate.port() != 0 && seen.insert(candidate) {
-                collected.push(socket_addr_to_direct_addr(candidate));
+                collected.push(candidate);
             }
         }
 
         for addr in self.endpoint.addr().ip_addrs() {
             if addr.port() != 0 && seen.insert(*addr) {
-                collected.push(socket_addr_to_direct_addr(*addr));
+                collected.push(*addr);
             }
         }
 
+        collected
+    }
+
+    /// Returns the remote socket address of a currently connected peer (pending or allowed),
+    /// for per-`(joiner_pubkey, source_ip)` LAN PIN rate limiting.
+    pub async fn peer_remote_addr(&self, peer_pubkey: [u8; 32]) -> Option<SocketAddr> {
+        let peer_id = PublicKey::from_bytes(&peer_pubkey).ok()?;
+        let peers = self
+            .shared
+            .peers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let active = peers.get(&peer_id)?;
+        if active.conn.close_reason().is_some() {
+            return None;
+        }
+        extract_conn_remote_ip(&active.conn).or(active.remote_addr)
+    }
+
+    pub fn local_endpoint_descriptor(&self) -> EndpointDescriptor {
+        if self.shared.relay_policy == RelayPolicy::ForceRelays {
+            return EndpointDescriptor {
+                transport_kind: TransportKind::IrohQuic,
+                relay_url: self
+                    .shared
+                    .pinned_relay_url_str
+                    .clone()
+                    .unwrap_or_default(),
+                direct_addrs: Vec::new(),
+            };
+        }
+
+        let mut collected: Vec<DirectAddr> = self
+            .local_direct_addrs()
+            .into_iter()
+            .map(socket_addr_to_direct_addr)
+            .collect();
         collected.truncate(MAX_DIRECT_ADDRS);
 
         let relay_url = match self.shared.relay_policy {
@@ -459,11 +598,15 @@ impl PartyP2pHandle {
                 .peers
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
-            peers
-                .keys()
-                .filter(|id| !next_allowed.contains(*id))
-                .copied()
-                .collect()
+            let mut revoke = Vec::new();
+            for (id, peer) in peers.iter() {
+                if next_allowed.contains(id) {
+                    peer.is_pending.store(false, Ordering::Release);
+                } else {
+                    revoke.push(*id);
+                }
+            }
+            revoke
         };
         for peer_id in to_revoke {
             self.shared.close_and_remove_peer(
@@ -474,6 +617,104 @@ impl PartyP2pHandle {
                 true,
             );
         }
+    }
+
+    /// Additively adds `peer_pubkey` to `allowed_peers` AND promotes any currently connected
+    /// pending LAN peer (`is_pending = false`), unlocking Lane 1 (`Causal`) and Lane 2
+    /// (`Ephemeral`) immediately on the live QUIC connection without dropping it.
+    pub async fn allow_peer(&self, peer_pubkey: [u8; 32]) -> Result<(), P2pError> {
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Err(P2pError::Closed);
+        }
+        let peer_id =
+            PublicKey::from_bytes(&peer_pubkey).map_err(|_| P2pError::InvalidPeerPubkey)?;
+
+        {
+            let mut guard = self
+                .shared
+                .allowed_peers
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !guard.contains(&peer_id) {
+                if guard.len() >= MAX_ALLOWED_PEERS {
+                    return Err(P2pError::Capacity);
+                }
+                guard.insert(peer_id);
+            }
+        }
+
+        // Promote any currently connected pending peer immediately on the live connection.
+        {
+            let peers = self
+                .shared
+                .peers
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(peer) = peers.get(&peer_id) {
+                peer.is_pending.store(false, Ordering::Release);
+            }
+        }
+        Ok(())
+    }
+
+    /// Toggles opt-in open LAN admission (`NoRelays` mode only).
+    ///
+    /// Fail-closed no-op when `effective_relay_policy != RelayPolicy::NoRelays`.
+    /// Setting `open = false` immediately stops admitting new unknown LAN peers and closes
+    /// all still-pending un-allowlisted peers (`CLOSE_UNAUTHORIZED`), while preserving
+    /// already-allowlisted / promoted peers.
+    pub async fn set_lan_open_admission(&self, open: bool) {
+        if self.shared.closed.load(Ordering::Acquire) {
+            return;
+        }
+        if self.shared.relay_policy != RelayPolicy::NoRelays {
+            return;
+        }
+
+        self.shared
+            .lan_open_admission
+            .store(open, Ordering::Release);
+
+        if !open {
+            let drained_pending: Vec<(EndpointId, ActivePeer)> = {
+                let mut peers = self
+                    .shared
+                    .peers
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let pending_ids: Vec<EndpointId> = peers
+                    .iter()
+                    .filter(|(id, p)| {
+                        p.is_pending.load(Ordering::Acquire) && !self.shared.is_allowed(id)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                let mut removed = Vec::with_capacity(pending_ids.len());
+                for id in pending_ids {
+                    if let Some(peer) = peers.remove(&id) {
+                        removed.push((id, peer));
+                    }
+                }
+                removed
+            };
+            for (peer_id, mut peer) in drained_pending {
+                peer.conn
+                    .close(VarInt::from_u32(CLOSE_UNAUTHORIZED), b"lan_admission_closed");
+                peer.shutdown();
+                let _ = self
+                    .shared
+                    .lifecycle_tx
+                    .try_send(P2pTransportEvent::PeerDisconnected {
+                        peer_pubkey: *peer_id.as_bytes(),
+                        reason_code: CLOSE_UNAUTHORIZED,
+                    });
+            }
+        }
+    }
+
+    /// Returns whether opt-in LAN open admission is currently active.
+    pub fn is_lan_open_admission(&self) -> bool {
+        self.shared.is_lan_open_admission()
     }
 
     pub fn revoke_peer(&self, pubkey: [u8; 32], close_code: u32) {
@@ -590,6 +831,63 @@ impl PartyP2pHandle {
             return Err(P2pError::PeerNotAllowed);
         }
 
+        self.dial_validated(peer_id, target.device_pubkey, transport_addrs)
+            .await
+    }
+
+    /// Dials an explicitly allowlisted peer directly by Ed25519 `peer_pubkey` and direct
+    /// UDP `SocketAddr`s with zero relay URLs.
+    pub async fn connect_direct(
+        &self,
+        peer_pubkey: [u8; 32],
+        addrs: &[SocketAddr],
+    ) -> Result<(), P2pError> {
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Err(P2pError::Closed);
+        }
+        if self.shared.relay_policy == RelayPolicy::ForceRelays {
+            return Err(P2pError::PolicyViolation(
+                "force_relays forbids direct IP connections".into(),
+            ));
+        }
+
+        let peer_id =
+            PublicKey::from_bytes(&peer_pubkey).map_err(|_| P2pError::InvalidPeerPubkey)?;
+        if peer_id == self.endpoint.id() {
+            return Err(P2pError::SelfConnect);
+        }
+        if addrs.is_empty() {
+            return Err(P2pError::InvalidConfig(
+                "connect_direct requires at least one direct address".into(),
+            ));
+        }
+        if addrs.len() > MAX_DIRECT_ADDRS {
+            return Err(P2pError::InvalidConfig("too many direct addresses".into()));
+        }
+
+        let mut transport_addrs = Vec::with_capacity(addrs.len());
+        for &addr in addrs {
+            transport_addrs.push(TransportAddr::Ip(validate_direct_socket_addr(addr)?));
+        }
+
+        if !self.shared.is_allowed(&peer_id) {
+            return Err(P2pError::PeerNotAllowed);
+        }
+
+        self.dial_validated(peer_id, peer_pubkey, transport_addrs)
+            .await
+    }
+
+    async fn dial_validated(
+        &self,
+        peer_id: EndpointId,
+        peer_pubkey: [u8; 32],
+        transport_addrs: Vec<TransportAddr>,
+    ) -> Result<(), P2pError> {
+        let initial_remote_addr = transport_addrs.iter().find_map(|addr| match addr {
+            TransportAddr::Ip(sock) => Some(*sock),
+            _ => None,
+        });
         let endpoint_addr = EndpointAddr::from_parts(peer_id, transport_addrs);
         let conn = tokio::time::timeout(
             DEFAULT_CONNECT_TIMEOUT,
@@ -655,9 +953,9 @@ impl PartyP2pHandle {
             Ok(Ok(streams)) => streams,
             Ok(Err(err)) => {
                 // If the remote closed our losing glare dial with 4409 SUPERSEDED and we
-                // already hold a live connection to `peer_id`, treat connect_peer as succeeded.
+                // already hold a live connection to `peer_id`, treat connect as succeeded.
                 if is_superseded_close(&conn.close_reason())
-                    && self.is_peer_connected(&target.device_pubkey)
+                    && self.is_peer_connected(&peer_pubkey)
                 {
                     return Ok(());
                 }
@@ -689,6 +987,9 @@ impl PartyP2pHandle {
             control_recv,
             causal_send,
             causal_recv,
+            false,
+            None,
+            initial_remote_addr,
         )
     }
 
@@ -702,18 +1003,9 @@ impl PartyP2pHandle {
         }
         let peer_id =
             PublicKey::from_bytes(&peer_pubkey).map_err(|_| P2pError::InvalidPeerPubkey)?;
-        if !self.shared.is_allowed(&peer_id) {
-            return Err(P2pError::PeerNotAllowed);
-        }
+        let allowed = self.shared.is_allowed(&peer_id);
 
         let lane = frame.lane();
-        let encoded = encode_p2p_party_frame(frame).map_err(|e| match e {
-            P2pWireError::FrameOversized | P2pWireError::FieldTooLarge => P2pError::FrameTooLarge,
-            other => P2pError::WireError(other),
-        })?;
-        if encoded.len() > lane.max_frame_bytes() {
-            return Err(P2pError::FrameTooLarge);
-        }
 
         enum SendHandle {
             Stream(mpsc::Sender<BudgetedFrame>, Arc<Semaphore>),
@@ -727,8 +1019,20 @@ impl PartyP2pHandle {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
             let Some(active) = peers.get(&peer_id) else {
-                return Err(P2pError::PeerNotConnected);
+                return Err(if allowed {
+                    P2pError::PeerNotConnected
+                } else {
+                    P2pError::PeerNotAllowed
+                });
             };
+            if !allowed {
+                let can_send_pending_control = lane == P2pLane::Control
+                    && active.is_pending.load(Ordering::Acquire)
+                    && self.shared.is_lan_open_admission();
+                if !can_send_pending_control {
+                    return Err(P2pError::PeerNotAllowed);
+                }
+            }
             if active.conn.close_reason().is_some() {
                 return Err(P2pError::PeerNotConnected);
             }
@@ -742,6 +1046,14 @@ impl PartyP2pHandle {
                 P2pLane::Ephemeral => SendHandle::Datagram(active.conn.clone()),
             }
         };
+
+        let encoded = encode_p2p_party_frame(frame).map_err(|e| match e {
+            P2pWireError::FrameOversized | P2pWireError::FieldTooLarge => P2pError::FrameTooLarge,
+            other => P2pError::WireError(other),
+        })?;
+        if encoded.len() > lane.max_frame_bytes() {
+            return Err(P2pError::FrameTooLarge);
+        }
 
         let payload = Bytes::from(encoded);
         match handle {
@@ -769,6 +1081,79 @@ impl PartyP2pHandle {
                 SendDatagramError::ConnectionLost(_) => P2pError::PeerNotConnected,
                 other => P2pError::Transport(other.to_string()),
             }),
+        }
+    }
+
+    /// Sends a `mp1-lan/1` Lane 0 (`Control`) handshake frame (`0x10..=0x13`) to a
+    /// pending or allowlisted peer in strict `RelayPolicy::NoRelays` LAN mode.
+    pub async fn send_lan_handshake(
+        &self,
+        peer_pubkey: [u8; 32],
+        message: &LanHandshakeMessage,
+    ) -> Result<(), P2pError> {
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Err(P2pError::Closed);
+        }
+        if self.shared.relay_policy != RelayPolicy::NoRelays {
+            return Err(P2pError::PolicyViolation(
+                "LAN handshake frames are only permitted under no_relays".into(),
+            ));
+        }
+        let peer_id =
+            PublicKey::from_bytes(&peer_pubkey).map_err(|_| P2pError::InvalidPeerPubkey)?;
+        let allowed = self.shared.is_allowed(&peer_id);
+
+        let (tx, budget) = {
+            let peers = self
+                .shared
+                .peers
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            let Some(active) = peers.get(&peer_id) else {
+                return Err(if allowed {
+                    P2pError::PeerNotConnected
+                } else {
+                    P2pError::PeerNotAllowed
+                });
+            };
+            if !allowed {
+                let can_send_pending_control = active.is_pending.load(Ordering::Acquire)
+                    && self.shared.is_lan_open_admission();
+                if !can_send_pending_control {
+                    return Err(P2pError::PeerNotAllowed);
+                }
+            }
+            if active.conn.close_reason().is_some() {
+                return Err(P2pError::PeerNotConnected);
+            }
+            (active.control_tx.clone(), Arc::clone(&active.control_budget))
+        };
+
+        let encoded = encode_lan_handshake_frame(message).map_err(|e| match e {
+            LanProtocolError::FrameTooLarge => P2pError::FrameTooLarge,
+            other => P2pError::Transport(format!("invalid LAN handshake frame: {other}")),
+        })?;
+        if encoded.len() > P2pLane::Control.max_frame_bytes() {
+            return Err(P2pError::FrameTooLarge);
+        }
+
+        let payload = Bytes::from(encoded);
+        let units = byte_budget_units(payload.len());
+        let send_fut = async {
+            let permit = budget
+                .acquire_many_owned(units)
+                .await
+                .map_err(|_| P2pError::PeerNotConnected)?;
+            tx.send(BudgetedFrame {
+                payload,
+                _permit: permit,
+            })
+            .await
+            .map_err(|_| P2pError::PeerNotConnected)
+        };
+        match tokio::time::timeout(SEND_QUEUE_TIMEOUT, send_fut).await {
+            Ok(res) => res,
+            Err(_) => Err(P2pError::Timeout),
         }
     }
 
@@ -915,10 +1300,53 @@ pub struct PartyP2pTransport {
 
 impl PartyP2pTransport {
     pub async fn spawn(config: PartyP2pConfig) -> Result<Self, P2pError> {
+        Self::spawn_with_lan(config, None).await
+    }
+
+    /// Spawns a per-party P2P transport with optional explicit LAN (`NoRelays`) configuration.
+    ///
+    /// Fails closed with [`P2pError::InvalidConfig`] before opening any socket if:
+    /// - `lan.lan_open_admission == true` without `lan.no_relays == true`
+    /// - `lan.no_relays == true` with `effective_relay_policy != RelayPolicy::NoRelays`
+    ///   (including `ForceRelays` or `AllowRelays`)
+    /// - `lan.lan_bind_port.is_some()` without `lan.no_relays == true`
+    /// - `lan.no_relays == true` with a non-empty `pinned_relay_url`
+    pub async fn spawn_with_lan(
+        config: PartyP2pConfig,
+        lan: Option<LanTransportConfig>,
+    ) -> Result<Self, P2pError> {
         let raw_relay = config
             .pinned_relay_url
             .as_deref()
             .filter(|s| !s.is_empty());
+
+        let (initial_lan_open_admission, lan_bind_port) = if let Some(lan_cfg) = lan {
+            if lan_cfg.lan_open_admission && !lan_cfg.no_relays {
+                return Err(P2pError::InvalidConfig(
+                    "lan_open_admission requires no_relays == true".into(),
+                ));
+            }
+            if lan_cfg.lan_bind_port.is_some() && !lan_cfg.no_relays {
+                return Err(P2pError::InvalidConfig(
+                    "lan_bind_port requires no_relays == true".into(),
+                ));
+            }
+            if lan_cfg.no_relays {
+                if config.effective_relay_policy != RelayPolicy::NoRelays {
+                    return Err(P2pError::InvalidConfig(
+                        "no_relays LAN transport requires RelayPolicy::NoRelays".into(),
+                    ));
+                }
+                if raw_relay.is_some() {
+                    return Err(P2pError::InvalidConfig(
+                        "no_relays LAN transport forbids pinned_relay_url".into(),
+                    ));
+                }
+            }
+            (lan_cfg.lan_open_admission, lan_cfg.lan_bind_port)
+        } else {
+            (false, None)
+        };
 
         let parsed_relay = match (config.effective_relay_policy, raw_relay) {
             (RelayPolicy::ForceRelays, None) => {
@@ -958,6 +1386,8 @@ impl PartyP2pTransport {
             relay_policy: config.effective_relay_policy,
             pinned_relay_url: pinned_relay_url.clone(),
             pinned_relay_url_str,
+            lan_open_admission: AtomicBool::new(initial_lan_open_admission),
+            in_flight_pending_lan: AtomicUsize::new(0),
             allowed_peers: RwLock::new(HashSet::new()),
             peers: RwLock::new(HashMap::new()),
             next_conn_id: AtomicU64::new(0),
@@ -1006,7 +1436,24 @@ impl PartyP2pTransport {
                     .addr_filter(AddrFilter::relay_only())
                     .relay_mode(RelayMode::Custom(RelayMap::from(url)))
             }
-            RelayPolicy::NoRelays => builder.relay_mode(RelayMode::Disabled),
+            RelayPolicy::NoRelays => {
+                let mut no_relay_builder = builder.relay_mode(RelayMode::Disabled);
+                if let Some(port) = lan_bind_port {
+                    let v4_bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+                    let v6_bind = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port);
+                    no_relay_builder = no_relay_builder
+                        .clear_ip_transports()
+                        .bind_addr(v4_bind)
+                        .map_err(|e| {
+                            P2pError::InvalidConfig(format!("invalid IPv4 lan_bind_port: {e}"))
+                        })?
+                        .bind_addr_with_opts(v6_bind, BindOpts::default().set_is_required(false))
+                        .map_err(|e| {
+                            P2pError::InvalidConfig(format!("invalid IPv6 lan_bind_port: {e}"))
+                        })?;
+                }
+                no_relay_builder
+            }
             RelayPolicy::AllowRelays => {
                 if let Some(url) = pinned_relay_url {
                     builder.relay_mode(RelayMode::Custom(RelayMap::from(url)))
@@ -1085,6 +1532,14 @@ impl PartyP2pTransport {
         self.handle.is_peer_connected(pubkey)
     }
 
+    pub fn local_direct_addrs(&self) -> Vec<SocketAddr> {
+        self.handle.local_direct_addrs()
+    }
+
+    pub async fn peer_remote_addr(&self, peer_pubkey: [u8; 32]) -> Option<SocketAddr> {
+        self.handle.peer_remote_addr(peer_pubkey).await
+    }
+
     pub fn local_endpoint_descriptor(&self) -> EndpointDescriptor {
         self.handle.local_endpoint_descriptor()
     }
@@ -1102,6 +1557,18 @@ impl PartyP2pTransport {
             .set_allowed_peers_with_close_code(pubkeys, close_code);
     }
 
+    pub async fn allow_peer(&self, peer_pubkey: [u8; 32]) -> Result<(), P2pError> {
+        self.handle.allow_peer(peer_pubkey).await
+    }
+
+    pub async fn set_lan_open_admission(&self, open: bool) {
+        self.handle.set_lan_open_admission(open).await;
+    }
+
+    pub fn is_lan_open_admission(&self) -> bool {
+        self.handle.is_lan_open_admission()
+    }
+
     pub fn revoke_peer(&self, pubkey: [u8; 32], close_code: u32) {
         self.handle.revoke_peer(pubkey, close_code);
     }
@@ -1110,12 +1577,28 @@ impl PartyP2pTransport {
         self.handle.connect_peer(target).await
     }
 
+    pub async fn connect_direct(
+        &self,
+        peer_pubkey: [u8; 32],
+        addrs: &[SocketAddr],
+    ) -> Result<(), P2pError> {
+        self.handle.connect_direct(peer_pubkey, addrs).await
+    }
+
     pub async fn send_frame(
         &self,
         peer_pubkey: [u8; 32],
         frame: &P2pPartyFrame,
     ) -> Result<(), P2pError> {
         self.handle.send_frame(peer_pubkey, frame).await
+    }
+
+    pub async fn send_lan_handshake(
+        &self,
+        peer_pubkey: [u8; 32],
+        message: &LanHandshakeMessage,
+    ) -> Result<(), P2pError> {
+        self.handle.send_lan_handshake(peer_pubkey, message).await
     }
 
     /// Receives the next transport event using a biased select that strictly prioritizes
@@ -1184,37 +1667,61 @@ fn validate_relay_url(raw: &str) -> Result<(RelayUrl, String), P2pError> {
     Ok((relay_url, canonical))
 }
 
-fn direct_addr_to_socket_addr(addr: &DirectAddr) -> Result<SocketAddr, P2pError> {
+fn validate_direct_socket_addr(addr: SocketAddr) -> Result<SocketAddr, P2pError> {
     if addr.port() == 0 {
         return Err(P2pError::InvalidConfig("direct address port is 0".into()));
     }
-    match *addr {
-        DirectAddr::V4 { ip, port } => {
-            let v4 = Ipv4Addr::from(ip);
-            if v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast() {
+    match addr {
+        SocketAddr::V4(v4) => {
+            let ip = v4.ip();
+            if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() {
                 return Err(P2pError::InvalidConfig(
                     "disallowed IPv4 direct address".into(),
                 ));
             }
-            Ok(SocketAddr::new(IpAddr::V4(v4), port))
+            Ok(addr)
         }
-        DirectAddr::V6 { ip, port } => {
-            let v6 = Ipv6Addr::from(ip);
-            if v6.is_unspecified() || v6.is_multicast() {
+        SocketAddr::V6(v6) => {
+            let ip = v6.ip();
+            if ip.is_unspecified() || ip.is_multicast() {
                 return Err(P2pError::InvalidConfig(
                     "disallowed IPv6 direct address".into(),
                 ));
             }
-            if let Some(v4) = v6.to_ipv4_mapped()
+            if let Some(v4) = ip.to_ipv4_mapped()
                 && (v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast())
             {
                 return Err(P2pError::InvalidConfig(
                     "disallowed IPv4-mapped IPv6 direct address".into(),
                 ));
             }
-            Ok(SocketAddr::new(IpAddr::V6(v6), port))
+            Ok(addr)
         }
     }
+}
+
+fn direct_addr_to_socket_addr(addr: &DirectAddr) -> Result<SocketAddr, P2pError> {
+    let sock = match *addr {
+        DirectAddr::V4 { ip, port } => SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port),
+        DirectAddr::V6 { ip, port } => SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), port),
+    };
+    validate_direct_socket_addr(sock)
+}
+
+fn extract_conn_remote_ip(conn: &Connection) -> Option<SocketAddr> {
+    let paths = conn.paths();
+    let mut fallback: Option<SocketAddr> = None;
+    for path in paths.iter() {
+        if let TransportAddr::Ip(addr) = path.remote_addr() {
+            if path.is_selected() {
+                return Some(*addr);
+            }
+            if fallback.is_none() {
+                fallback = Some(*addr);
+            }
+        }
+    }
+    fallback
 }
 
 fn socket_addr_to_direct_addr(addr: SocketAddr) -> DirectAddr {
@@ -1316,10 +1823,33 @@ async fn write_framed_stream(
     let _ = send.finish();
 }
 
+fn check_inbound_lane_allowed(
+    shared: &SharedState,
+    peer_id: &EndpointId,
+    lane: P2pLane,
+    is_pending: &AtomicBool,
+) -> Result<(), (u32, &'static [u8])> {
+    if shared.is_allowed(peer_id) {
+        return Ok(());
+    }
+    if is_pending.load(Ordering::Acquire) {
+        if lane == P2pLane::Control {
+            if shared.is_lan_open_admission() {
+                return Ok(());
+            }
+            return Err((CLOSE_UNAUTHORIZED, b"lan_admission_closed"));
+        }
+        return Err((CLOSE_PROTOCOL_VIOLATION, b"pending_peer_lane_violation"));
+    }
+    Err((CLOSE_PEER_REVOKED, b"peer_revoked"))
+}
+
 async fn read_framed_stream(
     mut recv: RecvStream,
     lane: P2pLane,
     peer_id: EndpointId,
+    conn_id: u64,
+    is_pending: Arc<AtomicBool>,
     conn: Connection,
     shared: Arc<SharedState>,
 ) {
@@ -1328,46 +1858,96 @@ async fn read_framed_stream(
     loop {
         if recv.read_exact(&mut len_buf).await.is_err() {
             if !shared.closed.load(Ordering::Acquire) && conn.close_reason().is_none() {
-                conn.close(
-                    VarInt::from_u32(CLOSE_PROTOCOL_VIOLATION),
+                shared.close_and_remove_peer(
+                    &peer_id,
+                    Some(conn_id),
+                    CLOSE_PROTOCOL_VIOLATION,
                     b"stream_closed_unexpectedly",
+                    true,
                 );
             }
             return;
         }
+        if let Err((code, reason)) =
+            check_inbound_lane_allowed(&shared, &peer_id, lane, &is_pending)
+        {
+            shared.close_and_remove_peer(&peer_id, Some(conn_id), code, reason, true);
+            return;
+        }
         let len = u32::from_le_bytes(len_buf) as usize;
         if len > max_bytes {
-            conn.close(VarInt::from_u32(CLOSE_FRAME_TOO_LARGE), b"frame_too_large");
+            shared.close_and_remove_peer(
+                &peer_id,
+                Some(conn_id),
+                CLOSE_FRAME_TOO_LARGE,
+                b"frame_too_large",
+                true,
+            );
             return;
         }
         let mut payload = vec![0u8; len];
         if len > 0 && recv.read_exact(&mut payload).await.is_err() {
             if !shared.closed.load(Ordering::Acquire) && conn.close_reason().is_none() {
-                conn.close(
-                    VarInt::from_u32(CLOSE_PROTOCOL_VIOLATION),
+                shared.close_and_remove_peer(
+                    &peer_id,
+                    Some(conn_id),
+                    CLOSE_PROTOCOL_VIOLATION,
                     b"stream_truncated_unexpectedly",
+                    true,
                 );
             }
             return;
         }
-        if !shared.is_allowed(&peer_id) {
-            conn.close(VarInt::from_u32(CLOSE_PEER_REVOKED), b"peer_revoked");
+        if let Err((code, reason)) =
+            check_inbound_lane_allowed(&shared, &peer_id, lane, &is_pending)
+        {
+            shared.close_and_remove_peer(&peer_id, Some(conn_id), code, reason, true);
             return;
         }
-        let frame = match decode_p2p_party_frame(lane, &payload) {
-            Ok(frame) => frame,
-            Err(err) => {
-                conn.close(
-                    VarInt::from_u32(wire_error_close_code(err)),
-                    b"invalid_party_frame",
-                );
-                return;
+        let event = if lane == P2pLane::Control
+            && shared.relay_policy == RelayPolicy::NoRelays
+            && is_lan_handshake_frame(&payload)
+        {
+            match decode_lan_handshake_frame(lane, &payload) {
+                Ok(message) => P2pTransportEvent::LanHandshakeReceived {
+                    peer_pubkey: *peer_id.as_bytes(),
+                    message,
+                },
+                Err(err) => {
+                    let code = if err == LanProtocolError::FrameTooLarge {
+                        CLOSE_FRAME_TOO_LARGE
+                    } else {
+                        CLOSE_PROTOCOL_VIOLATION
+                    };
+                    shared.close_and_remove_peer(
+                        &peer_id,
+                        Some(conn_id),
+                        code,
+                        b"invalid_lan_handshake_frame",
+                        true,
+                    );
+                    return;
+                }
             }
-        };
-        let event = P2pTransportEvent::FrameReceived {
-            peer_pubkey: *peer_id.as_bytes(),
-            lane,
-            frame,
+        } else {
+            let frame = match decode_p2p_party_frame(lane, &payload) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    shared.close_and_remove_peer(
+                        &peer_id,
+                        Some(conn_id),
+                        wire_error_close_code(err),
+                        b"invalid_party_frame",
+                        true,
+                    );
+                    return;
+                }
+            };
+            P2pTransportEvent::FrameReceived {
+                peer_pubkey: *peer_id.as_bytes(),
+                lane,
+                frame,
+            }
         };
         let units = byte_budget_units(len);
         let send_res = match lane {
@@ -1411,14 +1991,22 @@ async fn read_framed_stream(
     }
 }
 
-async fn read_datagram_loop(peer_id: EndpointId, conn: Connection, shared: Arc<SharedState>) {
+async fn read_datagram_loop(
+    peer_id: EndpointId,
+    conn_id: u64,
+    is_pending: Arc<AtomicBool>,
+    conn: Connection,
+    shared: Arc<SharedState>,
+) {
     let max_bytes = P2pLane::Ephemeral.max_frame_bytes();
     loop {
         let Ok(dgram) = conn.read_datagram().await else {
             return;
         };
-        if !shared.is_allowed(&peer_id) {
-            conn.close(VarInt::from_u32(CLOSE_PEER_REVOKED), b"peer_revoked");
+        if let Err((code, reason)) =
+            check_inbound_lane_allowed(&shared, &peer_id, P2pLane::Ephemeral, &is_pending)
+        {
+            shared.close_and_remove_peer(&peer_id, Some(conn_id), code, reason, true);
             return;
         }
         if dgram.len() > max_bytes {
@@ -1455,15 +2043,20 @@ fn register_active_peer(
     control_recv: RecvStream,
     causal_send: SendStream,
     causal_recv: RecvStream,
+    is_pending_lan: bool,
+    pending_guard: Option<InFlightPendingGuard>,
+    initial_remote_addr: Option<SocketAddr>,
 ) -> Result<(), P2pError> {
     if shared.closed.load(Ordering::Acquire) {
         conn.close(VarInt::from_u32(CLOSE_SHUTDOWN), b"endpoint_closed");
         return Err(P2pError::Closed);
     }
-    if !shared.is_allowed(&peer_id) {
+    if !shared.is_allowed(&peer_id) && (!is_pending_lan || !shared.is_lan_open_admission()) {
         conn.close(VarInt::from_u32(CLOSE_UNAUTHORIZED), b"peer_not_allowed");
         return Err(P2pError::PeerNotAllowed);
     }
+
+    let remote_addr = extract_conn_remote_ip(&conn).or(initial_remote_addr);
 
     let old = {
         let mut peers = shared.peers.write().unwrap_or_else(PoisonError::into_inner);
@@ -1472,11 +2065,34 @@ fn register_active_peer(
             conn.close(VarInt::from_u32(CLOSE_SHUTDOWN), b"endpoint_closed");
             return Err(P2pError::Closed);
         }
-        if !shared.is_allowed(&peer_id) {
-            drop(peers);
-            conn.close(VarInt::from_u32(CLOSE_PEER_REVOKED), b"peer_revoked");
-            return Err(P2pError::PeerNotAllowed);
-        }
+        let is_allowed_now = shared.is_allowed(&peer_id);
+        let effective_pending = if is_allowed_now {
+            false
+        } else {
+            if !is_pending_lan || !shared.is_lan_open_admission() {
+                drop(peers);
+                let (code, reason): (u32, &[u8]) = if is_pending_lan {
+                    (CLOSE_UNAUTHORIZED, b"lan_admission_closed")
+                } else {
+                    (CLOSE_PEER_REVOKED, b"peer_revoked")
+                };
+                conn.close(VarInt::from_u32(code), reason);
+                return Err(P2pError::PeerNotAllowed);
+            }
+            let other_pending = peers
+                .iter()
+                .filter(|(id, p)| **id != peer_id && p.is_pending.load(Ordering::Acquire))
+                .count();
+            if other_pending >= MAX_PENDING_LAN_PEERS {
+                drop(peers);
+                conn.close(
+                    VarInt::from_u32(CLOSE_UNAUTHORIZED),
+                    b"pending_lan_cap_reached",
+                );
+                return Err(P2pError::PeerNotAllowed);
+            }
+            true
+        };
 
         // Deterministic simultaneous-dial glare tie-break on healthy opposite-direction connections:
         // the connection initiated by the lexicographically smaller EndpointId wins.
@@ -1493,6 +2109,7 @@ fn register_active_peer(
         }
 
         let conn_id = shared.next_conn_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let is_pending = Arc::new(AtomicBool::new(effective_pending));
         let (control_tx, control_rx) = mpsc::channel(LANE_CHANNEL_CAPACITY);
         let (causal_tx, causal_rx) = mpsc::channel(LANE_CHANNEL_CAPACITY);
         let control_budget = Arc::new(Semaphore::new(OUTBOUND_CONTROL_BYTE_BUDGET));
@@ -1514,6 +2131,8 @@ fn register_active_peer(
             control_recv,
             P2pLane::Control,
             peer_id,
+            conn_id,
+            Arc::clone(&is_pending),
             conn.clone(),
             Arc::clone(shared),
         ));
@@ -1521,11 +2140,15 @@ fn register_active_peer(
             causal_recv,
             P2pLane::Causal,
             peer_id,
+            conn_id,
+            Arc::clone(&is_pending),
             conn.clone(),
             Arc::clone(shared),
         ));
         let t_dgram_r = tokio::spawn(read_datagram_loop(
             peer_id,
+            conn_id,
+            Arc::clone(&is_pending),
             conn.clone(),
             Arc::clone(shared),
         ));
@@ -1542,6 +2165,8 @@ fn register_active_peer(
             conn_id,
             is_outbound,
             conn,
+            remote_addr,
+            is_pending,
             control_tx,
             control_budget,
             causal_tx,
@@ -1551,7 +2176,10 @@ fn register_active_peer(
             ],
         };
 
-        peers.insert(peer_id, active)
+        let previous = peers.insert(peer_id, active);
+        // Transfer slot accounting from in-flight to active map under the write lock.
+        drop(pending_guard);
+        previous
     };
 
     if let Some(mut previous) = old {
@@ -1570,6 +2198,10 @@ fn register_active_peer(
 }
 
 async fn handle_incoming_connection(incoming: Incoming, shared: Arc<SharedState>) {
+    let initial_remote_addr = match incoming.remote_addr() {
+        IncomingAddr::Ip(addr) => Some(addr),
+        _ => None,
+    };
     let Ok(accepting) = incoming.accept() else {
         return;
     };
@@ -1583,9 +2215,26 @@ async fn handle_incoming_connection(incoming: Incoming, shared: Arc<SharedState>
         conn.close(VarInt::from_u32(CLOSE_PROTOCOL_VIOLATION), b"wrong_alpn");
         return;
     }
+    let mut is_pending_lan = false;
+    let mut pending_guard: Option<InFlightPendingGuard> = None;
     if !shared.is_allowed(&remote_id) {
-        conn.close(VarInt::from_u32(CLOSE_UNAUTHORIZED), b"peer_not_allowed");
-        return;
+        if !shared.is_lan_open_admission() {
+            conn.close(VarInt::from_u32(CLOSE_UNAUTHORIZED), b"peer_not_allowed");
+            return;
+        }
+        match shared.try_reserve_in_flight_pending(&remote_id) {
+            Some(guard) => {
+                is_pending_lan = true;
+                pending_guard = Some(guard);
+            }
+            None => {
+                conn.close(
+                    VarInt::from_u32(CLOSE_UNAUTHORIZED),
+                    b"pending_lan_cap_reached",
+                );
+                return;
+            }
+        }
     }
 
     // Accept bidirectional Stream 0 (Control) and Stream 4 (Causal) in any arrival order.
@@ -1626,7 +2275,7 @@ async fn handle_incoming_connection(incoming: Incoming, shared: Arc<SharedState>
             return Err(CLOSE_PROTOCOL_VIOLATION);
         };
 
-        if !shared.is_allowed(&remote_id) {
+        if !shared.is_allowed(&remote_id) && (!is_pending_lan || !shared.is_lan_open_admission()) {
             return Err(CLOSE_UNAUTHORIZED);
         }
 
@@ -1652,6 +2301,9 @@ async fn handle_incoming_connection(incoming: Incoming, shared: Arc<SharedState>
                 control_recv,
                 causal_send,
                 causal_recv,
+                is_pending_lan,
+                pending_guard,
+                initial_remote_addr,
             );
         }
         Ok(Err(code)) => {

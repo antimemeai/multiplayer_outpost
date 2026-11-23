@@ -1671,7 +1671,7 @@ dependencies = [
 
 [[package]]
 name = "mp-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2056,7 +2056,7 @@ checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
 name = "outpost-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2085,7 +2085,7 @@ dependencies = [
 
 [[package]]
 name = "outpost-control"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2111,19 +2111,21 @@ dependencies = [
 
 [[package]]
 name = "outpost-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
+ "blake3",
  "ed25519-dalek 2.2.0",
  "mp-protocol",
  "proptest",
  "serde_json",
  "sha2 0.10.9",
+ "zeroize",
 ]
 
 [[package]]
 name = "outpost-daemon"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "mp-protocol",
@@ -2134,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "outpost-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.2.17",
@@ -2147,7 +2149,7 @@ dependencies = [
 
 [[package]]
 name = "outpost-p2p"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "iroh",

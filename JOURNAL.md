@@ -115,3 +115,14 @@ Authored `docs/OUTPOST_ARCHITECTURE_AND_SPEC.md` (v1 Draft) and ran all 5 indepe
    - Wired native `mp-outpost upgrade [--check] [--yes|-y] [--version TAG] [--base-url URL] [--install-path PATH]` (TLS 1.3-only, dual `release-manifest.json` + `SHA256SUMS.txt` verification, tarball traversal/symlink audit, offline `--version` smoke check, atomic `0755` swap, best-effort daemon drain).
    - Added handle-first `friend add|accept|deny|decline|remove|block <@handle|account_id>` and incoming-first sorted `friend list` with human labels and actionable accept/deny hints.
    - Added opt-in `mp-outpost mcp setup --client <claude|codex|cursor|antigravity> --write [--config <path>] [--global]` with `.bak` backup, non-destructive JSON merge / idempotent TOML upsert, and atomic write.
+
+## 2026-11-23 — `v0.4.0` LAN Party! Mode (`mp1-lan/1`) & Roadmap v2 Online Parity
+
+1. **Zero-Internet LAN Party! Mode (`mp1-lan/1`, interoperable with Blackbird `v0.3.0`):**
+   - Implemented canonical `mp1-lan/1` protocol & mDNS codec (`crates/outpost-core/src/lan_protocol.rs`), `iroh` QUIC + TLS 1.3 Mutual RPK `LanTransport` (`crates/outpost-p2p`), and full `mp-outpost lan {status|scan|host|join}` runtime (`crates/outpost-cli/src/lan.rs`) enforcing all 6 Operator Security Mandates (zero-socket `lan status`, `MP_DISABLE_LAN=1` / `/etc/mp-outpost/lan.toml` fail-closed kill-switch, global `--pin`/`--pin=` argv rejection without echo, hidden `/dev/tty` or `--pin-stdin` PIN input with per-peer/lobby rate limits, Safety Number verification & pinning, and nonce-fenced peer chat).
+2. **Roadmap v2 Online Parity & IPC Schema v3:**
+   - Bumped `IPC_SCHEMA_VER = 3` (`crates/outpost-core/src/ipc_wire.rs`) for binary `FriendItem.safety_number` and `PartyCreateReq.{org_id, group_id}`.
+   - Enriched `GET /v1/friends` handling in `app_daemon.rs` + `friend list`: populates `@handle` from `peer_handle` and computes canonical Safety Numbers locally from strictly validated `peer_root_pubkey_b64` (never trusting mismatched server `peer_safety_number`).
+   - Added `mp-outpost relays [--ping] [--api-authority <host>] [--json]` with concurrent TLS 1.3 `/ping` probes and fastest-region ranking, plus actionable `409 relay_mismatch` IPC error diagnostics naming the party's `pinned_relay_url`.
+   - Wired `--org-id <id>` and `--group-id <id>` scoped party creation through `party create` -> IPC -> `ControlClient::create_party_with_scope`.
+   - Added compiled-binary E2E Oracle 7 verifying `lan status`, `MP_DISABLE_LAN=1` fail-closed, `--pin` argv guard, live 2-binary encrypted QUIC LAN Party chat on loopback, and TLS 1.3 `relays [--ping] --json`.

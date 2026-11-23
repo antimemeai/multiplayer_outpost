@@ -568,7 +568,7 @@ fn ipc_wire_2mib_bounds_ready_pipe_and_zero_respawn_war_policy() {
     }
 
     // A/B/A version coexistence oracle: compatible builds NEVER kill each other; mcp NEVER kills!
-    assert_eq!(IPC_SCHEMA_VER, 2);
+    assert_eq!(IPC_SCHEMA_VER, 3);
     let local_a = HelloPayload {
         ipc_schema_ver: IPC_SCHEMA_VER,
         build_order: 100,
@@ -1612,6 +1612,761 @@ fn gate2_l1_zeroize_bytes_clears_buffer() {
     mp_protocol::crypto::zeroize_bytes(&mut buf);
     assert_eq!(buf, [0u8; 32]);
 }
+
+// ---------------------------------------------------------------------------
+// 11. v0.4.0 Lane A: mp-protocol Roadmap v2 Sync & mp1-lan/1 Interop Oracles
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v040_mp_protocol_roadmap_v2_inbox_relay_hardening_and_test_vectors() {
+    use mp_protocol::{
+        ENC_SUBKEY_CERT_BODY_BYTES, ENC_SUBKEY_CERT_BYTES, ENC_SUBKEY_CERT_DOMAIN_SEP, Mp1Message,
+        Opcode, SocketRole, decode_frame, encode_frame, validate_corporate_relay_url,
+        validate_relay_url, validate_x25519_pubkey_strict, verify_enc_subkey_cert,
+    };
+
+    // 1. Updated docs/TEST_VECTORS.json contains dead_drop_inbox_suite1 metadata
+    let tv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/TEST_VECTORS.json");
+    let raw = std::fs::read_to_string(&tv_path).expect("docs/TEST_VECTORS.json must exist");
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+    let inbox = &v["dead_drop_inbox_suite1"];
+    assert_eq!(inbox["suite"].as_u64(), Some(1));
+    assert_eq!(
+        inbox["enc_cert_domain_sep"].as_str(),
+        Some(ENC_SUBKEY_CERT_DOMAIN_SEP)
+    );
+    assert_eq!(
+        inbox["enc_cert_bytes"].as_u64(),
+        Some(ENC_SUBKEY_CERT_BYTES as u64)
+    );
+    assert_eq!(inbox["mp1_opcodes"]["INBOX_NOTIFY"].as_str(), Some("0x0106"));
+    assert_eq!(inbox["mp1_opcodes"]["INBOX_ACKED"].as_str(), Some("0x0107"));
+
+    // 2. InboxNotify (0x0106) & InboxAcked (0x0107) round-trip and server-only policy
+    assert_eq!(Opcode::InboxNotify as u16, 0x0106);
+    assert_eq!(Opcode::InboxAcked as u16, 0x0107);
+    assert!(!Opcode::InboxNotify.is_allowed_from_client(SocketRole::Account));
+    assert!(!Opcode::InboxNotify.is_allowed_from_client(SocketRole::Party));
+    assert!(!Opcode::InboxAcked.is_allowed_from_client(SocketRole::Account));
+    assert!(!Opcode::InboxAcked.is_allowed_from_client(SocketRole::Party));
+
+    let notify = Mp1Message::InboxNotify {
+        drop_id: 42_001,
+        sender_account_id: AccountId::new(1001).unwrap(),
+        created_at_ms: 1_795_430_000_000,
+        expires_at_ms: 1_795_516_400_000,
+        ciphertext_len: 16_384,
+    };
+    let notify_wire = encode_frame(7, &notify).expect("encode InboxNotify");
+    let (hdr, decoded_notify) = decode_frame(&notify_wire).expect("decode InboxNotify");
+    assert_eq!(hdr.opcode, Opcode::InboxNotify);
+    assert_eq!(hdr.seq, 7);
+    assert_eq!(decoded_notify, notify);
+
+    let acked = Mp1Message::InboxAcked {
+        drop_id: 42_001,
+        device_id: DeviceId::new(2002).unwrap(),
+    };
+    let acked_wire = encode_frame(8, &acked).expect("encode InboxAcked");
+    let (ahdr, decoded_acked) = decode_frame(&acked_wire).expect("decode InboxAcked");
+    assert_eq!(ahdr.opcode, Opcode::InboxAcked);
+    assert_eq!(ahdr.seq, 8);
+    assert_eq!(decoded_acked, acked);
+
+    // 3. Hardened validate_relay_url / validate_corporate_relay_url
+    assert!(validate_relay_url("https://relay.multiplayer.tech").is_ok());
+    assert!(validate_relay_url("https://relay.acme-eng.com:8443").is_ok());
+    assert!(validate_corporate_relay_url("https://relay.acme-eng.com").is_ok());
+    assert!(validate_corporate_relay_url("https://relay.multiplayer.tech").is_err());
+    for bad in [
+        "https://relay.local",
+        "https://relay.internal",
+        "https://127.0.0.1.nip.io",
+        "https://xn--bcher-kva.com",
+        "https://relay.acme-eng.com:443",
+        "https://relay.acme-eng.com:1023",
+    ] {
+        assert!(validate_relay_url(bad).is_err(), "must reject {bad}");
+        assert!(validate_corporate_relay_url(bad).is_err(), "must reject {bad}");
+    }
+
+    // 4. X25519 strict pubkey & enc_subkey_cert verification
+    assert!(validate_x25519_pubkey_strict(&[0u8; 32]).is_err());
+    let mut good_x25519 = [0x42u8; 32];
+    good_x25519[31] &= 0x7f;
+    assert!(validate_x25519_pubkey_strict(&good_x25519).is_ok());
+
+    let root_sk = SigningKey::from_bytes(&[0x11; 32]);
+    let dev_sk = SigningKey::from_bytes(&[0x22; 32]);
+    let root_pk = root_sk.verifying_key().to_bytes();
+    let dev_pk = dev_sk.verifying_key().to_bytes();
+    let now_s = 1_800_000_000i64;
+    let mut body = [0u8; ENC_SUBKEY_CERT_BODY_BYTES];
+    body[0] = 1;
+    body[1..9].copy_from_slice(&1001u64.to_le_bytes());
+    body[9..17].copy_from_slice(&2002u64.to_le_bytes());
+    body[17..49].copy_from_slice(&root_pk);
+    body[49..81].copy_from_slice(&good_x25519);
+    body[81..89].copy_from_slice(&(now_s - 60).to_le_bytes());
+    body[89..97].copy_from_slice(&(now_s + 3600).to_le_bytes());
+    let mut sig_msg = Vec::new();
+    sig_msg.extend_from_slice(ENC_SUBKEY_CERT_DOMAIN_SEP.as_bytes());
+    sig_msg.extend_from_slice(&body);
+    use ed25519_dalek::Signer as _;
+    let sig = dev_sk.sign(&sig_msg).to_bytes();
+    let mut cert = [0u8; ENC_SUBKEY_CERT_BYTES];
+    cert[..ENC_SUBKEY_CERT_BODY_BYTES].copy_from_slice(&body);
+    cert[ENC_SUBKEY_CERT_BODY_BYTES..].copy_from_slice(&sig);
+    let claims = verify_enc_subkey_cert(&cert, 1001, 2002, &root_pk, &dev_pk, now_s)
+        .expect("valid enc_cert must verify");
+    assert_eq!(claims.enc_pk, good_x25519);
+}
+
+#[test]
+fn v040_lan_pin_proof_blackbird_golden_vector_and_safety_number() {
+    use outpost_core::lan_protocol::{
+        LanProtocolError, compute_lan_pin_proof, compute_lan_safety_number, format_lan_party_id_hex,
+        parse_lan_party_id_hex, validate_lan_pin, verify_lan_pin_proof,
+    };
+
+    let seq32 = |start: u8| -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = start.wrapping_add(i as u8);
+        }
+        out
+    };
+
+    let host_pk = seq32(0x00);
+    let joiner_pk = seq32(0x20);
+    let host_nonce = seq32(0x40);
+
+    // Exact Blackbird v0.3.0 golden vector (blackbird/tests/lan_party_protocol_test.cpp:237)
+    let proof = compute_lan_pin_proof("424242", "0102030405060708", &host_pk, &joiner_pk, &host_nonce)
+        .expect("golden proof");
+    assert_eq!(
+        to_hex(&proof),
+        "13615bcb4c8793ecbd26103a9abdeb767bfd40bdf73820116b0081319d2549c8"
+    );
+    assert!(
+        verify_lan_pin_proof(
+            "424242",
+            "0102030405060708",
+            &host_pk,
+            &joiner_pk,
+            &host_nonce,
+            &proof
+        )
+        .unwrap()
+    );
+
+    let mut flipped = proof;
+    flipped[31] ^= 0x01;
+    assert!(
+        !verify_lan_pin_proof(
+            "424242",
+            "0102030405060708",
+            &host_pk,
+            &joiner_pk,
+            &host_nonce,
+            &flipped
+        )
+        .unwrap()
+    );
+    assert!(
+        !verify_lan_pin_proof(
+            "424243",
+            "0102030405060708",
+            &host_pk,
+            &joiner_pk,
+            &host_nonce,
+            &proof
+        )
+        .unwrap()
+    );
+
+    // PIN validation (C0/DEL/C1/BiDi/Tag controls rejected; UTF-8 NFC & 64B accepted)
+    assert_eq!(validate_lan_pin(""), Err(LanProtocolError::InvalidPin));
+    assert_eq!(
+        validate_lan_pin(&"9".repeat(65)),
+        Err(LanProtocolError::InvalidPin)
+    );
+    for bad_pin in [
+        "ab\0cd",
+        "ab\x1b[31m",
+        "ab\ncd",
+        "ab\x7f",
+        "ab\u{0085}cd",
+        "abc\u{202E}123",
+        "abc\u{2066}123",
+        "abc\u{FEFF}123",
+        "abc\u{E0001}123",
+    ] {
+        assert_eq!(
+            validate_lan_pin(bad_pin),
+            Err(LanProtocolError::InvalidPin),
+            "must reject PIN {bad_pin:?}"
+        );
+    }
+    assert!(validate_lan_pin(&"9".repeat(64)).is_ok());
+    assert!(validate_lan_pin("caf\u{00e9}-42").is_ok());
+
+    // lan_party_id hex parsing
+    let pid = parse_lan_party_id_hex("0102030405060708").unwrap();
+    assert_eq!(format_lan_party_id_hex(&pid), "0102030405060708");
+    assert_eq!(
+        parse_lan_party_id_hex("010203040506070A"),
+        Err(LanProtocolError::InvalidLanPartyId)
+    );
+    assert_eq!(
+        parse_lan_party_id_hex("01020304"),
+        Err(LanProtocolError::InvalidLanPartyId)
+    );
+
+    // Safety number parity for account_id > 0 AND account_id == 0 (local-only LAN identity)
+    let golden_pk: [u8; 32] =
+        from_hex("d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737")
+            .try_into()
+            .unwrap();
+    assert_eq!(
+        compute_lan_safety_number(1001, &golden_pk).unwrap(),
+        "SP44-BGDF-SWJH-YXTV-ZWXT-MNGX-P342-B0TV"
+    );
+    assert_eq!(
+        compute_lan_safety_number(1001, &golden_pk).unwrap(),
+        mp_protocol::compute_safety_number(1001, &golden_pk)
+    );
+    let sn_local = compute_lan_safety_number(0, &golden_pk).unwrap();
+    assert_eq!(sn_local.len(), 39);
+    assert_eq!(sn_local, mp_protocol::compute_safety_number(0, &golden_pk));
+    assert_ne!(sn_local, compute_lan_safety_number(1001, &golden_pk).unwrap());
+    assert_eq!(
+        compute_lan_safety_number(0, &[0u8; 32]),
+        Err(LanProtocolError::InvalidPubkey)
+    );
+    assert_eq!(
+        compute_lan_safety_number(MAX_SAFE_ID + 1, &golden_pk),
+        Err(LanProtocolError::InvalidAccountId)
+    );
+}
+
+#[test]
+fn v040_lan_handshake_frames_roundtrip_and_strict_rejections() {
+    use outpost_core::lan_protocol::{
+        LanHandshakeKind, LanHandshakeMessage, LanHelloMessage, LanJoinMessage, LanMemberInfo,
+        LanProtocolError, LanRosterMessage, LanWelcomeMessage, decode_lan_handshake_frame,
+        encode_lan_handshake_frame, is_lan_handshake_frame,
+    };
+
+    let host_sk = SigningKey::from_bytes(&[0x11; 32]);
+    let host_pk = host_sk.verifying_key().to_bytes();
+    let peer_sk = SigningKey::from_bytes(&[0x22; 32]);
+    let peer_pk = peer_sk.verifying_key().to_bytes();
+
+    let hello = LanHandshakeMessage::Hello(LanHelloMessage {
+        lan_party_id: "0102030405060708".to_string(),
+        lobby_name: "Squad Room".to_string(),
+        host_name: "alice".to_string(),
+        host_account_id: 1001,
+        host_pubkey: host_pk,
+        require_pin: true,
+        host_nonce: [0xAB; 32],
+        max_members: 8,
+    });
+    let hello_wire = encode_lan_handshake_frame(&hello).unwrap();
+    assert!(is_lan_handshake_frame(&hello_wire));
+    assert_eq!(hello.kind(), LanHandshakeKind::LanHello);
+    assert_eq!(
+        decode_lan_handshake_frame(P2pLane::Control, &hello_wire).unwrap(),
+        hello
+    );
+
+    let join = LanHandshakeMessage::Join(LanJoinMessage {
+        lan_party_id: "0102030405060708".to_string(),
+        display_name: "bob".to_string(),
+        account_id: 0,
+        pin_proof: Some([0x55; 32]),
+    });
+    let join_wire = encode_lan_handshake_frame(&join).unwrap();
+    assert_eq!(
+        decode_lan_handshake_frame(P2pLane::Control, &join_wire).unwrap(),
+        join
+    );
+
+    let join_nopin = LanHandshakeMessage::Join(LanJoinMessage {
+        lan_party_id: "0102030405060708".to_string(),
+        display_name: "bob".to_string(),
+        account_id: 0,
+        pin_proof: None,
+    });
+    let join_nopin_wire = encode_lan_handshake_frame(&join_nopin).unwrap();
+    assert_eq!(
+        decode_lan_handshake_frame(P2pLane::Control, &join_nopin_wire).unwrap(),
+        join_nopin
+    );
+
+    let members = vec![
+        LanMemberInfo {
+            account_id: 1001,
+            display_name: "alice".to_string(),
+            pubkey: host_pk,
+            is_host: true,
+        },
+        LanMemberInfo {
+            account_id: 0,
+            display_name: "bob".to_string(),
+            pubkey: peer_pk,
+            is_host: false,
+        },
+    ];
+    let welcome = LanHandshakeMessage::Welcome(LanWelcomeMessage {
+        lan_party_id: "0102030405060708".to_string(),
+        accepted: true,
+        reason: String::new(),
+        roster_epoch: 1,
+        members: members.clone(),
+    });
+    let welcome_wire = encode_lan_handshake_frame(&welcome).unwrap();
+    assert_eq!(
+        decode_lan_handshake_frame(P2pLane::Control, &welcome_wire).unwrap(),
+        welcome
+    );
+
+    let welcome_reject = LanHandshakeMessage::Welcome(LanWelcomeMessage {
+        lan_party_id: "0102030405060708".to_string(),
+        accepted: false,
+        reason: "invalid pin".to_string(),
+        roster_epoch: 0,
+        members: vec![],
+    });
+    let welcome_reject_wire = encode_lan_handshake_frame(&welcome_reject).unwrap();
+    assert_eq!(
+        decode_lan_handshake_frame(P2pLane::Control, &welcome_reject_wire).unwrap(),
+        welcome_reject
+    );
+
+    let roster = LanHandshakeMessage::Roster(LanRosterMessage {
+        lan_party_id: "0102030405060708".to_string(),
+        roster_epoch: 2,
+        locked: true,
+        members,
+    });
+    let roster_wire = encode_lan_handshake_frame(&roster).unwrap();
+    assert_eq!(
+        decode_lan_handshake_frame(P2pLane::Control, &roster_wire).unwrap(),
+        roster
+    );
+
+    // Wrong lane rejected
+    assert_eq!(
+        decode_lan_handshake_frame(P2pLane::Causal, &hello_wire),
+        Err(LanProtocolError::FrameLaneMismatch)
+    );
+    assert_eq!(
+        decode_lan_handshake_frame(P2pLane::Ephemeral, &hello_wire),
+        Err(LanProtocolError::FrameLaneMismatch)
+    );
+
+    // Non-zero flags / reserved bytes rejected
+    let mut bad_flags = hello_wire.clone();
+    bad_flags[2] = 0x01;
+    assert_eq!(
+        decode_lan_handshake_frame(P2pLane::Control, &bad_flags),
+        Err(LanProtocolError::FrameNonZeroReserved)
+    );
+    let mut bad_rsv = hello_wire.clone();
+    bad_rsv[3] = 0x80;
+    assert_eq!(
+        decode_lan_handshake_frame(P2pLane::Control, &bad_rsv),
+        Err(LanProtocolError::FrameNonZeroReserved)
+    );
+
+    // Unknown JSON key rejected
+    let mut unknown_key = vec![0x01, 0x11, 0x00, 0x00];
+    unknown_key.extend_from_slice(
+        br#"{"lan_party_id":"0102030405060708","display_name":"bob","account_id":0,"extra":1}"#,
+    );
+    assert_eq!(
+        decode_lan_handshake_frame(P2pLane::Control, &unknown_key),
+        Err(LanProtocolError::FrameInvalidField)
+    );
+
+    // Duplicate JSON key rejected (even with identical value!)
+    let mut dup_key = vec![0x01, 0x11, 0x00, 0x00];
+    dup_key.extend_from_slice(
+        br#"{"lan_party_id":"0102030405060708","display_name":"bob","display_name":"bob","account_id":0}"#,
+    );
+    assert_eq!(
+        decode_lan_handshake_frame(P2pLane::Control, &dup_key),
+        Err(LanProtocolError::FrameInvalidField)
+    );
+
+    // Weak Ed25519 pubkey in LanHello rejected
+    let weak_hello = LanHandshakeMessage::Hello(LanHelloMessage {
+        lan_party_id: "0102030405060708".to_string(),
+        lobby_name: "Squad".to_string(),
+        host_name: "alice".to_string(),
+        host_account_id: 0,
+        host_pubkey: [0u8; 32],
+        require_pin: false,
+        host_nonce: [0x11; 32],
+        max_members: 4,
+    });
+    assert_eq!(
+        encode_lan_handshake_frame(&weak_hello),
+        Err(LanProtocolError::InvalidPubkey)
+    );
+
+    let mut weak_hello_wire = vec![0x01, 0x10, 0x00, 0x00];
+    weak_hello_wire.extend_from_slice(
+        format!(
+            r#"{{"lan_party_id":"0102030405060708","lobby_name":"Squad","host_name":"alice","host_account_id":0,"host_pubkey":"{}","require_pin":false,"host_nonce":"{}","max_members":4}}"#,
+            "00".repeat(32),
+            "11".repeat(32)
+        )
+        .as_bytes(),
+    );
+    assert_eq!(
+        decode_lan_handshake_frame(P2pLane::Control, &weak_hello_wire),
+        Err(LanProtocolError::InvalidPubkey)
+    );
+
+    // Rejected LanWelcome with non-empty members fails
+    let bad_reject = LanHandshakeMessage::Welcome(LanWelcomeMessage {
+        lan_party_id: "0102030405060708".to_string(),
+        accepted: false,
+        reason: "denied".to_string(),
+        roster_epoch: 0,
+        members: vec![LanMemberInfo {
+            account_id: 0,
+            display_name: "alice".to_string(),
+            pubkey: host_pk,
+            is_host: true,
+        }],
+    });
+    assert_eq!(
+        encode_lan_handshake_frame(&bad_reject),
+        Err(LanProtocolError::FrameInvalidField)
+    );
+
+    // Non-printable display name fails
+    let bad_name = LanHandshakeMessage::Join(LanJoinMessage {
+        lan_party_id: "0102030405060708".to_string(),
+        display_name: "bob\x1b[31m".to_string(),
+        account_id: 0,
+        pin_proof: None,
+    });
+    assert_eq!(
+        encode_lan_handshake_frame(&bad_name),
+        Err(LanProtocolError::FrameInvalidField)
+    );
+}
+
+#[test]
+fn v040_lan_pin_rate_limiter_5_peer_and_15_lobby_lockouts() {
+    use outpost_core::lan_protocol::{
+        LanPinLockoutStatus, LanPinPeerKey, LanPinRateLimiter,
+    };
+
+    let mut rl = LanPinRateLimiter::default();
+    let p1 = LanPinPeerKey {
+        joiner_pubkey: [0x01; 32],
+        source_ip: "192.168.1.10".to_string(),
+    };
+    let p2 = LanPinPeerKey {
+        joiner_pubkey: [0x02; 32],
+        source_ip: "192.168.1.11".to_string(),
+    };
+    let p3 = LanPinPeerKey {
+        joiner_pubkey: [0x03; 32],
+        source_ip: "192.168.1.12".to_string(),
+    };
+    let p4 = LanPinPeerKey {
+        joiner_pubkey: [0x04; 32],
+        source_ip: "192.168.1.13".to_string(),
+    };
+
+    // 4 failures -> still Allowed; 5th failure -> PeerLocked
+    for _ in 0..4 {
+        assert_eq!(rl.record_failure(&p1), LanPinLockoutStatus::Allowed);
+    }
+    assert_eq!(rl.peer_failures(&p1), 4);
+    assert_eq!(rl.record_failure(&p1), LanPinLockoutStatus::PeerLocked);
+    assert_eq!(rl.check(&p1), LanPinLockoutStatus::PeerLocked);
+    assert!(rl.is_peer_locked(&p1));
+    // record_success does NOT clear an already-locked peer
+    rl.record_success(&p1);
+    assert!(rl.is_peer_locked(&p1));
+
+    // Peer 2: 2 failures then success clears peer_failures but preserves total_failures
+    assert_eq!(rl.record_failure(&p2), LanPinLockoutStatus::Allowed);
+    assert_eq!(rl.record_failure(&p2), LanPinLockoutStatus::Allowed);
+    rl.record_success(&p2);
+    assert_eq!(rl.peer_failures(&p2), 0);
+    assert_eq!(rl.total_failures(), 7);
+
+    // Push total failures across p2 (4 more -> 11) and p3 (4 more -> 15 => LobbyLocked!)
+    for _ in 0..4 {
+        assert_eq!(rl.record_failure(&p2), LanPinLockoutStatus::Allowed);
+    }
+    for _ in 0..3 {
+        assert_eq!(rl.record_failure(&p3), LanPinLockoutStatus::Allowed);
+    }
+    assert_eq!(rl.total_failures(), 14);
+    assert_eq!(rl.record_failure(&p3), LanPinLockoutStatus::LobbyLocked);
+    assert!(rl.is_lobby_locked());
+    assert_eq!(rl.check(&p4), LanPinLockoutStatus::LobbyLocked);
+
+    rl.reset();
+    assert_eq!(rl.total_failures(), 0);
+    assert_eq!(rl.check(&p1), LanPinLockoutStatus::Allowed);
+}
+
+#[test]
+fn v040_lan_policy_toml_parser_and_non_overridable_system_floor() {
+    use outpost_core::lan_protocol::{
+        LanPolicyConfig, LanProtocolError, merge_lan_policy_floor, parse_lan_policy_toml,
+    };
+
+    assert_eq!(
+        parse_lan_policy_toml("# comment only\n\n").unwrap(),
+        LanPolicyConfig::default()
+    );
+
+    let full = parse_lan_policy_toml(
+        "[lan]\r\n\
+         disabled = true # kill\r\n\
+         require_pin = true\n\
+         require_local_auth = true\n\
+         idle_timeout_sec = 600\n\
+         scan_timeout_sec = 30\n",
+    )
+    .unwrap();
+    assert_eq!(
+        full,
+        LanPolicyConfig {
+            disabled: true,
+            require_pin: true,
+            require_local_auth: true,
+            idle_timeout_sec: 600,
+            scan_timeout_sec: 30,
+        }
+    );
+
+    // Strict fail-closed rejections
+    for bad in [
+        "disabled = true\n",                           // key before [lan]
+        "[other]\ndisabled = true\n",                  // unknown section
+        "[lan]\n[lan]\n",                              // duplicate [lan]
+        "[lan]\nunknown_key = true\n",                 // unknown key
+        "[lan]\ndisabled = true\ndisabled = false\n",  // duplicate key
+        "[lan]\ndisabled = yes\n",                     // invalid bool
+        "[lan]\nidle_timeout_sec = 0\n",               // 0 timeout
+        "[lan]\nidle_timeout_sec = 1801\n",            // > 1800
+        "[lan]\nscan_timeout_sec = 0\n",               // 0 scan timeout
+        "[lan]\nscan_timeout_sec = 61\n",              // > 60
+        "[lan]\nscan_timeout_sec = 015\n",             // leading zero
+        "[lan]\ndisabled = true\0\n",                  // NUL byte
+    ] {
+        assert_eq!(
+            parse_lan_policy_toml(bad),
+            Err(LanProtocolError::PolicyParseError),
+            "must reject TOML: {bad:?}"
+        );
+    }
+
+    // Non-overridable system floor: user CANNOT weaken system policy, CAN tighten it
+    let sys = LanPolicyConfig {
+        disabled: false,
+        require_pin: true,
+        require_local_auth: true,
+        idle_timeout_sec: 120,
+        scan_timeout_sec: 10,
+    };
+    let weak_user = LanPolicyConfig {
+        disabled: false,
+        require_pin: false,
+        require_local_auth: false,
+        idle_timeout_sec: 1800,
+        scan_timeout_sec: 60,
+    };
+    let merged = merge_lan_policy_floor(Some(&sys), Some(&weak_user), false);
+    assert_eq!(merged, sys);
+
+    // User CAN tighten timeouts and set disabled=true
+    let strict_user = LanPolicyConfig {
+        disabled: true,
+        require_pin: false,
+        require_local_auth: false,
+        idle_timeout_sec: 60,
+        scan_timeout_sec: 5,
+    };
+    let merged_strict = merge_lan_policy_floor(Some(&sys), Some(&strict_user), false);
+    assert!(merged_strict.disabled);
+    assert!(merged_strict.require_pin);
+    assert!(merged_strict.require_local_auth);
+    assert_eq!(merged_strict.idle_timeout_sec, 60);
+    assert_eq!(merged_strict.scan_timeout_sec, 5);
+
+    // env_disabled always forces disabled=true
+    let env_killed = merge_lan_policy_floor(None, Some(&weak_user), true);
+    assert!(env_killed.disabled);
+}
+
+#[test]
+fn v040_lan_mdns_txt_packet_goodbye_pointer_loop_and_direct_target() {
+    use outpost_core::lan_protocol::{
+        DNS_CLASS_IN, DNS_TYPE_PTR, LAN_BEACON_ALPN, LAN_BEACON_VERSION, LAN_MDNS_SERVICE_TYPE,
+        LanBeaconRecord, LanMdnsAnnouncement, LanProtocolError, decode_lan_mdns_packet,
+        decode_lan_txt_record, encode_lan_announcement, encode_lan_goodbye, encode_lan_ptr_query,
+        encode_lan_txt_record, format_lan_direct_target, parse_lan_direct_target,
+    };
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let beacon = LanBeaconRecord {
+        version: LAN_BEACON_VERSION,
+        lan_party_id: "0102030405060708".to_string(),
+        lobby_name: "LAN Night".to_string(),
+        host_name: "alice".to_string(),
+        host_pubkey: [0x33; 32],
+        require_pin: true,
+        alpn: LAN_BEACON_ALPN.to_string(),
+    };
+
+    // 1. TXT round-trip & strict rejections
+    let txt = encode_lan_txt_record(&beacon).unwrap();
+    assert!(txt.len() <= 256);
+    assert_eq!(decode_lan_txt_record(&txt).unwrap(), beacon);
+
+    // Unknown key in TXT rejected
+    let mut bad_txt_unknown = txt.clone();
+    bad_txt_unknown.push(7);
+    bad_txt_unknown.extend_from_slice(b"sec=123");
+    assert_eq!(
+        decode_lan_txt_record(&bad_txt_unknown),
+        Err(LanProtocolError::TxtUnknownKey)
+    );
+
+    // Duplicate key in TXT rejected
+    let mut bad_txt_dup = txt.clone();
+    bad_txt_dup.push(3);
+    bad_txt_dup.extend_from_slice(b"v=1");
+    assert_eq!(
+        decode_lan_txt_record(&bad_txt_dup),
+        Err(LanProtocolError::TxtDuplicateKey)
+    );
+
+    // ANSI escape byte in TXT rejected
+    let mut bad_txt_esc = txt.clone();
+    let esc_pos = bad_txt_esc.iter().position(|&b| b == b'L').unwrap();
+    bad_txt_esc[esc_pos] = 0x1b;
+    assert_eq!(
+        decode_lan_txt_record(&bad_txt_esc),
+        Err(LanProtocolError::TxtMalformed)
+    );
+
+    // 2. PTR query encode/decode
+    let q_bytes = encode_lan_ptr_query(true).unwrap();
+    let q_pkt = decode_lan_mdns_packet(&q_bytes).unwrap();
+    assert!(!q_pkt.is_response);
+    assert_eq!(q_pkt.questions.len(), 1);
+    assert_eq!(q_pkt.questions[0].qname, LAN_MDNS_SERVICE_TYPE);
+    assert_eq!(q_pkt.questions[0].qtype, DNS_TYPE_PTR);
+    assert_eq!(q_pkt.questions[0].qclass, DNS_CLASS_IN);
+    assert!(q_pkt.questions[0].unicast_response);
+
+    // 3. Announcement encode/decode (IPv4 + IPv6)
+    let addrs = vec![
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)), 51515),
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            51515,
+        ),
+    ];
+    let ann = LanMdnsAnnouncement {
+        beacon: beacon.clone(),
+        service_port: 51515,
+        addrs: addrs.clone(),
+        ttl_sec: 120,
+    };
+    let ann_wire = encode_lan_announcement(&ann).unwrap();
+    let decoded_ann = decode_lan_mdns_packet(&ann_wire).unwrap();
+    assert!(decoded_ann.is_response);
+    assert_eq!(decoded_ann.announcement, Some(ann));
+
+    // 4. Goodbye packet (TTL=0)
+    let bye_wire = encode_lan_goodbye(&beacon, 51515, &addrs).unwrap();
+    let decoded_bye = decode_lan_mdns_packet(&bye_wire).unwrap();
+    let bye_ann = decoded_bye.announcement.expect("goodbye announcement");
+    assert!(bye_ann.is_goodbye());
+    assert_eq!(bye_ann.ttl_sec, 0);
+    assert_eq!(bye_ann.beacon, beacon);
+
+    // 5. DNS compression pointer-loop rejection (self-pointer at offset 12 -> 0xC00C)
+    let mut ptr_loop = vec![
+        0x00, 0x00, // ID
+        0x00, 0x00, // Flags
+        0x00, 0x01, // QDCOUNT=1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // AN/NS/AR=0
+        0xc0, 0x0c, // pointer to self (offset 12)
+        0x00, 0x0c, 0x00, 0x01,
+    ];
+    assert_eq!(
+        decode_lan_mdns_packet(&ptr_loop),
+        Err(LanProtocolError::DnsPointerLoop)
+    );
+    // Mutual 2-hop pointer loop (offset 12 -> 14, offset 14 -> 12)
+    ptr_loop[13] = 0x0e;
+    ptr_loop[14] = 0xc0;
+    ptr_loop[15] = 0x0c;
+    assert_eq!(
+        decode_lan_mdns_packet(&ptr_loop),
+        Err(LanProtocolError::DnsPointerLoop)
+    );
+    // Out-of-bounds compression pointer
+    let ptr_oob = vec![
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xc0, 0xff, // OOB pointer
+        0x00, 0x0c, 0x00, 0x01,
+    ];
+    assert_eq!(
+        decode_lan_mdns_packet(&ptr_oob),
+        Err(LanProtocolError::DnsPointerOob)
+    );
+
+    // 6. Direct ip:port parser & formatter
+    let v4 = parse_lan_direct_target("192.168.1.42:51515").unwrap();
+    assert_eq!(format_lan_direct_target(v4), "192.168.1.42:51515");
+    let v4_lo = parse_lan_direct_target("127.0.0.1:4444").unwrap();
+    assert_eq!(format_lan_direct_target(v4_lo), "127.0.0.1:4444");
+    let v6 = parse_lan_direct_target("[fe80::1]:51515").unwrap();
+    assert_eq!(format_lan_direct_target(v6), "[fe80::1]:51515");
+
+    for bad_target in [
+        "",
+        "localhost:51515",
+        "192.168.1.42",
+        "192.168.1.42:0",
+        "192.168.1.42:0515",
+        "192.168.01.42:51515",
+        "192.168.1.42:65536",
+        " 192.168.1.42:51515",
+        "0.0.0.0:51515",
+        "224.0.0.251:5353",
+        "255.255.255.255:51515",
+        "[::]:51515",
+        "[ff02::fb]:5353",
+        "[fe80::1%en0]:51515",
+    ] {
+        assert_eq!(
+            parse_lan_direct_target(bad_target),
+            Err(LanProtocolError::InvalidDirectTarget),
+            "must reject direct target {bad_target:?}"
+        );
+    }
+}
+
 
 
 

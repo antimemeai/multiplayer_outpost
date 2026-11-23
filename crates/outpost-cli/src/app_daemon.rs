@@ -577,6 +577,7 @@ impl AppDaemon {
                         presence_status: entry.status as u8,
                         joinable_party_id: entry.joinable_party_id.map(PartyId::get),
                         handle,
+                        safety_number: String::new(),
                     });
                     item.presence_status = entry.status as u8;
                     item.joinable_party_id = entry.joinable_party_id.map(PartyId::get);
@@ -594,6 +595,7 @@ impl AppDaemon {
                     presence_status: entry.status as u8,
                     joinable_party_id: entry.joinable_party_id.map(PartyId::get),
                     handle,
+                    safety_number: String::new(),
                 });
                 item.presence_status = entry.status as u8;
                 item.joinable_party_id = entry.joinable_party_id.map(PartyId::get);
@@ -618,6 +620,7 @@ impl AppDaemon {
                             presence_status: 0,
                             joinable_party_id: None,
                             handle,
+                            safety_number: String::new(),
                         });
                     }
                     mp_protocol::SocialEventKind::FriendRequest => {}
@@ -2695,6 +2698,38 @@ impl AppDaemon {
         if let Ok(rest_friends) = control.list_friends().await {
             let mut st = self.inner.lock().await;
             for edge in rest_friends.friends {
+                if let Some(h) = edge.peer_handle.as_deref()
+                    && !h.is_empty()
+                {
+                    st.handle_cache.insert(edge.peer_account_id, h.to_string());
+                }
+                let verified_sn: Option<String> = match edge.peer_root_pubkey_b64.as_deref() {
+                    Some(pk_b64) => match B64
+                        .decode(pk_b64.as_bytes())
+                        .ok()
+                        .and_then(|raw| <[u8; 32]>::try_from(raw).ok())
+                    {
+                        Some(pk) if mp_protocol::validate_ed25519_pubkey_strict(&pk).is_ok() => {
+                            let local_sn =
+                                mp_protocol::compute_safety_number(edge.peer_account_id, &pk);
+                            if let Some(srv_sn) = edge.peer_safety_number.as_deref()
+                                && !srv_sn.is_empty()
+                                && srv_sn != local_sn
+                            {
+                                log_line(&format!(
+                                    "ignoring mismatched server peer_safety_number for account_id={}; using locally computed SN",
+                                    edge.peer_account_id
+                                ));
+                            }
+                            Some(local_sn)
+                        }
+                        _ => {
+                            // Invalid pubkey: never trust server-provided safety number.
+                            Some(String::new())
+                        }
+                    },
+                    None => None,
+                };
                 let handle = st
                     .handle_cache
                     .get(&edge.peer_account_id)
@@ -2709,10 +2744,17 @@ impl AppDaemon {
                         updated_at_ms: edge.updated_at_ms,
                         presence_status: 0,
                         joinable_party_id: None,
-                        handle,
+                        handle: handle.clone(),
+                        safety_number: String::new(),
                     });
                 entry.state = edge.state;
                 entry.updated_at_ms = edge.updated_at_ms;
+                if !handle.is_empty() {
+                    entry.handle = handle;
+                }
+                if let Some(sn) = verified_sn {
+                    entry.safety_number = sn;
+                }
             }
         }
 
@@ -2793,15 +2835,16 @@ impl AppDaemon {
         let endpoint_desc =
             gather_mp1_endpoint_descriptor(&p2p, eff_policy, pinned_for_sanitize).await;
 
+        let req_body = CreatePartyRequest {
+            visibility,
+            join_mode,
+            relay_policy: eff_policy,
+            max_members: req.max_members.clamp(2, 12),
+            endpoint: endpoint_desc,
+            relay_url: chosen_relay,
+        };
         let create_resp = match control
-            .create_party(&CreatePartyRequest {
-                visibility,
-                join_mode,
-                relay_policy: eff_policy,
-                max_members: req.max_members.clamp(2, 12),
-                endpoint: endpoint_desc,
-                relay_url: chosen_relay,
-            })
+            .create_party_with_scope(&req_body, req.org_id, req.group_id)
             .await
         {
             Ok(r) => r,
@@ -3053,6 +3096,20 @@ impl AppDaemon {
             Ok(r) => r,
             Err(e) => {
                 p2p.close().await;
+                if let Some((policy, pinned_url)) = e.relay_mismatch_info() {
+                    let policy_label = policy
+                        .map(crate::ipc_payloads::relay_policy_name)
+                        .unwrap_or("unknown");
+                    let msg = match pinned_url {
+                        Some(pinned) => format!(
+                            "relay_mismatch: party requires pinned relay '{pinned}' (policy={policy_label}); pass --relay-url {pinned} or update device relay config"
+                        ),
+                        None => format!(
+                            "relay_mismatch: party relay policy '{policy_label}' is incompatible with your local relay policy; pass --relay-policy or update device relay config"
+                        ),
+                    };
+                    return Err(ipc_err(ERR_CONFLICT, false, msg));
+                }
                 return Err(ipc_err(ERR_CONTROL_PLANE, true, e.to_string()));
             }
         };

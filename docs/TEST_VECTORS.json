@@ -55,5 +55,24 @@
     "party_id": 5001,
     "party_invite_link": "mppi1_5001_MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM",
     "party_invite_sha256_hex": "bf3dff455be4a5ae1a611a037d6e62dcf3d3a83bbb132b430dfa898e511ca34d"
+  },
+  "dead_drop_inbox_suite1": {
+    "suite": 1,
+    "enc_cert_domain_sep": "mp-enc-subkey-v1:",
+    "enc_cert_bytes": 161,
+    "enc_cert_layout": "version(u8=1) || account_id(u64_le) || device_id(u64_le) || root_pubkey(32B) || x25519_enc_pk(32B) || iat_s(i64_le) || exp_s(i64_le) || ed25519_device_sig(64B)",
+    "ciphertext_buckets_bytes": [1024, 4096, 16384, 65536],
+    "aead_hkdf_info": "mp-inbox-aead-v1",
+    "aead_cipher": "ChaCha20Poly1305",
+    "hpke_kem": "DHKEM(X25519, HKDF-SHA256)",
+    "hpke_kdf": "HKDF-SHA256",
+    "hpke_aead": "ChaCha20Poly1305",
+    "hpke_mode": "ModeAuth",
+    "hpke_info": "mp-inbox-hpke-v1",
+    "max_post_body_bytes": 98304,
+    "mp1_opcodes": {
+      "INBOX_NOTIFY": "0x0106",
+      "INBOX_ACKED": "0x0107"
+    }
   }
 }

@@ -15,10 +15,10 @@ use http::{HeaderName, HeaderValue, Method, Request, StatusCode};
 use http_body_util::{BodyExt as _, Full};
 use hyper_util::rt::TokioIo;
 use mp_protocol::{
-    AccountId, DeviceId, EndpointDescriptor, HttpMethod, KeyId, PartyId, PartyInviteId,
-    PartyJoinMode, PartyVisibility, RelayPolicy, RequestId, Rfc9421Error, Rfc9421Request,
-    build_signature_base, compute_content_digest, parse_signature_input, sha256,
-    validate_path_and_query,
+    AccountId, DeviceId, EndpointDescriptor, HttpMethod, KeyId, MAX_SAFE_ID, PartyId,
+    PartyInviteId, PartyJoinMode, PartyVisibility, RelayPolicy, RequestId, Rfc9421Error,
+    Rfc9421Request, build_signature_base, compute_content_digest, parse_signature_input, sha256,
+    validate_path_and_query, validate_relay_url,
 };
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +47,10 @@ pub const MAX_RETRY_AFTER_MS: u64 = 60_000;
 pub const MAX_FETCH_REDIRECTS: usize = 3;
 /// Overall deadline for [`ControlClient::fetch_https_bytes`] (`60s`).
 pub const MAX_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Maximum number of regional relay entries accepted from `GET /v1/relays`.
+pub const MAX_DISCOVERED_RELAYS: usize = 32;
+/// Maximum sanitized Unicode scalar count for `region`/`label` in `GET /v1/relays`.
+pub const MAX_RELAY_METADATA_CHARS: usize = 64;
 
 const MAX_ERROR_MESSAGE_CHARS: usize = 256;
 const MAX_FETCH_URL_BYTES: usize = 8 * 1024;
@@ -76,8 +80,27 @@ pub enum ControlError {
         error: String,
         server_now_ms: Option<u64>,
         retry_after_ms: Option<u64>,
+        relay_policy: Option<u8>,
+        pinned_relay_url: Option<String>,
         raw_body: String,
     },
+}
+
+impl ControlError {
+    /// If this error is an HTTP `409` `relay_mismatch` API response, returns
+    /// `(relay_policy, validated_pinned_relay_url)`.
+    pub fn relay_mismatch_info(&self) -> Option<(Option<u8>, Option<&str>)> {
+        match self {
+            Self::Api {
+                status: 409,
+                error,
+                relay_policy,
+                pinned_relay_url,
+                ..
+            } if error == "relay_mismatch" => Some((*relay_policy, pinned_relay_url.as_deref())),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for ControlError {
@@ -382,6 +405,8 @@ pub(crate) struct ApiErrorBody {
     pub(crate) error: Option<String>,
     pub(crate) server_now_ms: Option<u64>,
     pub(crate) retry_after_ms: Option<u64>,
+    pub(crate) relay_policy: Option<u8>,
+    pub(crate) pinned_relay_url: Option<String>,
 }
 
 /// RAII guard that aborts a spawned HTTP/1.1 connection driver task on drop
@@ -589,6 +614,29 @@ impl ControlClient {
     pub async fn health(&self) -> Result<HealthResponse, ControlError> {
         let resp = self.execute_unsigned_get("/v1/health").await?;
         Self::decode_json_response(resp, &[200])
+    }
+
+    /// `GET /v1/relays` (unauthenticated regional relay discovery).
+    ///
+    /// Enforces TLS 1.3-only, zero redirects, `<= 16 KiB` body cap, `relays.len() <= 32`,
+    /// strict HTTPS public-FQDN relay URL validation on `default_relay_url` and every
+    /// `relay.url`, and `<= 64`-char sanitization on `region` and `label`.
+    pub async fn list_relays(&self) -> Result<RelaysResponse, ControlError> {
+        let resp = self.execute_unsigned_get("/v1/relays").await?;
+        let mut decoded: RelaysResponse = Self::decode_json_response(resp, &[200])?;
+        validate_discovered_relay_url(&decoded.default_relay_url, "default_relay_url")?;
+        if decoded.relays.len() > MAX_DISCOVERED_RELAYS {
+            return Err(ControlError::Protocol(format!(
+                "GET /v1/relays returned {} entries (max {MAX_DISCOVERED_RELAYS})",
+                decoded.relays.len()
+            )));
+        }
+        for relay in &mut decoded.relays {
+            validate_discovered_relay_url(&relay.url, "relay.url")?;
+            relay.region = sanitize_untrusted_text(&relay.region, MAX_RELAY_METADATA_CHARS);
+            relay.label = sanitize_untrusted_text(&relay.label, MAX_RELAY_METADATA_CHARS);
+        }
+        Ok(decoded)
     }
 
     /// `POST /v1/accounts/register` (`reg.<sha256(root_pk)[..16]>`, explicit `Idempotency-Key`).
@@ -813,6 +861,32 @@ impl ControlClient {
         &self,
         req: &CreatePartyRequest,
     ) -> Result<CreatePartyResponse, ControlError> {
+        self.create_party_with_scope(req, None, None).await
+    }
+
+    /// `POST /v1/parties` with optional organization/group scoping (`org_id`, `group_id`).
+    ///
+    /// Rejects `org_id` or `group_id` outside `1..=MAX_SAFE_ID` locally before sending.
+    pub async fn create_party_with_scope(
+        &self,
+        req: &CreatePartyRequest,
+        org_id: Option<u64>,
+        group_id: Option<u64>,
+    ) -> Result<CreatePartyResponse, ControlError> {
+        if let Some(id) = org_id
+            && (id == 0 || id > MAX_SAFE_ID)
+        {
+            return Err(ControlError::InvalidRequest(format!(
+                "org_id must be in 1..={MAX_SAFE_ID}"
+            )));
+        }
+        if let Some(id) = group_id
+            && (id == 0 || id > MAX_SAFE_ID)
+        {
+            return Err(ControlError::InvalidRequest(format!(
+                "group_id must be in 1..={MAX_SAFE_ID}"
+            )));
+        }
         let signer = self.require_device_signer()?;
         let endpoint_bytes = req
             .endpoint
@@ -825,6 +899,8 @@ impl ControlClient {
             max_members: req.max_members,
             endpoint_b64: B64_STD.encode(endpoint_bytes),
             relay_url: req.relay_url.as_deref(),
+            org_id,
+            group_id,
         };
         let body = encode_json(&wire)?;
         let resp = self
@@ -1317,6 +1393,8 @@ impl ControlClient {
                 error: format!("relay_ping_http_{status}"),
                 server_now_ms: None,
                 retry_after_ms: None,
+                relay_policy: None,
+                pinned_relay_url: None,
                 raw_body: String::new(),
             })
         }
@@ -1878,6 +1956,42 @@ fn is_forbidden_error_scalar(ch: char) -> bool {
         || (0xE0000..=0xE007F).contains(&cp)
 }
 
+fn validate_discovered_relay_url(url: &str, field: &'static str) -> Result<(), ControlError> {
+    if url.is_empty() {
+        return Err(ControlError::Protocol(format!(
+            "empty {field} in control-plane response"
+        )));
+    }
+    validate_relay_url(url).map_err(|_| {
+        ControlError::Protocol(format!("invalid {field} in control-plane response"))
+    })?;
+    let rest = url.strip_prefix("https://").ok_or_else(|| {
+        ControlError::Protocol(format!("non-HTTPS {field} in control-plane response"))
+    })?;
+    let host = match rest.rsplit_once(':') {
+        Some((h, _)) => h,
+        None => rest,
+    };
+    const PRIVATE_SUFFIXES: &[&str] = &[
+        ".localhost",
+        ".local",
+        ".internal",
+        ".home.arpa",
+        ".lan",
+        ".home",
+        ".localdomain",
+        ".intranet",
+        ".corp",
+        ".invalid",
+    ];
+    if PRIVATE_SUFFIXES.iter().any(|sfx| host.ends_with(sfx)) {
+        return Err(ControlError::Protocol(format!(
+            "private-suffix {field} rejected in control-plane response"
+        )));
+    }
+    Ok(())
+}
+
 /// Sanitizes an untrusted server-supplied error string before storing or printing it:
 /// - strips ANSI CSI/OSC/DCS/SOS/PM/APC escape sequences
 /// - strips C0 (`< 0x20`), DEL (`0x7F`), C1 (`0x80..=0x9F`), BiDi overrides/isolates,
@@ -1885,7 +1999,11 @@ fn is_forbidden_error_scalar(ch: char) -> bool {
 /// - collapses ASCII whitespace runs to single ASCII spaces and trims ends
 /// - caps output length at 256 Unicode scalar values.
 pub fn sanitize_server_error(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len().min(MAX_ERROR_MESSAGE_CHARS));
+    sanitize_untrusted_text(raw, MAX_ERROR_MESSAGE_CHARS)
+}
+
+fn sanitize_untrusted_text(raw: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(raw.len().min(max_chars));
     let mut chars = raw.chars().peekable();
     let mut pending_space = false;
     let mut char_count: usize = 0;
@@ -1958,7 +2076,7 @@ pub fn sanitize_server_error(raw: &str) -> String {
         }
 
         if pending_space {
-            if char_count >= MAX_ERROR_MESSAGE_CHARS {
+            if char_count >= max_chars {
                 break;
             }
             out.push(' ');
@@ -1966,7 +2084,7 @@ pub fn sanitize_server_error(raw: &str) -> String {
             pending_space = false;
         }
 
-        if char_count >= MAX_ERROR_MESSAGE_CHARS {
+        if char_count >= max_chars {
             break;
         }
         out.push(ch);
@@ -1990,11 +2108,19 @@ fn parse_api_error(resp: RawHttpResponse) -> ControlError {
         .and_then(|p| p.retry_after_ms)
         .or(resp.retry_after_ms)
         .map(|ms| ms.clamp(MIN_RETRY_AFTER_MS, MAX_RETRY_AFTER_MS));
+    let relay_policy = parsed.as_ref().and_then(|p| p.relay_policy);
+    let pinned_relay_url = parsed
+        .as_ref()
+        .and_then(|p| p.pinned_relay_url.as_deref())
+        .filter(|url| validate_discovered_relay_url(url, "pinned_relay_url").is_ok())
+        .map(str::to_owned);
     ControlError::Api {
         status: resp.status,
         error,
         server_now_ms: parsed.as_ref().and_then(|p| p.server_now_ms),
         retry_after_ms,
+        relay_policy,
+        pinned_relay_url,
         raw_body,
     }
 }
@@ -2022,6 +2148,21 @@ fn to_lower_hex(bytes: &[u8]) -> String {
 pub struct HealthResponse {
     pub ok: bool,
     pub server_now_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RelayInfo {
+    pub url: String,
+    pub region: String,
+    pub label: String,
+    #[serde(default)]
+    pub default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RelaysResponse {
+    pub default_relay_url: String,
+    pub relays: Vec<RelayInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2148,6 +2289,12 @@ pub struct FriendEdge {
     pub peer_account_id: u64,
     pub state: u8,
     pub updated_at_ms: u64,
+    #[serde(default)]
+    pub peer_handle: Option<String>,
+    #[serde(default)]
+    pub peer_root_pubkey_b64: Option<String>,
+    #[serde(default)]
+    pub peer_safety_number: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -2196,6 +2343,10 @@ struct CreatePartyWire<'a> {
     endpoint_b64: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     relay_url: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    org_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

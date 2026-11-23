@@ -143,6 +143,173 @@ pub const RECOVERY_KEY_DOMAIN_SEP: &str = "mp-recovery-v1:";
 /// Domain separation string for 128-bit device-link confirmation fingerprints.
 pub const DEVICE_FP_DOMAIN_SEP: &str = "mpdevfp2:";
 
+/// Domain separation string for per-device signed X25519 encryption subkey certs (Unit 5).
+pub const ENC_SUBKEY_CERT_DOMAIN_SEP: &str = "mp-enc-subkey-v1:";
+/// Exact canonical byte length of `enc_cert`:
+/// `version(1) || account_id(8) || device_id(8) || root_pubkey(32) || enc_pk(32) || iat_s(8) || exp_s(8) || ed25519_sig(64) = 161 B`.
+pub const ENC_SUBKEY_CERT_BYTES: usize = 161;
+pub const ENC_SUBKEY_CERT_BODY_BYTES: usize = 97;
+pub const MAX_ENC_CERT_TTL_SECS: i64 = 30 * 86_400;
+pub const ENC_CERT_CLOCK_SKEW_SECS: i64 = 300;
+
+/// All 12 low-order Curve25519 Montgomery u-coordinates (RFC 7748 / libsodium) after clearing bit 255.
+const LOW_ORDER_X25519_POINTS: [[u8; 32]; 12] = [
+    // 0
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    // 1
+    [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    // 325606250916557431795983626356110631294008115727848805560023387167927233504
+    [0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a,
+     0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00],
+    // 39382357235489614581723060781553021112529911719440698176882885853963445705823
+    [0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef, 0x5b,
+     0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57],
+    // p - 1
+    [0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+    // p
+    [0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+    // p + 1
+    [0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+    // 2p - 1 (high bit cleared -> same as p - 1, include canonical non-reduced equivalents below)
+    [0xcd, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a,
+     0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x7f],
+    [0x4c, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef, 0x5b,
+     0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57],
+    // p + 2^255 - 19 (already covered by high-bit mask, also reject u >= p explicitly!)
+    [0xd9, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+    [0xda, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+    [0xdb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
+];
+
+/// Validates a 32-byte X25519 public key strictly: rejects non-canonical `u >= p`,
+/// high bit set (`>= 2^255`), all-zero, and all 12 low-order Curve25519 points.
+pub fn validate_x25519_pubkey_strict(enc_pk: &[u8; 32]) -> Result<(), CryptoError> {
+    let mut masked = *enc_pk;
+    if let Some(last) = masked.get_mut(31) {
+        if (*last & 0x80) != 0 {
+            return Err(CryptoError::InvalidPublicKey);
+        }
+        *last &= 0x7f;
+    }
+    if is_non_canonical_field_elem(&masked) {
+        return Err(CryptoError::InvalidPublicKey);
+    }
+    for low in &LOW_ORDER_X25519_POINTS {
+        if &masked == low {
+            return Err(CryptoError::WeakPublicKey);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncSubkeyCertClaims {
+    pub account_id: u64,
+    pub device_id: u64,
+    pub root_pubkey: Ed25519PubKey,
+    pub enc_pk: [u8; 32],
+    pub iat_s: i64,
+    pub exp_s: i64,
+}
+
+/// Strictly verifies a canonical `161 B` per-device X25519 encryption subkey certificate.
+/// Signed by `expected_device_pk` (the device's authoritative Ed25519 key from `AccountDO`)
+/// over `"mp-enc-subkey-v1:" || body[0..97]`, binding `(account_id, device_id, root_pubkey, enc_pk, iat_s, exp_s)`.
+pub fn verify_enc_subkey_cert(
+    cert: &[u8],
+    expected_account_id: u64,
+    expected_device_id: u64,
+    expected_root_pk: &Ed25519PubKey,
+    expected_device_pk: &Ed25519PubKey,
+    now_s: i64,
+) -> Result<EncSubkeyCertClaims, CryptoError> {
+    if cert.len() != ENC_SUBKEY_CERT_BYTES {
+        return Err(CryptoError::InvalidSignature);
+    }
+    let body = cert
+        .get(0..ENC_SUBKEY_CERT_BODY_BYTES)
+        .ok_or(CryptoError::InvalidSignature)?;
+    let sig_s = cert
+        .get(ENC_SUBKEY_CERT_BODY_BYTES..ENC_SUBKEY_CERT_BYTES)
+        .ok_or(CryptoError::InvalidSignature)?;
+    let sig: Ed25519Sig = sig_s.try_into().map_err(|_| CryptoError::InvalidSignature)?;
+
+    if body.first() != Some(&1u8) {
+        return Err(CryptoError::InvalidSignature);
+    }
+    let account_id = u64::from_le_bytes(
+        body.get(1..9)
+            .ok_or(CryptoError::InvalidSignature)?
+            .try_into()
+            .map_err(|_| CryptoError::InvalidSignature)?,
+    );
+    let device_id = u64::from_le_bytes(
+        body.get(9..17)
+            .ok_or(CryptoError::InvalidSignature)?
+            .try_into()
+            .map_err(|_| CryptoError::InvalidSignature)?,
+    );
+    let root_pubkey: Ed25519PubKey = body
+        .get(17..49)
+        .ok_or(CryptoError::InvalidSignature)?
+        .try_into()
+        .map_err(|_| CryptoError::InvalidSignature)?;
+    let enc_pk: [u8; 32] = body
+        .get(49..81)
+        .ok_or(CryptoError::InvalidSignature)?
+        .try_into()
+        .map_err(|_| CryptoError::InvalidSignature)?;
+    let iat_s = i64::from_le_bytes(
+        body.get(81..89)
+            .ok_or(CryptoError::InvalidSignature)?
+            .try_into()
+            .map_err(|_| CryptoError::InvalidSignature)?,
+    );
+    let exp_s = i64::from_le_bytes(
+        body.get(89..97)
+            .ok_or(CryptoError::InvalidSignature)?
+            .try_into()
+            .map_err(|_| CryptoError::InvalidSignature)?,
+    );
+
+    if account_id != expected_account_id
+        || device_id != expected_device_id
+        || &root_pubkey != expected_root_pk
+    {
+        return Err(CryptoError::InvalidSignature);
+    }
+    let ttl = exp_s.saturating_sub(iat_s);
+    if !(1..=MAX_ENC_CERT_TTL_SECS).contains(&ttl)
+        || iat_s > now_s.saturating_add(ENC_CERT_CLOCK_SKEW_SECS)
+        || exp_s <= now_s
+    {
+        return Err(CryptoError::InvalidSignature);
+    }
+    validate_x25519_pubkey_strict(&enc_pk)?;
+
+    let mut msg = Vec::with_capacity(ENC_SUBKEY_CERT_DOMAIN_SEP.len() + ENC_SUBKEY_CERT_BODY_BYTES);
+    msg.extend_from_slice(ENC_SUBKEY_CERT_DOMAIN_SEP.as_bytes());
+    msg.extend_from_slice(body);
+    verify_ed25519_strict(expected_device_pk, &msg, &sig)?;
+
+    Ok(EncSubkeyCertClaims {
+        account_id,
+        device_id,
+        root_pubkey,
+        enc_pk,
+        iat_s,
+        exp_s,
+    })
+}
+
 const CROCKFORD_B32: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 fn crockford_decode_char(b: u8) -> Option<u8> {
@@ -475,5 +642,66 @@ impl Handle {
 
     pub fn normalized(&self) -> &str {
         &self.normalized
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod enc_cert_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn make_enc_cert(
+        device_sk: &SigningKey,
+        account_id: u64,
+        device_id: u64,
+        root_pk: &Ed25519PubKey,
+        enc_pk: &[u8; 32],
+        iat_s: i64,
+        exp_s: i64,
+    ) -> [u8; ENC_SUBKEY_CERT_BYTES] {
+        let mut body = [0u8; ENC_SUBKEY_CERT_BODY_BYTES];
+        body[0] = 1;
+        body[1..9].copy_from_slice(&account_id.to_le_bytes());
+        body[9..17].copy_from_slice(&device_id.to_le_bytes());
+        body[17..49].copy_from_slice(root_pk);
+        body[49..81].copy_from_slice(enc_pk);
+        body[81..89].copy_from_slice(&iat_s.to_le_bytes());
+        body[89..97].copy_from_slice(&exp_s.to_le_bytes());
+
+        let mut msg = Vec::with_capacity(ENC_SUBKEY_CERT_DOMAIN_SEP.len() + ENC_SUBKEY_CERT_BODY_BYTES);
+        msg.extend_from_slice(ENC_SUBKEY_CERT_DOMAIN_SEP.as_bytes());
+        msg.extend_from_slice(&body);
+        let sig = device_sk.sign(&msg).to_bytes();
+
+        let mut cert = [0u8; ENC_SUBKEY_CERT_BYTES];
+        cert[0..ENC_SUBKEY_CERT_BODY_BYTES].copy_from_slice(&body);
+        cert[ENC_SUBKEY_CERT_BODY_BYTES..ENC_SUBKEY_CERT_BYTES].copy_from_slice(&sig);
+        cert
+    }
+
+    #[test]
+    fn enc_subkey_cert_verifies_valid_and_rejects_low_order_x25519_points() {
+        let root_sk = SigningKey::from_bytes(&[0x11; 32]);
+        let dev_sk = SigningKey::from_bytes(&[0x22; 32]);
+        let root_pk = root_sk.verifying_key().to_bytes();
+        let dev_pk = dev_sk.verifying_key().to_bytes();
+        let mut valid_x25519 = [0x42u8; 32];
+        valid_x25519[31] &= 0x7f;
+
+        let now_s = 1_800_000_000i64;
+        let cert = make_enc_cert(&dev_sk, 1001, 2002, &root_pk, &valid_x25519, now_s - 10, now_s + 86_400);
+        let claims = verify_enc_subkey_cert(&cert, 1001, 2002, &root_pk, &dev_pk, now_s)
+            .expect("valid cert must verify");
+        assert_eq!(claims.enc_pk, valid_x25519);
+
+        assert!(verify_enc_subkey_cert(&cert, 1001, 2003, &root_pk, &dev_pk, now_s).is_err());
+        let too_long = make_enc_cert(&dev_sk, 1001, 2002, &root_pk, &valid_x25519, now_s, now_s + 31 * 86_400);
+        assert!(verify_enc_subkey_cert(&too_long, 1001, 2002, &root_pk, &dev_pk, now_s).is_err());
+
+        for low in &LOW_ORDER_X25519_POINTS {
+            let bad = make_enc_cert(&dev_sk, 1001, 2002, &root_pk, low, now_s - 10, now_s + 3600);
+            assert!(verify_enc_subkey_cert(&bad, 1001, 2002, &root_pk, &dev_pk, now_s).is_err());
+        }
     }
 }

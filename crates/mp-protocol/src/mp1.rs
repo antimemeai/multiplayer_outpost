@@ -27,6 +27,8 @@ pub enum Opcode {
     PresenceDelta = 0x0103,
     SocialEvent = 0x0104,
     PartyInviteNotify = 0x0105,
+    InboxNotify = 0x0106,
+    InboxAcked = 0x0107,
     PartySnapshot = 0x0201,
     PartyMemberJoined = 0x0202,
     PartyEndpointUpdate = 0x0203,
@@ -71,6 +73,8 @@ impl Opcode {
             0x0103 => Ok(Self::PresenceDelta),
             0x0104 => Ok(Self::SocialEvent),
             0x0105 => Ok(Self::PartyInviteNotify),
+            0x0106 => Ok(Self::InboxNotify),
+            0x0107 => Ok(Self::InboxAcked),
             0x0201 => Ok(Self::PartySnapshot),
             0x0202 => Ok(Self::PartyMemberJoined),
             0x0203 => Ok(Self::PartyEndpointUpdate),
@@ -289,6 +293,17 @@ pub enum Mp1Message {
         from_account_id: AccountId,
         expires_at_ms: u64,
     },
+    InboxNotify {
+        drop_id: u64,
+        sender_account_id: AccountId,
+        created_at_ms: u64,
+        expires_at_ms: u64,
+        ciphertext_len: u32,
+    },
+    InboxAcked {
+        drop_id: u64,
+        device_id: DeviceId,
+    },
     PartySnapshot(PartySnapshot),
     PartyMemberJoined {
         party_epoch: u64,
@@ -339,6 +354,8 @@ impl Mp1Message {
             Self::PresenceDelta(_) => Opcode::PresenceDelta,
             Self::SocialEvent { .. } => Opcode::SocialEvent,
             Self::PartyInviteNotify { .. } => Opcode::PartyInviteNotify,
+            Self::InboxNotify { .. } => Opcode::InboxNotify,
+            Self::InboxAcked { .. } => Opcode::InboxAcked,
             Self::PartySnapshot(_) => Opcode::PartySnapshot,
             Self::PartyMemberJoined { .. } => Opcode::PartyMemberJoined,
             Self::PartyEndpointUpdate { .. } => Opcode::PartyEndpointUpdate,
@@ -625,6 +642,23 @@ pub fn encode_frame(seq: u32, msg: &Mp1Message) -> Result<Vec<u8>, Mp1Error> {
             payload.extend_from_slice(&from_account_id.to_le_bytes());
             payload.extend_from_slice(&check_safe_u64(*expires_at_ms)?.to_le_bytes());
         }
+        Mp1Message::InboxNotify {
+            drop_id,
+            sender_account_id,
+            created_at_ms,
+            expires_at_ms,
+            ciphertext_len,
+        } => {
+            payload.extend_from_slice(&check_positive_safe_u64(*drop_id)?.to_le_bytes());
+            payload.extend_from_slice(&sender_account_id.to_le_bytes());
+            payload.extend_from_slice(&check_safe_u64(*created_at_ms)?.to_le_bytes());
+            payload.extend_from_slice(&check_safe_u64(*expires_at_ms)?.to_le_bytes());
+            payload.extend_from_slice(&ciphertext_len.to_le_bytes());
+        }
+        Mp1Message::InboxAcked { drop_id, device_id } => {
+            payload.extend_from_slice(&check_positive_safe_u64(*drop_id)?.to_le_bytes());
+            payload.extend_from_slice(&device_id.to_le_bytes());
+        }
         Mp1Message::PartySnapshot(s) => {
             validate_party_snapshot(s)?;
             payload.extend_from_slice(&s.party_id.to_le_bytes());
@@ -833,6 +867,25 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(FrameHeader, Mp1Message), Mp1Error>
                 expires_at_ms,
             }
         }
+        Opcode::InboxNotify => {
+            let drop_id = check_positive_safe_u64(r.read_u64_safe()?)?;
+            let sender_account_id = AccountId::new(r.read_u64_safe()?)?;
+            let created_at_ms = r.read_u64_safe()?;
+            let expires_at_ms = r.read_u64_safe()?;
+            let ciphertext_len = r.read_u32()?;
+            Mp1Message::InboxNotify {
+                drop_id,
+                sender_account_id,
+                created_at_ms,
+                expires_at_ms,
+                ciphertext_len,
+            }
+        }
+        Opcode::InboxAcked => {
+            let drop_id = check_positive_safe_u64(r.read_u64_safe()?)?;
+            let device_id = DeviceId::new(r.read_u64_safe()?)?;
+            Mp1Message::InboxAcked { drop_id, device_id }
+        }
         Opcode::PartySnapshot => {
             let party_id = PartyId::new(r.read_u64_safe()?)?;
             let party_epoch = check_positive_safe_u64(r.read_u64_safe()?)?;
@@ -964,4 +1017,43 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(FrameHeader, Mp1Message), Mp1Error>
         },
         msg,
     ))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inbox_notify_and_acked_round_trip_and_server_only() {
+        assert!(!Opcode::InboxNotify.is_allowed_from_client(SocketRole::Account));
+        assert!(!Opcode::InboxNotify.is_allowed_from_client(SocketRole::Party));
+        assert!(!Opcode::InboxAcked.is_allowed_from_client(SocketRole::Account));
+        assert!(!Opcode::InboxAcked.is_allowed_from_client(SocketRole::Party));
+
+        let notify = Mp1Message::InboxNotify {
+            drop_id: 987_654_321,
+            sender_account_id: AccountId::new(42).unwrap(),
+            created_at_ms: 1_700_000_000_000,
+            expires_at_ms: 1_700_086_400_000,
+            ciphertext_len: 4096,
+        };
+        let frame = encode_frame(0, &notify).unwrap();
+        assert_eq!(frame.len(), MP1_HEADER_BYTES + 36);
+        let (hdr, decoded) = decode_frame(&frame).unwrap();
+        assert_eq!(hdr.opcode, Opcode::InboxNotify);
+        assert_eq!(hdr.payload_len, 36);
+        assert_eq!(decoded, notify);
+
+        let acked = Mp1Message::InboxAcked {
+            drop_id: 987_654_321,
+            device_id: DeviceId::new(77).unwrap(),
+        };
+        let ack_frame = encode_frame(0, &acked).unwrap();
+        assert_eq!(ack_frame.len(), MP1_HEADER_BYTES + 16);
+        let (ahdr, adec) = decode_frame(&ack_frame).unwrap();
+        assert_eq!(ahdr.opcode, Opcode::InboxAcked);
+        assert_eq!(ahdr.payload_len, 16);
+        assert_eq!(adec, acked);
+    }
 }

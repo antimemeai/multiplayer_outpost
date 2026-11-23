@@ -502,6 +502,7 @@ pub struct FriendItem {
     pub presence_status: u8,
     pub joinable_party_id: Option<u64>,
     pub handle: String,
+    pub safety_number: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,6 +517,8 @@ pub struct PartyCreateReq {
     pub relay_policy: u8,
     pub max_members: u8,
     pub relay_url: String,
+    pub org_id: Option<u64>,
+    pub group_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1263,6 +1266,7 @@ pub fn encode_friends_list_resp(resp: &FriendsListResp) -> Result<Vec<u8>, IpcWi
         w.u8(f.presence_status);
         w.opt_u64(f.joinable_party_id);
         w.str_u16(&f.handle)?;
+        w.str_u16(&f.safety_number)?;
     }
     Ok(w.finish())
 }
@@ -1282,6 +1286,7 @@ pub fn decode_friends_list_resp(bytes: &[u8]) -> Result<FriendsListResp, IpcWire
             presence_status: r.u8()?,
             joinable_party_id: r.opt_u64()?,
             handle: r.str_u16(128)?,
+            safety_number: r.str_u16(64)?,
         });
     }
     r.finish()?;
@@ -1295,6 +1300,8 @@ pub fn encode_party_create_req(req: &PartyCreateReq) -> Result<Vec<u8>, IpcWireE
     w.u8(req.relay_policy);
     w.u8(req.max_members);
     w.str_u16(&req.relay_url)?;
+    w.opt_u64(req.org_id);
+    w.opt_u64(req.group_id);
     Ok(w.finish())
 }
 
@@ -1306,6 +1313,8 @@ pub fn decode_party_create_req(bytes: &[u8]) -> Result<PartyCreateReq, IpcWireEr
         relay_policy: r.u8()?,
         max_members: r.u8()?,
         relay_url: r.str_u16(256)?,
+        org_id: r.opt_u64()?,
+        group_id: r.opt_u64()?,
     };
     r.finish()?;
     Ok(req)
@@ -1878,5 +1887,66 @@ mod tests {
         };
         let decoded = decode_status_resp(&bytes);
         assert_eq!(decoded.map(|s| s.exe_path), Ok(long_path));
+    }
+
+    #[test]
+    fn schema_v3_friends_and_scoped_party_create_roundtrip() {
+        let friends = super::FriendsListResp {
+            friends: vec![
+                super::FriendItem {
+                    account_id: 1002,
+                    state: 0,
+                    updated_at_ms: 1_730_000_000_000,
+                    presence_status: 1,
+                    joinable_party_id: Some(77),
+                    handle: "bob".to_string(),
+                    safety_number: "AAAA-BBBB-CCCC-DDDD-EEEE-FFFF-0000-1111".to_string(),
+                },
+                super::FriendItem {
+                    account_id: 1003,
+                    state: 2,
+                    updated_at_ms: 1_730_000_000_500,
+                    presence_status: 0,
+                    joinable_party_id: None,
+                    handle: String::new(),
+                    safety_number: String::new(),
+                },
+            ],
+        };
+        let encoded_friends = super::encode_friends_list_resp(&friends);
+        assert!(encoded_friends.is_ok());
+        if let Ok(bytes) = encoded_friends {
+            assert_eq!(super::decode_friends_list_resp(&bytes), Ok(friends));
+        }
+
+        let create_req = super::PartyCreateReq {
+            visibility: 0,
+            join_mode: 1,
+            relay_policy: 1,
+            max_members: 8,
+            relay_url: "https://relay.multiplayer.tech".to_string(),
+            org_id: Some(42),
+            group_id: Some(99),
+        };
+        let encoded_req = super::encode_party_create_req(&create_req);
+        assert!(encoded_req.is_ok());
+        if let Ok(bytes) = encoded_req {
+            assert_eq!(super::decode_party_create_req(&bytes), Ok(create_req));
+        }
+
+        let unscoped_req = super::PartyCreateReq {
+            visibility: 1,
+            join_mode: 0,
+            relay_policy: 0,
+            max_members: 4,
+            relay_url: String::new(),
+            org_id: None,
+            group_id: None,
+        };
+        let encoded_unscoped = super::encode_party_create_req(&unscoped_req);
+        assert!(encoded_unscoped.is_ok());
+        if let Ok(bytes) = encoded_unscoped {
+            assert_eq!(super::decode_party_create_req(&bytes), Ok(unscoped_req));
+        }
     }
 }

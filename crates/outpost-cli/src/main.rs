@@ -14,6 +14,7 @@ mod app_daemon;
 mod build_info;
 mod cli;
 mod ipc_payloads;
+mod lan;
 mod mcp_bridge;
 mod mpkey;
 mod storage;

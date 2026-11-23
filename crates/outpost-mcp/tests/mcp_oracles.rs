@@ -1503,11 +1503,11 @@ async fn oracle_8_identity_portability_secret_refusal_kind_codes() {
     let _ = h.close_and_wait().await;
 }
 
-/// Test 9 (Gate #2 Lane 1): `IPC_SCHEMA_VER == 2` refuses delegating sends to a stale v0.1 daemon
+/// Test 9 (Gate #2 Lane 1): `IPC_SCHEMA_VER >= 2` refuses delegating sends to a stale v0.1 daemon
 /// (schema 1) without retrying.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oracle_9_gate2_schema_v2_refuses_stale_v01_daemon() {
-    assert_eq!(IPC_SCHEMA_VER, 2);
+    assert_eq!(IPC_SCHEMA_VER, 3);
     let backend = MockBackend::new();
     backend
         .lock_state()
@@ -1542,7 +1542,10 @@ async fn oracle_9_gate2_schema_v2_refuses_stale_v01_daemon() {
         "daemon_schema_mismatch_restart_mcp"
     );
     assert_eq!(ptr(&reply, "/result/structuredContent/daemon_schema"), 1);
-    assert_eq!(ptr(&reply, "/result/structuredContent/local_schema"), 2);
+    assert_eq!(
+        ptr(&reply, "/result/structuredContent/local_schema"),
+        IPC_SCHEMA_VER
+    );
     assert_eq!(backend.send_calls.load(Ordering::SeqCst), 1);
 
     let _ = h.close_and_wait().await;

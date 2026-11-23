@@ -704,6 +704,361 @@ fn oracle_4_mcp_setup_and_recovery_key_argv_rejection() -> Result<(), String> {
 }
 
 // ===========================================================================
+// Oracle 7: LAN Party! CLI Mandates, 2-Binary Encrypted QUIC Chat, & Relays
+// ===========================================================================
+
+struct LanChildProc {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    rx: std::sync::mpsc::Receiver<String>,
+    stderr_handle: Option<std::thread::JoinHandle<String>>,
+}
+
+impl LanChildProc {
+    fn spawn(
+        state_dir: &Path,
+        runtime_dir: &Path,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self, String> {
+        let mut cmd = Command::new(BIN_PATH);
+        cmd.arg("--state-dir")
+            .arg(state_dir)
+            .arg("--runtime-dir")
+            .arg(runtime_dir)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for &(k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("spawn lan proc failed: {e}"))?;
+        let stdin = child.stdin.take().ok_or("missing lan proc stdin")?;
+        let stdout = child.stdout.take().ok_or("missing lan proc stdout")?;
+        let stderr = child.stderr.take().ok_or("missing lan proc stderr")?;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx.send(line.trim().to_string()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        let stderr_handle = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let mut reader = BufReader::new(stderr);
+            let _ = std::io::Read::read_to_string(&mut reader, &mut buf);
+            buf
+        });
+
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            rx,
+            stderr_handle: Some(stderr_handle),
+        })
+    }
+
+    fn send_line(&mut self, line: &str) -> Result<(), String> {
+        let stdin = self.stdin.as_mut().ok_or("lan proc stdin closed")?;
+        stdin
+            .write_all(line.as_bytes())
+            .map_err(|e| format!("write lan stdin: {e}"))?;
+        stdin
+            .write_all(b"\n")
+            .map_err(|e| format!("write lan newline: {e}"))?;
+        stdin.flush().map_err(|e| format!("flush lan stdin: {e}"))
+    }
+
+    fn wait_for_event(&mut self, event_name: &str, timeout: Duration) -> Result<Value, String> {
+        let deadline = Instant::now() + timeout;
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(rem.min(Duration::from_millis(250))) {
+                Ok(line) => {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                        if val.get("event").and_then(Value::as_str) == Some(event_name) {
+                            return Ok(val);
+                        }
+                        seen.push(line);
+                    } else {
+                        seen.push(line);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let err_tail = self.finish_and_read_stderr();
+        Err(format!(
+            "timed out waiting for event '{event_name}' (seen={seen:?}, stderr={err_tail})"
+        ))
+    }
+
+    fn finish_and_read_stderr(&mut self) -> String {
+        drop(self.stdin.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.stderr_handle
+            .take()
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default()
+    }
+
+    fn wait_exit_clean(&mut self, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    if status.success() {
+                        return Ok(());
+                    }
+                    let stderr = self
+                        .stderr_handle
+                        .take()
+                        .and_then(|h| h.join().ok())
+                        .unwrap_or_default();
+                    return Err(format!("lan proc exited with {status}: {stderr}"));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => return Err(format!("try_wait failed: {e}")),
+            }
+        }
+        let stderr = self.finish_and_read_stderr();
+        Err(format!("lan proc did not exit cleanly within {timeout:?}: {stderr}"))
+    }
+}
+
+impl Drop for LanChildProc {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn encode_hex_32(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(64);
+    for &b in bytes {
+        if let (Some(&hi), Some(&lo)) = (
+            HEX.get(usize::from(b >> 4)),
+            HEX.get(usize::from(b & 0x0f)),
+        ) {
+            s.push(char::from(hi));
+            s.push(char::from(lo));
+        }
+    }
+    s
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oracle_7_lan_party_cli_mandates_and_regional_relays() -> Result<(), String> {
+    let root_tmp = make_short_tempdir("mpo7")?;
+    let host_st = make_private_subdir(root_tmp.path(), "hst")?;
+    let host_rt = make_private_subdir(root_tmp.path(), "hrt")?;
+    let host_lan = make_private_subdir(root_tmp.path(), "hlan")?;
+    let join_st = make_private_subdir(root_tmp.path(), "jst")?;
+    let join_rt = make_private_subdir(root_tmp.path(), "jrt")?;
+    let join_lan = make_private_subdir(root_tmp.path(), "jlan")?;
+    let xdg_dir = make_private_subdir(root_tmp.path(), "xdg")?;
+
+    let host_lan_str = host_lan.to_string_lossy().into_owned();
+    let join_lan_str = join_lan.to_string_lossy().into_owned();
+    let xdg_str = xdg_dir.to_string_lossy().into_owned();
+    let base_env = [("XDG_CONFIG_HOME", xdg_str.as_str())];
+
+    // 1. `mp-outpost lan status --json --lan-dir <tmp>` reports `disabled: false` and opens zero sockets.
+    let st_out = run_bin(
+        &host_st,
+        &host_rt,
+        &["lan", "status", "--json", "--lan-dir", &host_lan_str],
+        None,
+        &base_env,
+    )?;
+    if !st_out.status_ok {
+        return Err(format!("lan status failed: {}", st_out.stderr));
+    }
+    let st_json: Value =
+        serde_json::from_str(&st_out.stdout).map_err(|e| format!("lan status json: {e}"))?;
+    if st_json.pointer("/policy/disabled").and_then(Value::as_bool) != Some(false) {
+        return Err(format!("expected lan status policy.disabled=false: {st_json}"));
+    }
+
+    // 2. `MP_DISABLE_LAN=1` fails closed immediately on both `lan host --no-mdns` and `lan scan`!
+    let disabled_env = [
+        ("XDG_CONFIG_HOME", xdg_str.as_str()),
+        ("MP_DISABLE_LAN", "1"),
+    ];
+    let dis_host = run_bin(
+        &host_st,
+        &host_rt,
+        &["lan", "host", "--no-mdns", "--lan-dir", &host_lan_str],
+        None,
+        &disabled_env,
+    )?;
+    if dis_host.status_ok {
+        return Err("MP_DISABLE_LAN=1 lan host MUST fail closed!".to_string());
+    }
+    let dis_scan = run_bin(
+        &host_st,
+        &host_rt,
+        &["lan", "scan", "--timeout", "1"],
+        None,
+        &disabled_env,
+    )?;
+    if dis_scan.status_ok {
+        return Err("MP_DISABLE_LAN=1 lan scan MUST fail closed!".to_string());
+    }
+
+    // 3. Global argv secret guard rejects `--pin` and `--pin=` (case-insensitive) without echoing `424242`!
+    for bad_args in [
+        vec!["lan", "host", "--pin", "424242"],
+        vec!["lan", "host", "--pin=424242"],
+        vec!["lan", "join", "127.0.0.1:4433", "--PIN=424242"],
+    ] {
+        let pin_res = run_bin(&host_st, &host_rt, &bad_args, None, &base_env)?;
+        if pin_res.status_ok
+            || pin_res.stderr.contains("424242")
+            || !pin_res.stderr.contains("PINs are forbidden on CLI argv")
+        {
+            return Err(format!(
+                "expected argv PIN rejection without echoing secret for {bad_args:?}: ok={} stderr={}",
+                pin_res.status_ok, pin_res.stderr
+            ));
+        }
+    }
+
+    // 4. Full 2-process compiled-binary encrypted QUIC LAN Party chat on loopback!
+    // Pre-seed joiner's local identity.json (mode 0600) so we know joiner's canonical SN up front,
+    // while letting host generate a fresh local identity on startup.
+    let join_seed = [0x77u8; 32];
+    let join_sk = SigningKey::from_bytes(&join_seed);
+    let join_pk = join_sk.verifying_key().to_bytes();
+    let join_sn = compute_safety_number(0, &join_pk);
+    let join_id_path = join_lan.join("identity.json");
+    let join_id_body = json!({
+        "version": 1,
+        "account_id": 0,
+        "display_name": "outpost-joiner",
+        "seed_hex": encode_hex_32(&join_seed),
+        "public_key_hex": encode_hex_32(&join_pk),
+    })
+    .to_string();
+    std::fs::write(&join_id_path, format!("{join_id_body}\n"))
+        .map_err(|e| format!("write joiner identity.json: {e}"))?;
+    std::fs::set_permissions(&join_id_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("chmod 0600 joiner identity.json: {e}"))?;
+
+    let mut host_proc = LanChildProc::spawn(
+        &host_st,
+        &host_rt,
+        &[
+            "--json",
+            "lan",
+            "host",
+            "--no-mdns",
+            "--require-pin",
+            "--pin-stdin",
+            "--lan-dir",
+            &host_lan_str,
+            "--display-name",
+            "outpost-host",
+            "--yes-safety-number",
+            &join_sn,
+        ],
+        &base_env,
+    )?;
+    host_proc.send_line("424242")?;
+
+    let ready_ev = host_proc.wait_for_event("lobby_ready", Duration::from_secs(15))?;
+    let direct_addr = ready_ev
+        .get("direct_addr")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing direct_addr in lobby_ready: {ready_ev}"))?
+        .to_string();
+    let host_pk_b64u = ready_ev
+        .get("host_pk_b64u")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing host_pk_b64u in lobby_ready: {ready_ev}"))?
+        .to_string();
+    let host_sn = ready_ev
+        .get("safety_number")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing safety_number in lobby_ready: {ready_ev}"))?
+        .to_string();
+    if ready_ev.get("require_pin").and_then(Value::as_bool) != Some(true)
+        || ready_ev.get("mdns_enabled").and_then(Value::as_bool) != Some(false)
+    {
+        return Err(format!("unexpected lobby_ready flags: {ready_ev}"));
+    }
+
+    let mut join_proc = LanChildProc::spawn(
+        &join_st,
+        &join_rt,
+        &[
+            "--json",
+            "lan",
+            "join",
+            &direct_addr,
+            "--host-pk",
+            &host_pk_b64u,
+            "--pin-stdin",
+            "--lan-dir",
+            &join_lan_str,
+            "--display-name",
+            "outpost-joiner",
+            "--yes-safety-number",
+            &host_sn,
+        ],
+        &base_env,
+    )?;
+    join_proc.send_line("424242")?;
+
+    let _join_ready = join_proc.wait_for_event("peer_joined", Duration::from_secs(15))?;
+    let _host_saw_join = host_proc.wait_for_event("peer_joined", Duration::from_secs(15))?;
+
+    join_proc.send_line("hello from outpost joiner")?;
+    let host_chat = host_proc.wait_for_event("chat", Duration::from_secs(15))?;
+    if host_chat.get("body").and_then(Value::as_str) != Some("hello from outpost joiner") {
+        return Err(format!("unexpected host chat event: {host_chat}"));
+    }
+
+    host_proc.send_line("hello from outpost host")?;
+    let join_chat = join_proc.wait_for_event("chat", Duration::from_secs(15))?;
+    if join_chat.get("body").and_then(Value::as_str) != Some("hello from outpost host") {
+        return Err(format!("unexpected joiner chat event: {join_chat}"));
+    }
+
+    let _ = join_proc.send_line("/quit");
+    let _ = host_proc.send_line("/quit");
+    join_proc.wait_exit_clean(Duration::from_secs(10))?;
+    host_proc.wait_exit_clean(Duration::from_secs(10))?;
+
+    // 5. Verify `mp-outpost relays --json` (and `--ping`) against a local TLS 1.3 mock server!
+    #[cfg(feature = "test-tls-overrides")]
+    live_e2e::verify_relays_cli_against_mock_tls13(root_tmp.path(), &host_st, &host_rt).await?;
+
+    Ok(())
+}
+
+// ===========================================================================
 // Oracle 3 (default production build): MUST ignore OUTPOST_TEST_* overrides
 // ===========================================================================
 
@@ -3135,6 +3490,127 @@ async fn oracle_6_tls13_self_upgrade_and_sha256_tamper_rejection() -> Result<(),
                 "tampered tarball MUST be rejected with SHA-256 mismatch: ok={} stderr={}",
                 bad.status_ok, bad.stderr
             ));
+        }
+
+        Ok(())
+    })();
+
+    server_task.abort();
+    result
+}
+
+pub(super) async fn verify_relays_cli_against_mock_tls13(
+    root_tmp: &Path,
+    state_dir: &Path,
+    runtime_dir: &Path,
+) -> Result<(), String> {
+    let (acceptor, cert_pem) = generate_mock_tls()?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("bind relays mock: {e}"))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("relays mock addr: {e}"))?;
+
+    let relays_body = json!({
+        "default_relay_url": format!("https://{TEST_AUTHORITY}"),
+        "relays": [
+            {
+                "url": format!("https://{TEST_AUTHORITY}"),
+                "region": "us-east",
+                "label": "US East Primary",
+                "default": true
+            }
+        ]
+    })
+    .to_string()
+    .into_bytes();
+
+    let server_task = tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor_c = acceptor.clone();
+            let body_c = relays_body.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor_c.accept(tcp).await else {
+                    return;
+                };
+                let Ok(req) = read_http_req(&mut tls).await else {
+                    return;
+                };
+                if req.method == "GET" && req.path == "/v1/relays" {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body_c.len()
+                    );
+                    let _ = tls.write_all(head.as_bytes()).await;
+                    let _ = tls.write_all(&body_c).await;
+                    let _ = tls.flush().await;
+                } else if req.method == "GET" && req.path == "/ping" {
+                    let _ = tls
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = tls.flush().await;
+                } else {
+                    let _ = tls
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = tls.flush().await;
+                }
+            });
+        }
+    });
+
+    let ca_path = root_tmp.join("relays_ca.pem");
+    std::fs::write(&ca_path, cert_pem).map_err(|e| format!("write relays ca: {e}"))?;
+    let addr_str = addr.to_string();
+    let ca_str = ca_path.to_string_lossy().into_owned();
+    let env_vars = [
+        ("OUTPOST_TEST_CONNECT_ADDR", addr_str.as_str()),
+        ("OUTPOST_TEST_CA_PEM", ca_str.as_str()),
+    ];
+
+    let result: Result<(), String> = (|| {
+        let out = run_bin(
+            state_dir,
+            runtime_dir,
+            &["--json", "relays", "--api-authority", TEST_AUTHORITY],
+            None,
+            &env_vars,
+        )?;
+        if !out.status_ok {
+            return Err(format!("relays --json failed: {}", out.stderr));
+        }
+        let j: Value =
+            serde_json::from_str(&out.stdout).map_err(|e| format!("parse relays json: {e}"))?;
+        let expected_url = format!("https://{TEST_AUTHORITY}");
+        if j.get("default_relay_url").and_then(Value::as_str) != Some(expected_url.as_str())
+            || j.pointer("/relays/0/region").and_then(Value::as_str) != Some("us-east")
+            || j.pointer("/relays/0/url").and_then(Value::as_str) != Some(expected_url.as_str())
+        {
+            return Err(format!("unexpected relays --json output: {j}"));
+        }
+
+        let ping_out = run_bin(
+            state_dir,
+            runtime_dir,
+            &["--json", "relays", "--ping", "--api-authority", TEST_AUTHORITY],
+            None,
+            &env_vars,
+        )?;
+        if !ping_out.status_ok {
+            return Err(format!("relays --ping --json failed: {}", ping_out.stderr));
+        }
+        let pj: Value = serde_json::from_str(&ping_out.stdout)
+            .map_err(|e| format!("parse relays --ping json: {e}"))?;
+        if pj.get("pinged").and_then(Value::as_bool) != Some(true)
+            || pj.get("fastest_relay_url").and_then(Value::as_str) != Some(expected_url.as_str())
+            || pj.pointer("/relays/0/ok").and_then(Value::as_bool) != Some(true)
+        {
+            return Err(format!("unexpected relays --ping --json output: {pj}"));
         }
 
         Ok(())

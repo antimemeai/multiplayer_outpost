@@ -114,6 +114,12 @@ pub fn reject_secrets_in_argv(args: &[String]) -> Result<(), String> {
 
     for a in args.iter().skip(1) {
         let lower = a.to_ascii_lowercase();
+        if lower == "--pin" || lower.starts_with("--pin=") {
+            return Err(
+                "PINs are forbidden on CLI argv (use hidden /dev/tty prompt or --pin-stdin)"
+                    .to_string(),
+            );
+        }
         for &(flag, label) in SECRET_FLAGS {
             if lower == flag || lower.starts_with(&format!("{flag}=")) {
                 return Err(format!(
@@ -215,6 +221,7 @@ fn redact_unknown_arg(arg: &str) -> String {
         if fl == "--passphrase"
             || fl == "--recovery-key"
             || fl == "--invite-secret"
+            || fl == "--pin"
             || fl == "--token"
             || fl == "--secret"
             || fl == "--key"
@@ -222,6 +229,7 @@ fn redact_unknown_arg(arg: &str) -> String {
             || fl.ends_with("-secret")
             || fl.ends_with("-token")
             || fl.ends_with("-key")
+            || fl.ends_with("-pin")
         {
             return format!("{}=[REDACTED]", sanitize_cli_meta(flag));
         }
@@ -366,6 +374,8 @@ pub async fn run_cli_command(args: &[String]) -> Result<(), String> {
         "device" => cmd_device(&opts, sub).await,
         "web" => cmd_web(&opts, sub).await,
         "doctor" => cmd_doctor(&opts, sub).await,
+        "relays" => cmd_relays(&opts, sub).await,
+        "lan" => crate::lan::run_lan(&opts, sub).await,
         "upgrade" => crate::upgrade::run_upgrade(&opts, sub).await,
         "mcp" => cmd_mcp(&opts, sub),
         "peer" => cmd_peer(&opts, sub).await,
@@ -396,6 +406,8 @@ Commands:\n\
   device init|install-cwt|enroll|renew|revoke|link <create|join|approve>\n\
   web approve <XXXX-XXXX>\n\
   doctor [--api-authority <host>] [--relay-url <url>]\n\
+  relays [--ping] [--api-authority <host>]\n\
+  lan status|scan|host|join\n\
   upgrade [--check] [--yes|-y] [--version <vX.Y.Z|latest>]\n\
   peer list|trust|revoke\n\
   friend list|add|accept|deny|decline|remove|block <@handle|account_id>\n\
@@ -3629,6 +3641,7 @@ async fn cmd_friend(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                         json!({
                             "account_id": f.account_id,
                             "handle": f.handle,
+                            "safety_number": f.safety_number,
                             "state": f.state,
                             "state_label": friend_state_label(f.state),
                             "presence_status": f.presence_status,
@@ -3651,7 +3664,15 @@ async fn cmd_friend(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                         } else {
                             format!("@{safe_h}")
                         };
-                        println!("  {target_ref} (account_id={})", f.account_id);
+                        if f.safety_number.is_empty() {
+                            println!("  {target_ref} (account_id={})", f.account_id);
+                        } else {
+                            println!(
+                                "  {target_ref} (account_id={} safety_number={})",
+                                f.account_id,
+                                sanitize_cli_meta(&f.safety_number)
+                            );
+                        }
                         println!(
                             "    Accept: mp-outpost friend accept {target_ref}  |  Deny: mp-outpost friend deny {target_ref}"
                         );
@@ -3663,10 +3684,20 @@ async fn cmd_friend(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                         println!();
                     }
                     for f in others {
+                        let safe_h = sanitize_cli_meta(&f.handle);
+                        let handle_part = if safe_h.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" handle=@{safe_h}")
+                        };
+                        let sn_part = if f.safety_number.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" safety_number={}", sanitize_cli_meta(&f.safety_number))
+                        };
                         println!(
-                            "account_id={} handle=@{} state={} ({}) presence={}",
+                            "account_id={}{handle_part} state={} ({}) presence={}{sn_part}",
                             f.account_id,
-                            sanitize_cli_meta(&f.handle),
                             friend_state_label(f.state),
                             f.state,
                             f.presence_status
@@ -3781,6 +3812,8 @@ async fn cmd_party(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
             let mut relay_policy = RelayPolicy::AllowRelays;
             let mut max_members: u8 = 8;
             let mut relay_url = String::new();
+            let mut org_id: Option<u64> = None;
+            let mut group_id: Option<u64> = None;
             let mut i = 0usize;
             while i < rest.len() {
                 let a = rest.get(i).map(String::as_str).unwrap_or_default();
@@ -3815,6 +3848,18 @@ async fn cmd_party(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                     "--relay-url" => {
                         relay_url = next_val(rest, &mut i, "--relay-url")?.to_string();
                     }
+                    "--org-id" => {
+                        org_id = Some(parse_safe_id(
+                            next_val(rest, &mut i, "--org-id")?,
+                            "--org-id",
+                        )?);
+                    }
+                    "--group-id" => {
+                        group_id = Some(parse_safe_id(
+                            next_val(rest, &mut i, "--group-id")?,
+                            "--group-id",
+                        )?);
+                    }
                     other => {
                         return Err(format!(
                             "unknown argument to `party create`: {}",
@@ -3830,6 +3875,8 @@ async fn cmd_party(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                 relay_policy: relay_policy as u8,
                 max_members,
                 relay_url,
+                org_id,
+                group_id,
             };
             let raw = client
                 .request(
@@ -5277,6 +5324,218 @@ fn extract_https_authority_from_url(url: &str) -> Option<&str> {
     if auth.is_empty() { None } else { Some(auth) }
 }
 
+async fn cmd_relays(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let mut ping = false;
+    let mut api_authority_override: Option<String> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--ping" => {
+                ping = true;
+                i += 1;
+            }
+            "--api-authority" => {
+                api_authority_override =
+                    Some(next_val(args, &mut i, "--api-authority")?.to_string());
+            }
+            "-h" | "--help" => {
+                println!("Usage: mp-outpost relays [--ping] [--api-authority <host>] [--json]");
+                return Ok(());
+            }
+            other => {
+                return Err(format!(
+                    "unknown argument to `relays`: {}",
+                    redact_unknown_arg(other)
+                ));
+            }
+        }
+    }
+
+    let device_authority = resolve_effective_state_dir(opts.state_dir.as_deref())
+        .ok()
+        .and_then(|st_dir| {
+            open_state_dir(&st_dir).ok()?;
+            let dev_id = resolve_active_device_id(&st_dir, opts.device_id).ok()?;
+            load_device_record(&st_dir, dev_id)
+                .ok()
+                .map(|d| d.api_authority)
+        });
+    let effective_authority = api_authority_override
+        .or(device_authority)
+        .unwrap_or_else(|| DEFAULT_API_AUTHORITY.to_string());
+
+    let cfg = build_control_client_config(&effective_authority).map_err(|e| e.to_string())?;
+    let client = ControlClient::new(cfg.with_request_timeout(Duration::from_secs(10)));
+    let discovered = client.list_relays().await.map_err(|e| e.to_string())?;
+
+    struct RelayRow {
+        orig_idx: usize,
+        url: String,
+        region: String,
+        label: String,
+        is_default: bool,
+        ok: Option<bool>,
+        rtt_ms: Option<u64>,
+        error: Option<String>,
+    }
+
+    let mut rows: Vec<RelayRow> = discovered
+        .relays
+        .into_iter()
+        .enumerate()
+        .map(|(idx, r)| {
+            let is_default = r.default || r.url == discovered.default_relay_url;
+            RelayRow {
+                orig_idx: idx,
+                url: r.url,
+                region: r.region,
+                label: r.label,
+                is_default,
+                ok: None,
+                rtt_ms: None,
+                error: None,
+            }
+        })
+        .collect();
+
+    if ping {
+        let mut join_set = tokio::task::JoinSet::new();
+        for row in &rows {
+            let idx = row.orig_idx;
+            let url = row.url.clone();
+            join_set.spawn(async move {
+                let auth = extract_https_authority_from_url(&url)
+                    .unwrap_or(DEFAULT_API_AUTHORITY)
+                    .to_string();
+                match build_control_client_config(&auth) {
+                    Ok(relay_cfg) => {
+                        let probe_client =
+                            ControlClient::new(relay_cfg.with_request_timeout(Duration::from_secs(10)));
+                        match probe_client.probe_relay_ping(&url).await {
+                            Ok(rtt) => {
+                                let ms = u64::try_from(rtt.as_millis()).unwrap_or(u64::MAX);
+                                (idx, true, Some(ms), None)
+                            }
+                            Err(e) => (idx, false, None, Some(sanitize_cli_meta(&e.to_string()))),
+                        }
+                    }
+                    Err(e) => (idx, false, None, Some(sanitize_cli_meta(&e.to_string()))),
+                }
+            });
+        }
+        while let Some(res) = join_set.join_next().await {
+            if let Ok((idx, ok, rtt_ms, error)) = res
+                && let Some(row) = rows.get_mut(idx)
+            {
+                row.ok = Some(ok);
+                row.rtt_ms = rtt_ms;
+                row.error = error;
+            }
+        }
+        rows.sort_by(|a, b| {
+            let a_rank = match (a.ok, a.rtt_ms) {
+                (Some(true), Some(ms)) => (0u8, ms),
+                _ => (1u8, u64::MAX),
+            };
+            let b_rank = match (b.ok, b.rtt_ms) {
+                (Some(true), Some(ms)) => (0u8, ms),
+                _ => (1u8, u64::MAX),
+            };
+            a_rank.cmp(&b_rank).then_with(|| a.orig_idx.cmp(&b.orig_idx))
+        });
+    }
+
+    let fastest_relay_url = if ping {
+        rows.iter()
+            .find(|r| r.ok == Some(true))
+            .map(|r| r.url.clone())
+    } else {
+        None
+    };
+
+    if opts.json {
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                if ping {
+                    json!({
+                        "url": r.url,
+                        "region": r.region,
+                        "label": r.label,
+                        "default": r.is_default,
+                        "ok": r.ok.unwrap_or(false),
+                        "rtt_ms": r.rtt_ms,
+                        "error": r.error,
+                    })
+                } else {
+                    json!({
+                        "url": r.url,
+                        "region": r.region,
+                        "label": r.label,
+                        "default": r.is_default,
+                    })
+                }
+            })
+            .collect();
+        print_json(&json!({
+            "api_authority": sanitize_cli_meta(&effective_authority),
+            "default_relay_url": discovered.default_relay_url,
+            "pinged": ping,
+            "fastest_relay_url": fastest_relay_url,
+            "relays": items,
+        }));
+    } else {
+        println!(
+            "Regional relays (authority={}, default={}):",
+            sanitize_cli_meta(&effective_authority),
+            sanitize_cli_meta(&discovered.default_relay_url)
+        );
+        if rows.is_empty() {
+            println!("  (no regional relays advertised)");
+        } else {
+            for r in &rows {
+                let mut tags = Vec::new();
+                if r.is_default {
+                    tags.push("default");
+                }
+                if fastest_relay_url.as_deref() == Some(r.url.as_str()) {
+                    tags.push("fastest");
+                }
+                let tag_suffix = if tags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", tags.join(", "))
+                };
+                if ping {
+                    let status_col = match (r.ok, r.rtt_ms, r.error.as_deref()) {
+                        (Some(true), Some(ms), _) => format!("ok ({ms}ms)"),
+                        (_, _, Some(err)) => format!("FAIL ({err})"),
+                        _ => "FAIL".to_string(),
+                    };
+                    println!(
+                        "  {:<12}  {:<24}  {}  {}{tag_suffix}",
+                        sanitize_cli_meta(&r.region),
+                        sanitize_cli_meta(&r.label),
+                        sanitize_cli_meta(&r.url),
+                        status_col,
+                    );
+                } else {
+                    println!(
+                        "  {:<12}  {:<24}  {}{tag_suffix}",
+                        sanitize_cli_meta(&r.region),
+                        sanitize_cli_meta(&r.label),
+                        sanitize_cli_meta(&r.url),
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn cmd_doctor(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     let mut api_authority_override: Option<String> = None;
     let mut relay_url_override: Option<String> = None;
@@ -6241,6 +6500,33 @@ mod tests {
         .unwrap_or_default();
         assert!(!err.is_empty());
         assert!(!err.contains("supersecret999"));
+
+        // --pin and --pin=... (case-insensitive) MUST be rejected without echoing value!
+        for bad_pin in [
+            vec!["mp-outpost", "lan", "host", "--pin", "424242"],
+            vec!["mp-outpost", "lan", "host", "--pin=424242"],
+            vec!["mp-outpost", "lan", "join", "--PIN=424242"],
+            vec!["mp-outpost", "lan", "join", "--PIN", "424242"],
+        ] {
+            let pin_err = reject_secrets_in_argv(&s(&bad_pin))
+                .err()
+                .unwrap_or_default();
+            assert!(
+                pin_err.contains("PINs are forbidden on CLI argv"),
+                "expected PIN guard error, got: {pin_err}"
+            );
+            assert!(!pin_err.contains("424242"));
+        }
+        assert!(
+            reject_secrets_in_argv(&s(&[
+                "mp-outpost",
+                "lan",
+                "host",
+                "--require-pin",
+                "--pin-stdin",
+            ]))
+            .is_ok()
+        );
 
         // PEM header and .mpkey
         assert!(

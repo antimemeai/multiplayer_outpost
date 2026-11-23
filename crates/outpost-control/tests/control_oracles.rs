@@ -25,20 +25,21 @@ use base64::engine::general_purpose::STANDARD as B64_STD;
 use ed25519_dalek::SigningKey;
 use mp_protocol::{
     AccountId, DeviceId, DirectAddr, EndpointDescriptor, HttpMethod, MAX_MP1_FRAME_BYTES,
-    MemberLeaveReason, Mp1Message, PartyId, PartyInviteId, PartyJoinMode, PartyMemberRecord,
-    PartySnapshot, PartyVisibility, RelayPolicy, RequestId, Rfc9421Error, Rfc9421Request,
-    SessionId, TransportKind, encode_device_cwt, encode_frame, sha256, verify_rfc9421_request,
+    MAX_SAFE_ID, MemberLeaveReason, Mp1Message, PartyId, PartyInviteId, PartyJoinMode,
+    PartyMemberRecord, PartySnapshot, PartyVisibility, RelayPolicy, RequestId, Rfc9421Error,
+    Rfc9421Request, SessionId, TransportKind, encode_device_cwt, encode_frame, sha256,
+    verify_rfc9421_request,
 };
 use outpost_control::{
     ApprovePartyRequest, ChurnStatus, ControlClient, ControlClientConfig, ControlError,
     CreatePartyRequest, DeviceLinkApproveRequest, DeviceLinkClaimResponse,
     DeviceLinkInspectResponse, DeviceLinkPollResponse, EndpointUpdateCoalescer,
     EnrollDeviceRequest, EvictionChurnDetector, JoinPartyRequest, JoinPartyResponse,
-    MAX_CLOCK_OFFSET_MS, MAX_RESPONSE_BODY_BYTES, MAX_RETRY_AFTER_MS, MIN_RETRY_AFTER_MS,
-    MP1_PING_TEXT, MP1_PONG_TEXT, MintPartyInviteRequest, Mp1WsEvent, Mp1WsTarget,
-    RegisterAccountRequest, RequestSigner, WsConnectError, WsError,
-    build_tls13_client_config_with_roots, sanitize_server_error, validate_link_code, wall_now_ms,
-    wall_now_secs,
+    MAX_CLOCK_OFFSET_MS, MAX_DISCOVERED_RELAYS, MAX_RELAY_METADATA_CHARS, MAX_RESPONSE_BODY_BYTES,
+    MAX_RETRY_AFTER_MS, MIN_RETRY_AFTER_MS, MP1_PING_TEXT, MP1_PONG_TEXT, MintPartyInviteRequest,
+    Mp1WsEvent, Mp1WsTarget, RegisterAccountRequest, RelayInfo, RelaysResponse, RequestSigner,
+    WsConnectError, WsError, build_tls13_client_config_with_roots, sanitize_server_error,
+    validate_link_code, wall_now_ms, wall_now_secs,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -2841,6 +2842,478 @@ async fn oracle_fetch_https_bytes_redirects_allowlist_downgrade_and_max_bytes() 
         }
         other => panic!("expected Api 404, got {other:?}"),
     }
+
+    srv.await.expect("server task");
+}
+
+// ===========================================================================
+// Oracle 13: Regional Relays Discovery (`GET /v1/relays`) + Hostile URL Rejections
+// ===========================================================================
+
+#[tokio::test]
+async fn oracle_list_relays_valid_sanitization_and_hostile_rejections() {
+    let pki = generate_test_pki();
+    let tls13_acceptor = make_server_acceptor(&pki, &[&rustls::version::TLS13]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let long_label = "North America West ".to_owned() + &"X".repeat(80);
+    let too_many_entries: Vec<String> = (0..=MAX_DISCOVERED_RELAYS)
+        .map(|i| {
+            format!(
+                r#"{{"url":"https://relay-{i}.multiplayer.tech","region":"r{i}","label":"Relay {i}","default":false}}"#
+            )
+        })
+        .collect();
+    let too_many_body = format!(
+        r#"{{"default_relay_url":"https://relay.multiplayer.tech","relays":[{}]}}"#,
+        too_many_entries.join(",")
+    );
+
+    let srv = tokio::spawn(async move {
+        let responses: Vec<(&str, String)> = vec![
+            // 1. Valid regional relays with ANSI escape + >64-char label sanitization
+            (
+                "HTTP/1.1 200 OK",
+                format!(
+                    r#"{{"default_relay_url":"https://relay.multiplayer.tech","relays":[{{"url":"https://relay.multiplayer.tech","region":"global","label":"Global (default)","default":true}},{{"url":"https://relay-wnam.multiplayer.tech","region":"wnam\u001b[31m","label":"{long_label}","default":false}}]}}"#
+                ),
+            ),
+            // 2. Hostile non-HTTPS http:// relay URL
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"default_relay_url":"https://relay.multiplayer.tech","relays":[{"url":"http://relay.multiplayer.tech","region":"global","label":"Insecure","default":true}]}"#.to_owned(),
+            ),
+            // 3. Hostile localhost default_relay_url
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"default_relay_url":"https://localhost","relays":[{"url":"https://relay.multiplayer.tech","region":"global","label":"Global","default":true}]}"#.to_owned(),
+            ),
+            // 4. Hostile private-suffix .internal relay URL
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"default_relay_url":"https://relay.multiplayer.tech","relays":[{"url":"https://relay.internal","region":"corp","label":"Private","default":false}]}"#.to_owned(),
+            ),
+            // 5. Empty default_relay_url
+            (
+                "HTTP/1.1 200 OK",
+                r#"{"default_relay_url":"","relays":[{"url":"https://relay.multiplayer.tech","region":"global","label":"Global","default":true}]}"#.to_owned(),
+            ),
+            // 6. Exceeding MAX_DISCOVERED_RELAYS (33 > 32)
+            ("HTTP/1.1 200 OK", too_many_body),
+            // 7. Redirect must be refused (zero redirects)
+            ("HTTP/1.1 302 Found", String::new()),
+        ];
+
+        for (idx, (status_line, body)) in responses.into_iter().enumerate() {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls");
+            let req = read_http_request(&mut tls).await;
+            assert_eq!(req.method, "GET");
+            assert_eq!(req.path, "/v1/relays");
+            assert!(
+                !req.headers.contains_key("signature"),
+                "GET /v1/relays must be unauthenticated"
+            );
+
+            let resp = if idx == 6 {
+                "HTTP/1.1 302 Found\r\nLocation: https://evil.example/v1/relays\r\nContent-Length: 0\r\n\r\n"
+                    .to_owned()
+            } else {
+                format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            };
+            tls.write_all(resp.as_bytes()).await.expect("write resp");
+            tls.shutdown().await.expect("shutdown");
+        }
+    });
+
+    let client = ControlClient::new(make_client_config(&pki, addr));
+
+    // 1. Valid response with sanitized region/label
+    let res = client.list_relays().await.expect("valid list_relays");
+    assert_eq!(res.default_relay_url, "https://relay.multiplayer.tech");
+    assert_eq!(res.relays.len(), 2);
+    assert_eq!(
+        res.relays[0],
+        RelayInfo {
+            url: "https://relay.multiplayer.tech".to_owned(),
+            region: "global".to_owned(),
+            label: "Global (default)".to_owned(),
+            default: true,
+        }
+    );
+    assert_eq!(res.relays[1].url, "https://relay-wnam.multiplayer.tech");
+    assert_eq!(res.relays[1].region, "wnam");
+    assert!(!res.relays[1].default);
+    assert_eq!(res.relays[1].label.chars().count(), MAX_RELAY_METADATA_CHARS);
+    assert!(res.relays[1].label.starts_with("North America West X"));
+    let _typed_check: RelaysResponse = res;
+
+    // 2. http:// relay rejected
+    assert!(matches!(
+        client.list_relays().await,
+        Err(ControlError::Protocol(_))
+    ));
+    // 3. localhost default_relay_url rejected
+    assert!(matches!(
+        client.list_relays().await,
+        Err(ControlError::Protocol(_))
+    ));
+    // 4. private-suffix .internal relay rejected
+    assert!(matches!(
+        client.list_relays().await,
+        Err(ControlError::Protocol(_))
+    ));
+    // 5. empty default_relay_url rejected
+    assert!(matches!(
+        client.list_relays().await,
+        Err(ControlError::Protocol(_))
+    ));
+    // 6. >32 relays rejected
+    assert!(matches!(
+        client.list_relays().await,
+        Err(ControlError::Protocol(_))
+    ));
+    // 7. 302 redirect refused
+    assert!(matches!(
+        client.list_relays().await,
+        Err(ControlError::UnexpectedRedirect { status: 302 })
+    ));
+
+    srv.await.expect("server task");
+}
+
+// ===========================================================================
+// Oracle 14: Enriched + Legacy `GET /v1/friends` Edges
+// ===========================================================================
+
+#[tokio::test]
+async fn oracle_list_friends_enriched_and_legacy_edges() {
+    let pki = generate_test_pki();
+    let tls13_acceptor = make_server_acceptor(&pki, &[&rustls::version::TLS13]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let acct_id = AccountId::new(1001).expect("acct");
+    let dev_id = DeviceId::new(2002).expect("dev");
+    let dev_secret = [81u8; 32];
+    let dev_pubkey = SigningKey::from_bytes(&dev_secret)
+        .verifying_key()
+        .to_bytes();
+
+    let srv = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("accept");
+        let mut tls = tls13_acceptor.accept(tcp).await.expect("tls");
+        let req = read_http_request(&mut tls).await;
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "/v1/friends");
+
+        verify_rfc9421_request(
+            &Rfc9421Request {
+                method: HttpMethod::Get,
+                authority: req.headers.get("host").map(String::as_str).unwrap_or(""),
+                path: &req.path,
+                query: &req.query,
+                content_type: None,
+                content_digest: None,
+                has_content_encoding: false,
+                body: &[],
+                signature_input: req.headers.get("signature-input").expect("sig-in"),
+                signature: req.headers.get("signature").expect("sig"),
+            },
+            TEST_AUTHORITY,
+            &dev_pubkey,
+            wall_now_secs(),
+        )
+        .expect("RFC 9421 verify");
+
+        let body = concat!(
+            r#"{"friends":["#,
+            r#"{"peer_account_id":1002,"state":2,"updated_at_ms":1730000100000,"peer_handle":"bob","peer_root_pubkey_b64":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","peer_safety_number":"12345-67890-12345-67890"},"#,
+            r#"{"peer_account_id":1003,"state":1,"updated_at_ms":1730000200000}"#,
+            r#"]}"#
+        );
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        tls.write_all(resp.as_bytes()).await.expect("write resp");
+        tls.shutdown().await.expect("shutdown");
+    });
+
+    let signer = RequestSigner::device(acct_id, dev_id, dev_secret);
+    let client = ControlClient::with_device_signer(make_client_config(&pki, addr), signer);
+
+    let res = client.list_friends().await.expect("list_friends");
+    assert_eq!(res.friends.len(), 2);
+
+    // Enriched edge
+    let enriched = &res.friends[0];
+    assert_eq!(enriched.peer_account_id, 1002);
+    assert_eq!(enriched.state, 2);
+    assert_eq!(enriched.updated_at_ms, 1_730_000_100_000);
+    assert_eq!(enriched.peer_handle.as_deref(), Some("bob"));
+    assert_eq!(
+        enriched.peer_root_pubkey_b64.as_deref(),
+        Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+    );
+    assert_eq!(
+        enriched.peer_safety_number.as_deref(),
+        Some("12345-67890-12345-67890")
+    );
+
+    // Legacy minimal edge (optional fields omitted -> None)
+    let legacy = &res.friends[1];
+    assert_eq!(legacy.peer_account_id, 1003);
+    assert_eq!(legacy.state, 1);
+    assert_eq!(legacy.updated_at_ms, 1_730_000_200_000);
+    assert_eq!(legacy.peer_handle, None);
+    assert_eq!(legacy.peer_root_pubkey_b64, None);
+    assert_eq!(legacy.peer_safety_number, None);
+
+    srv.await.expect("server task");
+}
+
+// ===========================================================================
+// Oracle 15: `POST /v1/parties/:id/join` `409 relay_mismatch` Structured Details
+// ===========================================================================
+
+#[tokio::test]
+async fn oracle_join_party_409_relay_mismatch_validated_and_hostile_pinned_url() {
+    let pki = generate_test_pki();
+    let tls13_acceptor = make_server_acceptor(&pki, &[&rustls::version::TLS13]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let acct_id = AccountId::new(1001).expect("acct");
+    let dev_id = DeviceId::new(2002).expect("dev");
+    let party_id = PartyId::new(5005).expect("party");
+    let dev_secret = [82u8; 32];
+
+    let srv = tokio::spawn(async move {
+        let bodies = [
+            // 1. Valid 409 relay_mismatch with regional pinned_relay_url
+            (
+                "HTTP/1.1 409 Conflict",
+                r#"{"error":"relay_mismatch","relay_policy":1,"pinned_relay_url":"https://relay-wnam.multiplayer.tech"}"#,
+            ),
+            // 2. Hostile http:// pinned_relay_url must be ignored (None)
+            (
+                "HTTP/1.1 409 Conflict",
+                r#"{"error":"relay_mismatch","relay_policy":1,"pinned_relay_url":"http://evil.example"}"#,
+            ),
+            // 3. Private-suffix .local pinned_relay_url must be ignored (None)
+            (
+                "HTTP/1.1 409 Conflict",
+                r#"{"error":"relay_mismatch","relay_policy":2,"pinned_relay_url":"https://relay.local"}"#,
+            ),
+            // 4. Other 409 error -> relay_mismatch_info() returns None
+            (
+                "HTTP/1.1 409 Conflict",
+                r#"{"error":"party_full","relay_policy":1,"pinned_relay_url":"https://relay-wnam.multiplayer.tech"}"#,
+            ),
+        ];
+
+        for (status_line, body) in bodies {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls");
+            let req = read_http_request(&mut tls).await;
+            assert_eq!(req.method, "POST");
+            assert_eq!(req.path, "/v1/parties/5005/join");
+
+            let resp = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write resp");
+            tls.shutdown().await.expect("shutdown");
+        }
+    });
+
+    let signer = RequestSigner::device(acct_id, dev_id, dev_secret);
+    let client = ControlClient::with_device_signer(make_client_config(&pki, addr), signer);
+    let join_req = JoinPartyRequest {
+        endpoint: make_relay_only_endpoint(),
+        invite_link: None,
+    };
+
+    // 1. Valid 409 relay_mismatch
+    let err1 = client
+        .join_party(party_id, &join_req)
+        .await
+        .expect_err("409 relay_mismatch expected");
+    assert_eq!(
+        err1.relay_mismatch_info(),
+        Some((Some(1), Some("https://relay-wnam.multiplayer.tech")))
+    );
+    match err1 {
+        ControlError::Api {
+            status: 409,
+            error,
+            relay_policy,
+            pinned_relay_url,
+            ..
+        } => {
+            assert_eq!(error, "relay_mismatch");
+            assert_eq!(relay_policy, Some(1));
+            assert_eq!(
+                pinned_relay_url.as_deref(),
+                Some("https://relay-wnam.multiplayer.tech")
+            );
+        }
+        other => panic!("expected Api 409 relay_mismatch, got {other:?}"),
+    }
+
+    // 2. Hostile http:// pinned_relay_url ignored -> None
+    let err2 = client
+        .join_party(party_id, &join_req)
+        .await
+        .expect_err("409 expected");
+    assert_eq!(err2.relay_mismatch_info(), Some((Some(1), None)));
+
+    // 3. Private-suffix .local pinned_relay_url ignored -> None
+    let err3 = client
+        .join_party(party_id, &join_req)
+        .await
+        .expect_err("409 expected");
+    assert_eq!(err3.relay_mismatch_info(), Some((Some(2), None)));
+
+    // 4. Non-relay_mismatch 409 -> relay_mismatch_info() == None
+    let err4 = client
+        .join_party(party_id, &join_req)
+        .await
+        .expect_err("409 party_full expected");
+    assert_eq!(err4.relay_mismatch_info(), None);
+
+    srv.await.expect("server task");
+}
+
+// ===========================================================================
+// Oracle 16: `create_party_with_scope` (`org_id`/`group_id`) + Safe-ID Bounds
+// ===========================================================================
+
+#[tokio::test]
+async fn oracle_create_party_with_scope_and_invalid_ids() {
+    let pki = generate_test_pki();
+    let tls13_acceptor = make_server_acceptor(&pki, &[&rustls::version::TLS13]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let acct_id = AccountId::new(1001).expect("acct");
+    let dev_id = DeviceId::new(2002).expect("dev");
+    let dev_secret = [83u8; 32];
+    let dev_pubkey = SigningKey::from_bytes(&dev_secret)
+        .verifying_key()
+        .to_bytes();
+
+    let srv = tokio::spawn(async move {
+        // Expect exactly 2 valid network calls (scoped + unscoped); invalid IDs must fail locally.
+        for idx in 0..2u8 {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls");
+            let req = read_http_request(&mut tls).await;
+            assert_eq!(req.method, "POST");
+            assert_eq!(req.path, "/v1/parties");
+
+            verify_rfc9421_request(
+                &Rfc9421Request {
+                    method: HttpMethod::Post,
+                    authority: req.headers.get("host").map(String::as_str).unwrap_or(""),
+                    path: &req.path,
+                    query: &req.query,
+                    content_type: req.headers.get("content-type").map(String::as_str),
+                    content_digest: req.headers.get("content-digest").map(String::as_str),
+                    has_content_encoding: req.headers.contains_key("content-encoding"),
+                    body: &req.body,
+                    signature_input: req.headers.get("signature-input").expect("sig-in"),
+                    signature: req.headers.get("signature").expect("sig"),
+                },
+                TEST_AUTHORITY,
+                &dev_pubkey,
+                wall_now_secs(),
+            )
+            .expect("RFC 9421 verify");
+
+            let body_json: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("valid request JSON");
+            if idx == 0 {
+                assert_eq!(body_json.get("org_id").and_then(|v| v.as_u64()), Some(42));
+                assert_eq!(body_json.get("group_id").and_then(|v| v.as_u64()), Some(99));
+            } else {
+                assert!(
+                    body_json.get("org_id").is_none(),
+                    "unscoped create_party must omit org_id"
+                );
+                assert!(
+                    body_json.get("group_id").is_none(),
+                    "unscoped create_party must omit group_id"
+                );
+            }
+
+            let resp_body = format!(
+                r#"{{"party_id":{},"party_epoch":1,"pinned_relay_url":"https://relay-wnam.multiplayer.tech"}}"#,
+                6000 + u64::from(idx)
+            );
+            let resp = format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write resp");
+            tls.shutdown().await.expect("shutdown");
+        }
+    });
+
+    let signer = RequestSigner::device(acct_id, dev_id, dev_secret);
+    let client = ControlClient::with_device_signer(make_client_config(&pki, addr), signer);
+    let base_req = CreatePartyRequest {
+        visibility: PartyVisibility::Friends,
+        join_mode: PartyJoinMode::InviteOnly,
+        relay_policy: RelayPolicy::ForceRelays,
+        max_members: 4,
+        endpoint: make_relay_only_endpoint(),
+        relay_url: Some("https://relay-wnam.multiplayer.tech".to_owned()),
+    };
+
+    // Invalid org_id / group_id values must be rejected locally without hitting the network!
+    for (bad_org, bad_group) in [
+        (Some(0), None),
+        (Some(MAX_SAFE_ID + 1), None),
+        (None, Some(0)),
+        (None, Some(MAX_SAFE_ID + 1)),
+        (Some(0), Some(99)),
+        (Some(42), Some(MAX_SAFE_ID + 1)),
+    ] {
+        let err = client
+            .create_party_with_scope(&base_req, bad_org, bad_group)
+            .await
+            .expect_err("invalid org/group id must fail locally");
+        assert!(
+            matches!(err, ControlError::InvalidRequest(_)),
+            "expected InvalidRequest for ({bad_org:?}, {bad_group:?}), got {err:?}"
+        );
+    }
+
+    // Valid scoped create_party_with_scope
+    let scoped = client
+        .create_party_with_scope(&base_req, Some(42), Some(99))
+        .await
+        .expect("create_party_with_scope must succeed");
+    assert_eq!(scoped.party_id, 6000);
+    assert_eq!(scoped.pinned_relay_url, "https://relay-wnam.multiplayer.tech");
+
+    // Backward-compatible unscoped create_party omits org_id/group_id
+    let unscoped = client
+        .create_party(&base_req)
+        .await
+        .expect("create_party must succeed");
+    assert_eq!(unscoped.party_id, 6001);
 
     srv.await.expect("server task");
 }

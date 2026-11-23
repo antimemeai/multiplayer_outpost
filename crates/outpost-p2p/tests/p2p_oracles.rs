@@ -15,8 +15,9 @@ use outpost_core::p2p_wire::{
     P2pEphemeralPulse, P2pLane, P2pPartyFrame,
 };
 use outpost_p2p::{
-    ALPN, CLOSE_PEER_REVOKED, CLOSE_SUPERSEDED, CLOSE_UNAUTHORIZED, P2pError, P2pTransportEvent,
-    PartyP2pConfig, PartyP2pTransport, PeerDialTarget, STREAM_INIT_MARKER,
+    ALPN, CLOSE_PEER_REVOKED, CLOSE_PROTOCOL_VIOLATION, CLOSE_SUPERSEDED, CLOSE_UNAUTHORIZED,
+    LanTransportConfig, MAX_PENDING_LAN_PEERS, P2pError, P2pTransportEvent, PartyP2pConfig,
+    PartyP2pTransport, PeerDialTarget, STREAM_INIT_MARKER,
 };
 
 async fn spawn_no_relays(device_id: u64, seed_byte: u8) -> Result<PartyP2pTransport, P2pError> {
@@ -873,5 +874,511 @@ async fn oracle8_allowlist_close_code_4401_and_split_concurrent_send_revoke() ->
 
         bob.close().await;
     }
+    Ok(())
+}
+
+async fn spawn_lan(
+    device_id: u64,
+    seed_byte: u8,
+    open_admission: bool,
+    bind_port: Option<u16>,
+) -> Result<PartyP2pTransport, P2pError> {
+    PartyP2pTransport::spawn_with_lan(
+        PartyP2pConfig {
+            local_device_id: device_id,
+            device_secret: [seed_byte; 32],
+            effective_relay_policy: RelayPolicy::NoRelays,
+            pinned_relay_url: None,
+        },
+        Some(LanTransportConfig {
+            no_relays: true,
+            lan_open_admission: open_admission,
+            lan_bind_port: bind_port,
+        }),
+    )
+    .await
+}
+
+/// Oracle 9: Opt-in LAN `NoRelays` + `lan_open_admission` fails closed on invalid/online
+/// configurations without opening sockets, and supports explicit `lan_bind_port`.
+#[tokio::test]
+async fn oracle9_lan_config_and_open_admission_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. lan_open_admission == true without no_relays == true -> InvalidConfig
+    let bad_open = PartyP2pTransport::spawn_with_lan(
+        PartyP2pConfig {
+            local_device_id: 1,
+            device_secret: [0xD1; 32],
+            effective_relay_policy: RelayPolicy::NoRelays,
+            pinned_relay_url: None,
+        },
+        Some(LanTransportConfig {
+            no_relays: false,
+            lan_open_admission: true,
+            lan_bind_port: None,
+        }),
+    )
+    .await;
+    assert!(matches!(bad_open, Err(P2pError::InvalidConfig(_))));
+
+    // 2. ForceRelays + no_relays == true -> InvalidConfig
+    let bad_force = PartyP2pTransport::spawn_with_lan(
+        PartyP2pConfig {
+            local_device_id: 2,
+            device_secret: [0xD2; 32],
+            effective_relay_policy: RelayPolicy::ForceRelays,
+            pinned_relay_url: Some("https://relay.multiplayer.tech".into()),
+        },
+        Some(LanTransportConfig {
+            no_relays: true,
+            lan_open_admission: true,
+            lan_bind_port: None,
+        }),
+    )
+    .await;
+    assert!(matches!(bad_force, Err(P2pError::InvalidConfig(_))));
+
+    // 3. ForceRelays + no_relays == true (even with lan_open_admission == false) -> InvalidConfig
+    let bad_force_closed = PartyP2pTransport::spawn_with_lan(
+        PartyP2pConfig {
+            local_device_id: 3,
+            device_secret: [0xD3; 32],
+            effective_relay_policy: RelayPolicy::ForceRelays,
+            pinned_relay_url: Some("https://relay.multiplayer.tech".into()),
+        },
+        Some(LanTransportConfig {
+            no_relays: true,
+            lan_open_admission: false,
+            lan_bind_port: None,
+        }),
+    )
+    .await;
+    assert!(matches!(bad_force_closed, Err(P2pError::InvalidConfig(_))));
+
+    // 4. AllowRelays + no_relays == true -> InvalidConfig
+    let bad_allow = PartyP2pTransport::spawn_with_lan(
+        PartyP2pConfig {
+            local_device_id: 4,
+            device_secret: [0xD4; 32],
+            effective_relay_policy: RelayPolicy::AllowRelays,
+            pinned_relay_url: None,
+        },
+        Some(LanTransportConfig {
+            no_relays: true,
+            lan_open_admission: false,
+            lan_bind_port: None,
+        }),
+    )
+    .await;
+    assert!(matches!(bad_allow, Err(P2pError::InvalidConfig(_))));
+
+    // 5. lan_bind_port without no_relays == true -> InvalidConfig
+    let bad_port = PartyP2pTransport::spawn_with_lan(
+        PartyP2pConfig {
+            local_device_id: 5,
+            device_secret: [0xD5; 32],
+            effective_relay_policy: RelayPolicy::AllowRelays,
+            pinned_relay_url: None,
+        },
+        Some(LanTransportConfig {
+            no_relays: false,
+            lan_open_admission: false,
+            lan_bind_port: Some(45678),
+        }),
+    )
+    .await;
+    assert!(matches!(bad_port, Err(P2pError::InvalidConfig(_))));
+
+    // 6. NoRelays LAN mode + pinned_relay_url -> InvalidConfig
+    let bad_relay_url = PartyP2pTransport::spawn_with_lan(
+        PartyP2pConfig {
+            local_device_id: 6,
+            device_secret: [0xD6; 32],
+            effective_relay_policy: RelayPolicy::NoRelays,
+            pinned_relay_url: Some("https://relay.multiplayer.tech".into()),
+        },
+        Some(LanTransportConfig {
+            no_relays: true,
+            lan_open_admission: true,
+            lan_bind_port: None,
+        }),
+    )
+    .await;
+    assert!(matches!(bad_relay_url, Err(P2pError::InvalidConfig(_))));
+
+    // 7. Online ForceRelays endpoint ignores set_lan_open_admission(true), has zero direct addrs,
+    //    and rejects connect_direct with PolicyViolation.
+    let forced = PartyP2pTransport::spawn(PartyP2pConfig {
+        local_device_id: 7,
+        device_secret: [0xD7; 32],
+        effective_relay_policy: RelayPolicy::ForceRelays,
+        pinned_relay_url: Some("https://relay.multiplayer.tech".into()),
+    })
+    .await?;
+    forced.set_lan_open_admission(true).await;
+    assert!(!forced.is_lan_open_admission());
+    assert!(forced.local_direct_addrs().is_empty());
+    let peer_pk = *SecretKey::from_bytes(&[0xD8; 32]).public().as_bytes();
+    forced.allow_peer(peer_pk).await?;
+    let direct_err = forced
+        .connect_direct(
+            peer_pk,
+            &[SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433)],
+        )
+        .await;
+    assert!(matches!(direct_err, Err(P2pError::PolicyViolation(_))));
+    forced.close().await;
+
+    // 8. Online AllowRelays endpoint ignores set_lan_open_admission(true).
+    let allow_ep = PartyP2pTransport::spawn(PartyP2pConfig {
+        local_device_id: 8,
+        device_secret: [0xD9; 32],
+        effective_relay_policy: RelayPolicy::AllowRelays,
+        pinned_relay_url: None,
+    })
+    .await?;
+    allow_ep.set_lan_open_admission(true).await;
+    assert!(!allow_ep.is_lan_open_admission());
+    allow_ep.close().await;
+
+    // 9. Explicit lan_bind_port binds that exact UDP port cleanly.
+    let probe = std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
+    let chosen_port = probe.local_addr()?.port();
+    drop(probe);
+    let fixed = spawn_lan(9, 0xDA, false, Some(chosen_port)).await?;
+    let addrs = fixed.local_direct_addrs();
+    assert!(
+        addrs.iter().any(|a| a.port() == chosen_port),
+        "expected bound port {chosen_port} in {addrs:?}"
+    );
+    fixed.close().await;
+
+    Ok(())
+}
+
+/// Oracle 10: Real dual-endpoint `NoRelays` LAN open admission over 127.0.0.1 (`blackbird-mp/1`):
+/// - Pending joiner dials directly via `connect_direct`
+/// - Lane 0 Control handshake succeeds before `allow_peer`; Lane 1 Causal & Lane 2 Ephemeral
+///   from pending peers are blocked & disconnected (`4400`), never delivered to application
+/// - `peer_remote_addr` reports loopback `SocketAddr` for rate limiting
+/// - `allow_peer` promotes the live QUIC connection; bidirectional Lane 1 + Lane 2 succeed
+/// - `set_lan_open_admission(false)` disconnects remaining pending peers and rejects new unknowns
+#[tokio::test]
+async fn oracle10_lan_open_admission_pending_isolation_promotion_and_lock()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut host = spawn_lan(100, 0xE1, true, None).await?;
+    let mut joiner_a = spawn_lan(101, 0xE2, false, None).await?;
+    let mut rogue_b = spawn_lan(102, 0xE3, false, None).await?;
+    let mut rogue_c = spawn_lan(103, 0xE4, false, None).await?;
+    let mut pending_d = spawn_lan(104, 0xE5, false, None).await?;
+    let unknown_e = spawn_lan(105, 0xE6, false, None).await?;
+
+    let host_pk = host.local_pubkey();
+    let joiner_a_pk = joiner_a.local_pubkey();
+    let rogue_b_pk = rogue_b.local_pubkey();
+    let rogue_c_pk = rogue_c.local_pubkey();
+    let pending_d_pk = pending_d.local_pubkey();
+
+    assert!(host.is_lan_open_admission());
+    let host_addrs: Vec<SocketAddr> = host
+        .local_direct_addrs()
+        .into_iter()
+        .filter(|a| a.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .collect();
+    assert!(
+        !host_addrs.is_empty(),
+        "LAN host must expose 127.0.0.1 direct socket"
+    );
+
+    // Joiners explicitly allow the host before dialing directly.
+    for ep in [&joiner_a, &rogue_b, &rogue_c, &pending_d, &unknown_e] {
+        ep.allow_peer(host_pk).await?;
+    }
+
+    // 1. Joiner A dials host directly (un-allowlisted on host -> admitted as pending).
+    joiner_a.connect_direct(host_pk, &host_addrs).await?;
+    assert!(wait_for_connected(&mut host, joiner_a_pk).await);
+    assert!(wait_for_connected(&mut joiner_a, host_pk).await);
+
+    // Host observes Joiner A's loopback remote SocketAddr for per-IP PIN rate limiting.
+    let remote_addr = host.peer_remote_addr(joiner_a_pk).await;
+    let Some(sock) = remote_addr else {
+        return Err("expected Some(SocketAddr) for pending LAN joiner".into());
+    };
+    assert_eq!(sock.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    assert_ne!(sock.port(), 0);
+
+    // Before allow_peer: host CANNOT send Lane 1 or Lane 2 to pending Joiner A.
+    let blocked_chat = P2pPartyFrame::ChatMessage(P2pChatMessage {
+        room_scope: "lan/main".into(),
+        target_selector: "@all".into(),
+        sender_handle: "host".into(),
+        timestamp_ns: 1,
+        body: "blocked-before-allow".into(),
+    });
+    let blocked_pulse = P2pPartyFrame::EphemeralPulse(P2pEphemeralPulse {
+        activity_state: P2pActivityState::Idle,
+        timestamp_ns: 2,
+        status: "blocked".into(),
+    });
+    assert_eq!(
+        host.send_frame(joiner_a_pk, &blocked_chat).await,
+        Err(P2pError::PeerNotAllowed)
+    );
+    assert_eq!(
+        host.send_frame(joiner_a_pk, &blocked_pulse).await,
+        Err(P2pError::PeerNotAllowed)
+    );
+
+    // Before allow_peer: bidirectional Lane 0 Control handshake succeeds cleanly!
+    let lan_hello = P2pPartyFrame::ControlNotice(P2pControlNotice {
+        kind: P2pControlNoticeKind::Status,
+        party_epoch: 1,
+        text: "LAN_HELLO:nonce=abc123".into(),
+    });
+    host.send_frame(joiner_a_pk, &lan_hello).await?;
+    assert_eq!(
+        wait_for_frame(&mut joiner_a, host_pk, P2pLane::Control).await,
+        Some(lan_hello)
+    );
+
+    let lan_join = P2pPartyFrame::ControlNotice(P2pControlNotice {
+        kind: P2pControlNoticeKind::SyncAck,
+        party_epoch: 1,
+        text: "LAN_JOIN:pin_proof=ok".into(),
+    });
+    joiner_a.send_frame(host_pk, &lan_join).await?;
+    assert_eq!(
+        wait_for_frame(&mut host, joiner_a_pk, P2pLane::Control).await,
+        Some(lan_join)
+    );
+
+    // 2. Rogue pending Joiner B sends Lane 1 Causal before allow_peer -> strictly blocked
+    //    (NEVER delivered to application) and disconnected with CLOSE_PROTOCOL_VIOLATION (4400).
+    rogue_b.connect_direct(host_pk, &host_addrs).await?;
+    assert!(wait_for_connected(&mut host, rogue_b_pk).await);
+    let rogue_chat = P2pPartyFrame::ChatMessage(P2pChatMessage {
+        room_scope: "lan/main".into(),
+        target_selector: "@all".into(),
+        sender_handle: "rogue-b".into(),
+        timestamp_ns: 10,
+        body: "must-never-arrive".into(),
+    });
+    rogue_b.send_frame(host_pk, &rogue_chat).await?;
+    let mut rogue_b_disconnected = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(ev) = recv_within(&mut host, Duration::from_millis(500)).await {
+            match ev {
+                P2pTransportEvent::FrameReceived { peer_pubkey, .. }
+                    if peer_pubkey == rogue_b_pk =>
+                {
+                    return Err("pending peer Lane 1 frame leaked to host application!".into());
+                }
+                P2pTransportEvent::PeerDisconnected {
+                    peer_pubkey,
+                    reason_code,
+                } if peer_pubkey == rogue_b_pk => {
+                    rogue_b_disconnected = Some(reason_code);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(rogue_b_disconnected, Some(CLOSE_PROTOCOL_VIOLATION));
+    assert_eq!(
+        wait_for_disconnect(&mut rogue_b, host_pk).await,
+        Some(CLOSE_PROTOCOL_VIOLATION)
+    );
+
+    // 3. Rogue pending Joiner C sends Lane 2 Ephemeral datagram before allow_peer -> strictly
+    //    blocked (NEVER delivered to application) and disconnected with CLOSE_PROTOCOL_VIOLATION.
+    rogue_c.connect_direct(host_pk, &host_addrs).await?;
+    assert!(wait_for_connected(&mut host, rogue_c_pk).await);
+    let rogue_pulse = P2pPartyFrame::EphemeralPulse(P2pEphemeralPulse {
+        activity_state: P2pActivityState::Working,
+        timestamp_ns: 20,
+        status: "must-never-arrive".into(),
+    });
+    rogue_c.send_frame(host_pk, &rogue_pulse).await?;
+    let mut rogue_c_disconnected = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(ev) = recv_within(&mut host, Duration::from_millis(500)).await {
+            match ev {
+                P2pTransportEvent::FrameReceived { peer_pubkey, .. }
+                    if peer_pubkey == rogue_c_pk =>
+                {
+                    return Err("pending peer Lane 2 datagram leaked to host application!".into());
+                }
+                P2pTransportEvent::PeerDisconnected {
+                    peer_pubkey,
+                    reason_code,
+                } if peer_pubkey == rogue_c_pk => {
+                    rogue_c_disconnected = Some(reason_code);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(rogue_c_disconnected, Some(CLOSE_PROTOCOL_VIOLATION));
+    assert_eq!(
+        wait_for_disconnect(&mut rogue_c, host_pk).await,
+        Some(CLOSE_PROTOCOL_VIOLATION)
+    );
+
+    // 4. Host promotes Joiner A via allow_peer (idempotent) without dropping live QUIC conn.
+    host.allow_peer(joiner_a_pk).await?;
+    host.allow_peer(joiner_a_pk).await?;
+
+    // Bidirectional Lane 1 Causal chat + Lane 2 Ephemeral datagrams succeed immediately!
+    let chat_a2h = P2pPartyFrame::ChatMessage(P2pChatMessage {
+        room_scope: "lan/main".into(),
+        target_selector: "@all".into(),
+        sender_handle: "joiner-a".into(),
+        timestamp_ns: 30,
+        body: "promoted-chat-a-to-host".into(),
+    });
+    let chat_h2a = P2pPartyFrame::ChatMessage(P2pChatMessage {
+        room_scope: "lan/main".into(),
+        target_selector: "@joiner-a".into(),
+        sender_handle: "host".into(),
+        timestamp_ns: 31,
+        body: "promoted-chat-host-to-a".into(),
+    });
+    let pulse_a2h = P2pPartyFrame::EphemeralPulse(P2pEphemeralPulse {
+        activity_state: P2pActivityState::Working,
+        timestamp_ns: 32,
+        status: "lan-fast".into(),
+    });
+    let pulse_h2a = P2pPartyFrame::EphemeralPulse(P2pEphemeralPulse {
+        activity_state: P2pActivityState::Idle,
+        timestamp_ns: 33,
+        status: "host-ack".into(),
+    });
+
+    joiner_a.send_frame(host_pk, &chat_a2h).await?;
+    assert_eq!(
+        wait_for_frame(&mut host, joiner_a_pk, P2pLane::Causal).await,
+        Some(chat_a2h)
+    );
+    host.send_frame(joiner_a_pk, &chat_h2a).await?;
+    assert_eq!(
+        wait_for_frame(&mut joiner_a, host_pk, P2pLane::Causal).await,
+        Some(chat_h2a)
+    );
+    joiner_a.send_frame(host_pk, &pulse_a2h).await?;
+    assert_eq!(
+        wait_for_frame(&mut host, joiner_a_pk, P2pLane::Ephemeral).await,
+        Some(pulse_a2h)
+    );
+    host.send_frame(joiner_a_pk, &pulse_h2a).await?;
+    assert_eq!(
+        wait_for_frame(&mut joiner_a, host_pk, P2pLane::Ephemeral).await,
+        Some(pulse_h2a)
+    );
+
+    // 5. Connect pending peer D, then lock lobby via set_lan_open_admission(false):
+    //    - Pending peer D is immediately disconnected (CLOSE_UNAUTHORIZED)
+    //    - Unknown peer E dialing host is rejected (PeerNotAllowed)
+    //    - Promoted Joiner A stays connected and exchanges frames cleanly!
+    pending_d.connect_direct(host_pk, &host_addrs).await?;
+    assert!(wait_for_connected(&mut host, pending_d_pk).await);
+
+    host.set_lan_open_admission(false).await;
+    assert!(!host.is_lan_open_admission());
+
+    assert_eq!(
+        wait_for_disconnect(&mut host, pending_d_pk).await,
+        Some(CLOSE_UNAUTHORIZED)
+    );
+    assert_eq!(
+        wait_for_disconnect(&mut pending_d, host_pk).await,
+        Some(CLOSE_UNAUTHORIZED)
+    );
+    assert!(host.peer_remote_addr(pending_d_pk).await.is_none());
+
+    let reject_e = unknown_e.connect_direct(host_pk, &host_addrs).await;
+    assert_eq!(reject_e, Err(P2pError::PeerNotAllowed));
+
+    let post_lock_chat = P2pPartyFrame::ChatMessage(P2pChatMessage {
+        room_scope: "lan/main".into(),
+        target_selector: "@all".into(),
+        sender_handle: "joiner-a".into(),
+        timestamp_ns: 40,
+        body: "still-connected-after-lock".into(),
+    });
+    joiner_a.send_frame(host_pk, &post_lock_chat).await?;
+    assert_eq!(
+        wait_for_frame(&mut host, joiner_a_pk, P2pLane::Causal).await,
+        Some(post_lock_chat)
+    );
+
+    unknown_e.close().await;
+    pending_d.close().await;
+    rogue_c.close().await;
+    rogue_b.close().await;
+    joiner_a.close().await;
+    host.close().await;
+    Ok(())
+}
+
+/// Oracle 11: `MAX_PENDING_LAN_PEERS` (16) cap is strictly enforced while already-allowlisted
+/// VIP peers can still connect, and promoting 1 pending peer frees a slot.
+#[tokio::test]
+async fn oracle11_lan_open_admission_enforces_16_pending_peer_cap()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut host = spawn_lan(200, 0xF0, true, None).await?;
+    let host_pk = host.local_pubkey();
+    let host_addrs: Vec<SocketAddr> = host
+        .local_direct_addrs()
+        .into_iter()
+        .filter(|a| a.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .collect();
+    assert!(!host_addrs.is_empty());
+
+    let mut pending = Vec::with_capacity(MAX_PENDING_LAN_PEERS);
+    for idx in 0..MAX_PENDING_LAN_PEERS {
+        let seed_byte = u8::try_from(0x10 + idx)?;
+        let ep = spawn_lan(300 + u64::try_from(idx)?, seed_byte, false, None).await?;
+        let pk = ep.local_pubkey();
+        ep.allow_peer(host_pk).await?;
+        ep.connect_direct(host_pk, &host_addrs).await?;
+        assert!(wait_for_connected(&mut host, pk).await);
+        pending.push((ep, pk));
+    }
+
+    // 17th unknown peer MUST be rejected!
+    let overflow = spawn_lan(400, 0xF1, false, None).await?;
+    let overflow_pk = overflow.local_pubkey();
+    overflow.allow_peer(host_pk).await?;
+    assert_eq!(
+        overflow.connect_direct(host_pk, &host_addrs).await,
+        Err(P2pError::PeerNotAllowed)
+    );
+
+    // Already-allowlisted VIP peer MUST still connect even while all 16 pending slots are full!
+    let vip = spawn_lan(401, 0xF2, false, None).await?;
+    let vip_pk = vip.local_pubkey();
+    host.allow_peer(vip_pk).await?;
+    vip.allow_peer(host_pk).await?;
+    vip.connect_direct(host_pk, &host_addrs).await?;
+    assert!(wait_for_connected(&mut host, vip_pk).await);
+
+    // Promoting 1 pending peer frees 1 slot so overflow can now connect!
+    let Some(first_pending_pk) = pending.first().map(|(_, pk)| *pk) else {
+        return Err("expected at least one pending peer".into());
+    };
+    host.allow_peer(first_pending_pk).await?;
+    overflow.connect_direct(host_pk, &host_addrs).await?;
+    assert!(wait_for_connected(&mut host, overflow_pk).await);
+
+    overflow.close().await;
+    vip.close().await;
+    for (ep, _) in pending {
+        ep.close().await;
+    }
+    host.close().await;
     Ok(())
 }

@@ -96,16 +96,48 @@ impl fmt::Display for EndpointError {
 
 impl std::error::Error for EndpointError {}
 
-/// Validates an optional HTTPS relay URL origin (`https://<fqdn>[:port]`, <= 100 bytes).
+/// Label-boundary denylist for private/internal/loopback/rebinding suffixes.
+const DENIED_RELAY_SUFFIXES: &[&str] = &[
+    "localhost",
+    "local",
+    "internal",
+    "arpa",
+    "localdomain",
+    "lan",
+    "home",
+    "corp",
+    "intranet",
+    "private",
+    "invalid",
+    "test",
+    "example",
+    "onion",
+    "alt",
+    "nip.io",
+    "sslip.io",
+    "xip.io",
+    "localtest.me",
+    "lvh.me",
+];
+
+fn host_matches_suffix(host: &str, suffix: &str) -> bool {
+    if host == suffix {
+        return true;
+    }
+    host.len() > suffix.len()
+        && host.ends_with(suffix)
+        && host.as_bytes().get(host.len() - suffix.len() - 1) == Some(&b'.')
+}
+
+/// Extracts and validates the host portion of an `https://<fqdn>[:port]` relay origin.
 /// Strictly rejects:
 /// - non-HTTPS schemes, paths, queries, fragments, userinfo, uppercase
 /// - single-label hosts (`localhost`), IPv4 literals (`127.0.0.1`), integer/hex hosts (`2130706433`, `0x7f.1`)
-/// - DNS labels > 63 bytes or starting/ending with `-`
-/// - explicit default `:443` (canonical origin equality) or invalid ports
-pub fn validate_relay_url(url: &str) -> Result<(), EndpointError> {
-    if url.is_empty() {
-        return Ok(());
-    }
+/// - DNS labels > 63 bytes, starting/ending with `-`, `0x...`, or punycode `xn--` on ANY label
+/// - non-alpha or single-char TLDs (requires `^[a-z]{2,63}$`)
+/// - private/internal/rebinding DNS suffixes (`DENIED_RELAY_SUFFIXES`) on exact label boundaries
+/// - explicit privileged ports `0..=1023` (including `:443`, `:80`, `:22`) or invalid ports
+fn parse_and_validate_relay_host(url: &str) -> Result<&str, EndpointError> {
     if url.len() > MAX_RELAY_URL_BYTES {
         return Err(EndpointError::InvalidRelayUrl);
     }
@@ -136,7 +168,7 @@ pub fn validate_relay_url(url: &str) -> Result<(), EndpointError> {
         return Err(EndpointError::InvalidRelayUrl);
     }
 
-    // Require a valid multi-label FQDN (rejects localhost, numeric/IPv4/hex hosts, bad DNS labels).
+    // Require a valid multi-label FQDN (rejects localhost, numeric/IPv4/hex hosts, punycode, bad DNS labels).
     let labels: Vec<&str> = host.split('.').collect();
     if labels.len() < 2 {
         return Err(EndpointError::InvalidRelayUrl);
@@ -150,13 +182,22 @@ pub fn validate_relay_url(url: &str) -> Result<(), EndpointError> {
             || label.starts_with('-')
             || label.ends_with('-')
             || label.starts_with("0x")
+            || label.starts_with("xn--")
         {
             return Err(EndpointError::InvalidRelayUrl);
         }
     }
-    // TLD must contain at least one ASCII letter (rejects numeric/IPv4-like hosts).
+    // TLD must be strictly `^[a-z]{2,63}$` (rejects numeric/IP-like/punycode/1-char TLDs).
     let tld = labels.last().copied().unwrap_or("");
-    if !tld.bytes().any(|b| b.is_ascii_lowercase()) {
+    if tld.len() < 2 || !tld.bytes().all(|b| b.is_ascii_lowercase()) {
+        return Err(EndpointError::InvalidRelayUrl);
+    }
+
+    // Exact label-boundary suffix denylist (prevents internal/LAN/rebinding SSRF).
+    if DENIED_RELAY_SUFFIXES
+        .iter()
+        .any(|&suffix| host_matches_suffix(host, suffix))
+    {
         return Err(EndpointError::InvalidRelayUrl);
     }
 
@@ -165,9 +206,32 @@ pub fn validate_relay_url(url: &str) -> Result<(), EndpointError> {
             return Err(EndpointError::InvalidRelayUrl);
         }
         let port: u16 = p.parse().map_err(|_| EndpointError::InvalidRelayUrl)?;
-        if port == 0 || port == 443 {
+        // Reject privileged ports (< 1024, including :443 default port and :22/:80/:53).
+        if port < 1024 {
             return Err(EndpointError::InvalidRelayUrl);
         }
+    }
+    Ok(host)
+}
+
+/// Validates an optional HTTPS relay URL origin (`https://<fqdn>[:port]`, <= 100 bytes).
+pub fn validate_relay_url(url: &str) -> Result<(), EndpointError> {
+    if url.is_empty() {
+        return Ok(());
+    }
+    let _ = parse_and_validate_relay_host(url)?;
+    Ok(())
+}
+
+/// Validates a non-empty customer self-hosted corporate relay URL origin.
+/// Enforces all `validate_relay_url` SSRF invariants AND rejects `multiplayer.tech` / `*.multiplayer.tech`.
+pub fn validate_corporate_relay_url(url: &str) -> Result<(), EndpointError> {
+    if url.is_empty() {
+        return Err(EndpointError::InvalidRelayUrl);
+    }
+    let host = parse_and_validate_relay_host(url)?;
+    if host_matches_suffix(host, "multiplayer.tech") {
+        return Err(EndpointError::InvalidRelayUrl);
     }
     Ok(())
 }
@@ -394,5 +458,77 @@ impl EndpointDescriptor {
         };
         ep.validate()?;
         Ok(ep)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_url_hardening_rejects_ssrf_punycode_and_privileged_ports() {
+        // Valid public origins (default port omitted or unprivileged >= 1024)
+        assert!(validate_relay_url("").is_ok());
+        assert!(validate_relay_url("https://relay.multiplayer.tech").is_ok());
+        assert!(validate_relay_url("https://relay-weur.multiplayer.tech").is_ok());
+        assert!(validate_relay_url("https://relay.corp-team.com:8443").is_ok());
+        assert!(validate_relay_url("https://relay.corp-team.com:1024").is_ok());
+
+        // Corporate relay rejects empty & *.multiplayer.tech, accepts real customer domain
+        assert!(validate_corporate_relay_url("https://relay.acme-eng.com").is_ok());
+        assert!(validate_corporate_relay_url("https://relay.acme-eng.com:8443").is_ok());
+        assert!(validate_corporate_relay_url("").is_err());
+        assert!(validate_corporate_relay_url("https://multiplayer.tech").is_err());
+        assert!(validate_corporate_relay_url("https://relay.multiplayer.tech").is_err());
+        assert!(validate_corporate_relay_url("https://relay-wnam.multiplayer.tech").is_err());
+
+        // Reject SSRF, private/rebinding suffixes, punycode on any label, bad TLDs, privileged ports
+        for bad in [
+            "http://relay.acme-eng.com",
+            "https://localhost",
+            "https://sub.localhost",
+            "https://relay.local",
+            "https://relay.internal",
+            "https://1.0.0.127.in-addr.arpa",
+            "https://relay.localdomain",
+            "https://relay.lan",
+            "https://relay.home",
+            "https://relay.corp",
+            "https://relay.intranet",
+            "https://relay.private",
+            "https://relay.invalid",
+            "https://relay.test",
+            "https://relay.example",
+            "https://hidden.onion",
+            "https://relay.alt",
+            "https://127.0.0.1.nip.io",
+            "https://10-0-0-1.sslip.io",
+            "https://127.0.0.1.xip.io",
+            "https://a.localtest.me",
+            "https://a.lvh.me",
+            "https://127.0.0.1",
+            "https://169.254.169.254",
+            "https://0x7f.1",
+            "https://xn--bcher-kva.com",
+            "https://relay.xn--p1ai",
+            "https://relay.c",
+            "https://relay.c0m",
+            "https://relay.acme-eng.com:443",
+            "https://relay.acme-eng.com:80",
+            "https://relay.acme-eng.com:22",
+            "https://relay.acme-eng.com:1023",
+            "https://relay.acme-eng.com:0",
+            "https://relay.acme-eng.com/path",
+            "https://user@relay.acme-eng.com",
+        ] {
+            assert!(
+                validate_relay_url(bad).is_err(),
+                "validate_relay_url must reject {bad}"
+            );
+            assert!(
+                validate_corporate_relay_url(bad).is_err(),
+                "validate_corporate_relay_url must reject {bad}"
+            );
+        }
     }
 }
