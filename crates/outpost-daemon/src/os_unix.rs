@@ -25,9 +25,11 @@ use outpost_core::storage_codec::decode_daemon_info;
 
 use crate::error::DaemonError;
 use crate::runtime_dir::{
-    SOCKET_FILE_NAME, VerifiedDir, fstat_fd, leaf_name_to_cstring, path_to_cstring, stat_dev_ino,
+    SOCKET_FILE_NAME, VerifiedDir, fstat_fd, leaf_name_to_cstring, stat_dev_ino,
     validate_sun_path_budget,
 };
+#[cfg(target_os = "macos")]
+use crate::runtime_dir::path_to_cstring;
 use crate::state_io::read_file_in_dir;
 
 pub const STARTUP_LOCK_NAME: &str = "startup.lock";

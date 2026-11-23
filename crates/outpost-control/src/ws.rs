@@ -825,10 +825,8 @@ fn validate_101_headers(
                 proto_count = proto_count.saturating_add(1);
                 proto_value = Some(val.as_str());
             }
-            "sec-websocket-extensions" => {
-                if !val.is_empty() {
-                    return Err(WsConnectError::ForbiddenExtension);
-                }
+            "sec-websocket-extensions" if !val.is_empty() => {
+                return Err(WsConnectError::ForbiddenExtension);
             }
             _ => {}
         }
@@ -885,12 +883,12 @@ fn sha1_fips180_4(input: &[u8]) -> [u8; 20] {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    let (chunks, _) = msg.as_chunks::<64>();
+    for chunk in chunks {
         let mut w = [0u32; 80];
-        for (slot, word_bytes) in w.iter_mut().zip(chunk.chunks_exact(4)) {
-            if let Ok(arr) = <[u8; 4]>::try_from(word_bytes) {
-                *slot = u32::from_be_bytes(arr);
-            }
+        let (word_chunks, _) = chunk.as_chunks::<4>();
+        for (slot, word_bytes) in w.iter_mut().zip(word_chunks) {
+            *slot = u32::from_be_bytes(*word_bytes);
         }
         for t in 16usize..80 {
             let a = w.get(t.saturating_sub(3)).copied().unwrap_or(0);
@@ -932,8 +930,9 @@ fn sha1_fips180_4(input: &[u8]) -> [u8; 20] {
 
     let words = [h0, h1, h2, h3, h4];
     let mut out = [0u8; 20];
-    for (dst, word) in out.chunks_exact_mut(4).zip(words) {
-        dst.copy_from_slice(&word.to_be_bytes());
+    let (out_chunks, _) = out.as_chunks_mut::<4>();
+    for (dst, word) in out_chunks.iter_mut().zip(words) {
+        *dst = word.to_be_bytes();
     }
     out
 }

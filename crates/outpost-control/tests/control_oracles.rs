@@ -171,7 +171,8 @@ fn sha1_digest(input: &[u8]) -> [u8; 20] {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    let (chunks, _) = msg.as_chunks::<64>();
+    for chunk in chunks {
         let mut w = [0u32; 80];
         for i in 0..16 {
             w[i] = u32::from_be_bytes([
