@@ -1,0 +1,34 @@
+[package]
+name = "outpost-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mp-outpost"
+path = "src/main.rs"
+
+[dependencies]
+base64.workspace = true
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "rand_core"] }
+getrandom = "0.4"
+libc.workspace = true
+mp-protocol.workspace = true
+outpost-control = { path = "../outpost-control" }
+outpost-core = { path = "../outpost-core" }
+outpost-daemon = { path = "../outpost-daemon" }
+outpost-mcp = { path = "../outpost-mcp" }
+outpost-p2p = { path = "../outpost-p2p" }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rcgen = "0.13"
+tempfile = "3"
+tokio-rustls.workspace = true
+tokio-websockets.workspace = true

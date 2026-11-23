@@ -6,6 +6,7 @@ members = [
     "crates/outpost-p2p",
     "crates/outpost-daemon",
     "crates/outpost-mcp",
+    "crates/outpost-cli",
 ]
 
 [workspace.package]

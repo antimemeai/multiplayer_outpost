@@ -311,6 +311,16 @@ fn five_link_admission_rejects_compromised_server_pubkey_swap_with_valid_cwt() {
 
 #[test]
 fn safety_number_crockford_normalization_and_symmetric_relay_policy() {
+    // Exact cross-company golden Safety Number vector from blackbird-leader Wave 12C (xplat-board seq:17):
+    let golden_root_pk: [u8; 32] =
+        from_hex("d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737")
+            .try_into()
+            .unwrap();
+    assert_eq!(
+        compute_safety_number(1001, &golden_root_pk),
+        "SP44-BGDF-SWJH-YXTV-ZWXT-MNGX-P342-B0TV"
+    );
+
     let sn = compute_safety_number(1001, &[0xAB; 32]);
     assert_eq!(sn.len(), 39);
     assert_eq!(sn.split('-').count(), 8);
