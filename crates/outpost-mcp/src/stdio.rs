@@ -38,9 +38,9 @@ pub const DEFAULT_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_IN_FLIGHT_REQUESTS: usize = 16;
 const LINE_CHANNEL_CAPACITY: usize = 8;
 const MAX_QUEUED_LINE_BYTES: usize = 32 * 1024 * 1024;
-const SEND_FRAME_TIMEOUT: Duration = Duration::from_millis(250);
+const SEND_FRAME_TIMEOUT: Duration = Duration::from_millis(15);
 const SEND_FRAME_EOF_TIMEOUT: Duration = Duration::from_millis(5);
-const WRITER_FLUSH_TIMEOUT: Duration = Duration::from_millis(20);
+const WRITER_FLUSH_TIMEOUT: Duration = Duration::from_millis(15);
 const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
 struct LineBudgetState {
@@ -585,8 +585,7 @@ async fn handle_raw_line<B: McpOutpostBackend>(
                 shutdown,
                 eof_seen,
             )
-            .await
-                || !(shutdown.is_cancelled() || eof_seen.is_cancelled() || out_tx.is_closed());
+            .await;
         }
         Err(StrictJsonError::DuplicateKey) => {
             return send_error(
@@ -597,8 +596,7 @@ async fn handle_raw_line<B: McpOutpostBackend>(
                 shutdown,
                 eof_seen,
             )
-            .await
-                || !(shutdown.is_cancelled() || eof_seen.is_cancelled() || out_tx.is_closed());
+            .await;
         }
         Err(StrictJsonError::InvalidData(msg)) => {
             return send_error(
@@ -609,8 +607,7 @@ async fn handle_raw_line<B: McpOutpostBackend>(
                 shutdown,
                 eof_seen,
             )
-            .await
-                || !(shutdown.is_cancelled() || eof_seen.is_cancelled() || out_tx.is_closed());
+            .await;
         }
     };
 
@@ -624,8 +621,7 @@ async fn handle_raw_line<B: McpOutpostBackend>(
             shutdown,
             eof_seen,
         )
-        .await
-            || !(shutdown.is_cancelled() || eof_seen.is_cancelled() || out_tx.is_closed());
+        .await;
     }
 
     let Some(obj) = parsed.as_object() else {
@@ -637,8 +633,7 @@ async fn handle_raw_line<B: McpOutpostBackend>(
             shutdown,
             eof_seen,
         )
-        .await
-            || !(shutdown.is_cancelled() || eof_seen.is_cancelled() || out_tx.is_closed());
+        .await;
     };
 
     // Determine whether this is a notification (no `id` key) or a request (`id` present).
@@ -675,8 +670,7 @@ async fn handle_raw_line<B: McpOutpostBackend>(
                 shutdown,
                 eof_seen,
             )
-            .await
-                || !(shutdown.is_cancelled() || eof_seen.is_cancelled() || out_tx.is_closed());
+            .await;
         }
         return true;
     }
@@ -692,8 +686,7 @@ async fn handle_raw_line<B: McpOutpostBackend>(
                 shutdown,
                 eof_seen,
             )
-            .await
-                || !(shutdown.is_cancelled() || eof_seen.is_cancelled() || out_tx.is_closed());
+            .await;
         }
         return true;
     };
@@ -706,7 +699,7 @@ async fn handle_raw_line<B: McpOutpostBackend>(
         return true;
     };
 
-    let sent = match method {
+    match method {
         "ping" => {
             // Allowed even before `initialize`; zero backend I/O.
             send_result(out_tx, &id, json!({}), shutdown, eof_seen).await
@@ -799,8 +792,7 @@ async fn handle_raw_line<B: McpOutpostBackend>(
             )
             .await
         }
-    };
-    sent || !(shutdown.is_cancelled() || eof_seen.is_cancelled() || out_tx.is_closed())
+    }
 }
 
 fn handle_notification(method: &str, params: Option<&Value>, in_flight: &Arc<InFlightTable>) {
