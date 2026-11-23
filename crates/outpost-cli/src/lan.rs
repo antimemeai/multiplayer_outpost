@@ -125,11 +125,8 @@ fn env_kill_switch_active(lookup: &dyn Fn(&str) -> Option<String>, var_name: &st
         return false;
     };
     let lower = raw.trim_matches([' ', '\t']).to_ascii_lowercase();
-    if lower.is_empty() || lower == "0" || lower == "false" || lower == "no" {
-        return false;
-    }
     // Honor 1/true/yes and fail closed on any other non-empty value.
-    true
+    !(lower.is_empty() || lower == "0" || lower == "false" || lower == "no")
 }
 
 fn default_user_policy_path(lookup: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
@@ -1507,10 +1504,7 @@ fn lan_ipv4_priority(ip: Ipv4Addr) -> u8 {
 
 fn is_usable_lan_ipv4(ip: Ipv4Addr) -> bool {
     let [a, b, c, d] = ip.octets();
-    if a == 0 || a == 127 || (a & 0xf0) == 0xe0 || (a == 255 && b == 255 && c == 255 && d == 255) {
-        return false;
-    }
-    true
+    !(a == 0 || a == 127 || (a & 0xf0) == 0xe0 || (a == 255 && b == 255 && c == 255 && d == 255))
 }
 
 pub(crate) fn enumerate_lan_ipv4_addrs(service_port: u16) -> Vec<SocketAddr> {
