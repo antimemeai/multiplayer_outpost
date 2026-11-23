@@ -1,10 +1,14 @@
 //! Decoded-layer per-response CSPRNG nonce provenance fencing and accidental-secret-disclosure guard.
 
 use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64U};
+use base64::engine::general_purpose::{
+    STANDARD as B64, STANDARD_NO_PAD as B64_NO_PAD, URL_SAFE as B64U_PAD,
+    URL_SAFE_NO_PAD as B64U,
+};
 
 /// Sanitizes remote peer text while preserving `\n` (`0x0A`) and `\t` (`0x09`).
-/// Strips all other C0, DEL, C1, Unicode BiDi overrides/isolates, and zero-width characters.
+/// Strips all other C0, DEL, C1, Unicode line/paragraph separators (`U+2028`, `U+2029`),
+/// Unicode BiDi overrides/isolates, zero-width characters, and Unicode Tag characters (`U+E0000..=U+E007F`).
 pub fn sanitize_peer_text(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -13,14 +17,49 @@ pub fn sanitize_peer_text(input: &str) -> String {
             '\n' | '\t' => true,
             _ if cp <= 0x1F || cp == 0x7F => false,
             _ if (0x80..=0x9F).contains(&cp) => false,
+            // Unicode line/paragraph separators
+            '\u{2028}' | '\u{2029}' => false,
             // Unicode BiDi controls & isolates
             '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}'
             | '\u{2066}'..='\u{2069}' => false,
             // Zero-width characters & BOM
             '\u{200B}'..='\u{200D}' | '\u{FEFF}' => false,
+            // Unicode Tag characters (invisible prompt-injection smuggling)
+            '\u{E0000}'..='\u{E007F}' => false,
             _ => true,
         };
         if keep {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Single O(n) pass that breaks any contiguous run of `>= 3` `<` or `>` characters into
+/// space-separated characters (`<<<<<` -> `< < < < <`), while preserving single/double `<`/`>`.
+fn break_angle_runs(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '<' || ch == '>' {
+            let mut count = 1usize;
+            while chars.peek() == Some(&ch) {
+                chars.next();
+                count += 1;
+            }
+            if count >= 3 {
+                for i in 0..count {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    out.push(ch);
+                }
+            } else {
+                for _ in 0..count {
+                    out.push(ch);
+                }
+            }
+        } else {
             out.push(ch);
         }
     }
@@ -33,7 +72,7 @@ pub fn fence_peer_text(raw: &str, nonce: u64) -> String {
     let clean = sanitize_peer_text(raw);
     let nonce_lower = format!("{nonce:016x}");
     let neutralized = replace_ascii_case_insensitive(&clean, &nonce_lower, "[redacted-nonce]");
-    let neutralized = neutralized.replace("<<<", "< < <").replace(">>>", "> > >");
+    let neutralized = break_angle_runs(&neutralized);
     format!(
         "<<<BLACKBIRD_UNTRUSTED_PEER_DATA_BEGIN_{nonce_lower}>>>\n{neutralized}\n<<<BLACKBIRD_UNTRUSTED_PEER_DATA_END_{nonce_lower}>>>"
     )
@@ -198,31 +237,64 @@ fn contains_private_pem_header(haystack: &[u8]) -> bool {
     false
 }
 
+fn matches_secret_bytes(payload: &[u8], secret: &[u8]) -> bool {
+    if contains_subslice(payload, secret)
+        || contains_subslice_ascii_ci(payload, hex_lower(secret).as_bytes())
+        || contains_subslice(payload, B64.encode(secret).as_bytes())
+        || contains_subslice(payload, B64_NO_PAD.encode(secret).as_bytes())
+        || contains_subslice(payload, B64U_PAD.encode(secret).as_bytes())
+        || contains_subslice(payload, B64U.encode(secret).as_bytes())
+    {
+        return true;
+    }
+
+    // Check alignment-invariant inner Base64 slices for offsets 0, 1, and 2 in both
+    // standard and URL-safe alphabets so secrets embedded in larger binary blobs before
+    // Base64 encoding cannot evade detection via 1/2-byte misalignment or suffix bleed.
+    let mut buf = Vec::with_capacity(secret.len() + 2);
+    for offset in 0usize..=2 {
+        buf.clear();
+        buf.resize(offset, 0u8);
+        buf.extend_from_slice(secret);
+        let start = if offset == 0 { 0 } else { 4 };
+        let end = (buf.len() / 3) * 4;
+        if end.saturating_sub(start) < 8 {
+            continue;
+        }
+        let std_enc = B64_NO_PAD.encode(&buf);
+        if let Some(slice) = std_enc.as_bytes().get(start..end)
+            && contains_subslice(payload, slice)
+        {
+            return true;
+        }
+        let url_enc = B64U.encode(&buf);
+        if let Some(slice) = url_enc.as_bytes().get(start..end)
+            && contains_subslice(payload, slice)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Accidental-disclosure guard for outbound chat & board payloads:
 /// 1. Exact-matches our own `device_secret` and `device_cwt` across raw, hex (case-insensitive),
-///    standard base64, and base64url encodings (zero false positives).
+///    standard/URL-safe base64 (padded & unpadded), plus alignment-invariant inner base64 chunks
+///    for 0/1/2-byte offsets (zero false positives).
 /// 2. Refuses exact-grammar `mpinv1_` / `mppi1_` invite tokens and `-----BEGIN * PRIVATE KEY-----`.
 pub fn scan_outbound_secrets(
     payload: &[u8],
     own_device_secret: &[u8; 32],
     own_device_cwt: &[u8],
 ) -> Option<SecretMatchKind> {
-    // 1. Own device_secret (raw, hex ci, b64, b64u)
-    if contains_subslice(payload, own_device_secret)
-        || contains_subslice_ascii_ci(payload, hex_lower(own_device_secret).as_bytes())
-        || contains_subslice(payload, B64.encode(own_device_secret).as_bytes())
-        || contains_subslice(payload, B64U.encode(own_device_secret).as_bytes())
-    {
+    // 1. Own device_secret (raw, hex ci, b64 variants, misaligned b64 chunks)
+    if matches_secret_bytes(payload, own_device_secret) {
         return Some(SecretMatchKind::OwnDeviceSecret);
     }
 
     // 2. Own device_cwt (when non-trivial length >= 8)
-    if own_device_cwt.len() >= 8
-        && (contains_subslice(payload, own_device_cwt)
-            || contains_subslice_ascii_ci(payload, hex_lower(own_device_cwt).as_bytes())
-            || contains_subslice(payload, B64.encode(own_device_cwt).as_bytes())
-            || contains_subslice(payload, B64U.encode(own_device_cwt).as_bytes()))
-    {
+    if own_device_cwt.len() >= 8 && matches_secret_bytes(payload, own_device_cwt) {
         return Some(SecretMatchKind::OwnDeviceCwt);
     }
 

@@ -16,36 +16,47 @@
     clippy::indexing_slicing
 )]
 
+#[cfg(feature = "test-tls-overrides")]
 use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader, Write as _};
+#[cfg(feature = "test-tls-overrides")]
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+#[cfg(feature = "test-tls-overrides")]
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use ed25519_dalek::SigningKey;
+use mp_protocol::{MAX_CWT_TTL_SECS, encode_device_cwt};
+#[cfg(feature = "test-tls-overrides")]
 use mp_protocol::{
-    AccountId, DeviceId, EndpointDescriptor, MAX_CWT_TTL_SECS, Mp1Message, PartyId, PartyJoinMode,
-    PartyMemberRecord, PartySnapshot, PartyVisibility, RelayPolicy, SessionId, encode_device_cwt,
-    encode_frame,
+    AccountId, DeviceId, EndpointDescriptor, Mp1Message, PartyId, PartyJoinMode, PartyMemberRecord,
+    PartySnapshot, PartyVisibility, RelayPolicy, SessionId, encode_frame,
 };
 use outpost_control::wall_now_secs;
-use outpost_core::storage_codec::{
-    PeerRecord, PeersStoreRecord, TrustState, encode_peers_store,
-};
-use outpost_core::trust::{api_authority_hash, compute_safety_number};
+#[cfg(feature = "test-tls-overrides")]
+use outpost_core::storage_codec::{PeerRecord, PeersStoreRecord, TrustState, encode_peers_store};
+#[cfg(feature = "test-tls-overrides")]
+use outpost_core::trust::api_authority_hash;
+use outpost_core::trust::compute_safety_number;
+#[cfg(feature = "test-tls-overrides")]
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::{Value, json};
+#[cfg(feature = "test-tls-overrides")]
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+#[cfg(feature = "test-tls-overrides")]
 use tokio::net::TcpListener;
+#[cfg(feature = "test-tls-overrides")]
 use tokio::sync::broadcast;
+#[cfg(feature = "test-tls-overrides")]
 use tokio_rustls::TlsAcceptor;
 
 const BIN_PATH: &str = env!("CARGO_BIN_EXE_mp-outpost");
+#[cfg(feature = "test-tls-overrides")]
 const TEST_AUTHORITY: &str = "api.multiplayer.tech";
 
 fn make_short_tempdir(prefix: &str) -> Result<tempfile::TempDir, String> {
@@ -193,6 +204,7 @@ impl Drop for McpProc {
     }
 }
 
+#[allow(dead_code)]
 struct EnrolledDeviceInfo {
     account_id: u64,
     device_id: u64,
@@ -470,9 +482,93 @@ fn oracle_1_custody_lazy_mcp_eof_and_tty_gate() -> Result<(), String> {
 }
 
 // ===========================================================================
+// Oracle 3 (default production build): MUST ignore OUTPOST_TEST_* overrides
+// ===========================================================================
+
+#[cfg(not(feature = "test-tls-overrides"))]
+#[test]
+fn oracle_3_default_binary_ignores_test_tls_overrides() -> Result<(), String> {
+    let root_tmp = make_short_tempdir("mpo3")?;
+    let state_dir = make_private_subdir(root_tmp.path(), "st")?;
+    let runtime_dir = make_private_subdir(root_tmp.path(), "rt")?;
+
+    // Provision a device, then spawn the daemon with intentionally malformed
+    // OUTPOST_TEST_CONNECT_ADDR and nonexistent OUTPOST_TEST_CA_PEM.
+    // A production binary (without `test-tls-overrides`) MUST completely ignore both
+    // env vars so `AppDaemon::load` -> `build_control_client_config` succeeds cleanly!
+    let _dev = provision_device(&state_dir, &runtime_dir, 1003, 2003, [0x33u8; 32], "prod-check")?;
+
+    let hostile_env = [
+        ("OUTPOST_TEST_CONNECT_ADDR", "not-a-valid-socket-addr"),
+        ("OUTPOST_TEST_CA_PEM", "/nonexistent/hostile/ca.pem"),
+    ];
+
+    let start_out = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &["daemon", "start", "--json"],
+        None,
+        &hostile_env,
+    )?;
+    let _ = run_bin(&state_dir, &runtime_dir, &["daemon", "stop"], None, &[]);
+
+    if !start_out.status_ok {
+        return Err(format!(
+            "default binary honored OUTPOST_TEST_* env vars instead of ignoring them: stderr={}",
+            start_out.stderr
+        ));
+    }
+    if start_out.stderr.contains("OUTPOST_TEST_CONNECT_ADDR")
+        || start_out.stderr.contains("OUTPOST_TEST_CA_PEM")
+    {
+        return Err(format!(
+            "default binary parsed OUTPOST_TEST_* env vars: {}",
+            start_out.stderr
+        ));
+    }
+
+    // Also verify `device renew` refuses to renew an unknown device_id without `--device-pubkey-b64`.
+    let root_key_path = root_tmp.path().join("root.key");
+    std::fs::write(&root_key_path, B64.encode([0x33u8; 32]))
+        .map_err(|e| format!("write root key: {e}"))?;
+    let root_key_str = root_key_path.to_string_lossy().into_owned();
+    let renew_out = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &[
+            "device",
+            "renew",
+            "--device-id",
+            "9999",
+            "--account-id",
+            "1003",
+            "--root-key-file",
+            &root_key_str,
+        ],
+        None,
+        &hostile_env,
+    )?;
+    if renew_out.status_ok {
+        return Err("device renew MUST refuse missing local device record without --device-pubkey-b64!".to_string());
+    }
+    if !renew_out.stderr.contains("--device-pubkey-b64") {
+        return Err(format!(
+            "expected device renew to require --device-pubkey-b64, got: {}",
+            renew_out.stderr
+        ));
+    }
+
+    Ok(())
+}
+
+// ===========================================================================
 // Oracle 2: Full 2-Outpost Live E2E Party over Local TLS 1.3 Mock MP1 Server
 //           + Real iroh v1.5.0 QUIC + MCP party_send / party_wait
 // ===========================================================================
+
+#[cfg(feature = "test-tls-overrides")]
+mod live_e2e {
+    use super::*;
 
 struct MockAccount {
     account_id: u64,
@@ -1412,4 +1508,5 @@ async fn oracle_2_two_outpost_live_e2e_iroh_quic_and_mcp() -> Result<(), String>
     }
 
     Ok(())
+}
 }

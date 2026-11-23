@@ -23,12 +23,12 @@ const fn build_table() -> [u32; 256] {
 
 const CRC32C_TABLE: [u32; 256] = build_table();
 
+#[allow(clippy::indexing_slicing)]
 pub fn crc32c(bytes: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFF_u32;
     for &b in bytes {
         let idx = ((crc ^ u32::from(b)) & 0xFF) as usize;
-        let entry = CRC32C_TABLE.get(idx).copied().unwrap_or(0);
-        crc = (crc >> 8) ^ entry;
+        crc = (crc >> 8) ^ CRC32C_TABLE[idx];
     }
     !crc
 }

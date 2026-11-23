@@ -9,20 +9,23 @@
 //! - Sans-IO 100k-step DST (ring wrap, `(daemon_epoch, after_seq)` cursor reset, `client_msg_id` conflict, `epochs.bin` floor, A/B/A version-coexistence)
 
 use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64U};
+use base64::engine::general_purpose::{
+    STANDARD as B64, STANDARD_NO_PAD as B64_NO_PAD, URL_SAFE as B64U_PAD,
+    URL_SAFE_NO_PAD as B64U,
+};
 use ed25519_dalek::SigningKey;
 use mp_protocol::{
-    AccountId, DeviceId, EndpointDescriptor, PartyMemberRecord, RelayPolicy, TransportKind,
-    encode_device_cwt, sha256, validate_ed25519_pubkey_strict,
+    AccountId, DeviceId, EndpointDescriptor, MAX_SAFE_ID, PartyMemberRecord, RelayPolicy,
+    TransportKind, encode_device_cwt, sha256, validate_ed25519_pubkey_strict,
 };
 use outpost_core::crc32c::crc32c;
 use outpost_core::fence::{
     SecretMatchKind, fence_peer_text, sanitize_peer_text, scan_outbound_secrets,
 };
 use outpost_core::ipc_wire::{
-    ClientKind, HelloCompatAction, HelloPayload, IPC_SCHEMA_VER, IpcFrame, IpcOpcode,
-    MAX_IPC_BODY_BYTES, ReadyReply, decode_ipc_frame, decode_ready_reply, encode_ipc_frame,
-    encode_ready_reply, evaluate_hello_compat,
+    ClientKind, HelloCompatAction, HelloPayload, IPC_SCHEMA_VER, IPC_WIRE_VER, IpcFrame,
+    IpcOpcode, IpcWireError, MAX_IPC_BODY_BYTES, ReadyReply, decode_ipc_frame, decode_ipc_header,
+    decode_ready_reply, encode_ipc_frame, encode_ready_reply, evaluate_hello_compat,
 };
 use outpost_core::p2p_wire::{
     P2pActivityState, P2pBridgeEnvelope, P2pChatMessage, P2pControlNotice, P2pControlNoticeKind,
@@ -30,16 +33,16 @@ use outpost_core::p2p_wire::{
     encode_p2p_party_frame,
 };
 use outpost_core::party_state::{
-    DedupeCache, DedupeOutcome, EpochFloorStore, PartyEventBody, PartyEventRing,
-    PeerSendCandidate, SendPlanError, SendTarget, plan_send_recipients,
+    DedupeCache, DedupeLookup, DedupeOutcome, EpochFloorStore, MAX_POLL_MAX_BYTES, PartyEventBody,
+    PartyEventRing, PeerSendCandidate, SendPlanError, SendTarget, plan_send_recipients,
 };
 use outpost_core::storage_codec::{
     DaemonInfoRecord, DefaultDeviceRecord, DeviceRecord, EpochFloorEntry, EpochsStoreRecord,
-    PeerRecord, PeersStoreRecord, PendingDeviceRecord, PendingRegRecord, TrustState,
-    decode_daemon_info, decode_default_device, decode_device_record, decode_epochs_store,
-    decode_peers_store, decode_pending_device, decode_pending_reg, encode_daemon_info,
-    encode_default_device, encode_device_record, encode_epochs_store, encode_peers_store,
-    encode_pending_device, encode_pending_reg,
+    MAX_EPOCH_ENTRIES, PeerRecord, PeersStoreRecord, PendingDeviceRecord, PendingRegRecord,
+    TrustState, decode_daemon_info, decode_default_device, decode_device_record,
+    decode_epochs_store, decode_peers_store, decode_pending_device, decode_pending_reg,
+    encode_daemon_info, encode_default_device, encode_device_record, encode_epochs_store,
+    encode_peers_store, encode_pending_device, encode_pending_reg,
 };
 use outpost_core::trust::{
     AdmissionDecision, PeerTrustLookup, api_authority_hash, compute_safety_number,
@@ -82,9 +85,9 @@ fn crc32c_matches_rfc3720_check_vector() {
 #[test]
 fn mp_protocol_matches_sibling_golden_test_vectors() {
     let tv_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../multiplayer_site/docs/TEST_VECTORS.json");
+        .join("../../docs/TEST_VECTORS.json");
     let raw = std::fs::read_to_string(&tv_path)
-        .expect("sibling TEST_VECTORS.json must exist");
+        .expect("docs/TEST_VECTORS.json must exist");
     let v: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
 
     let root_seed: [u8; 32] = from_hex(v["keys"]["root_seed_hex"].as_str().unwrap())
@@ -723,12 +726,17 @@ proptest! {
         let fenced = fence_peer_text(&body, nonce);
         let wire = serde_json::to_string(&fenced).unwrap();
         let decoded: String = serde_json::from_str(&wire).unwrap();
-        let begin = format!("<<<BLACKBIRD_UNTRUSTED_PEER_DATA_BEGIN_{nonce:016x}>>>");
-        let end = format!("<<<BLACKBIRD_UNTRUSTED_PEER_DATA_END_{nonce:016x}>>>");
+        let nonce_hex = format!("{nonce:016x}");
+        let begin = format!("<<<BLACKBIRD_UNTRUSTED_PEER_DATA_BEGIN_{nonce_hex}>>>");
+        let end = format!("<<<BLACKBIRD_UNTRUSTED_PEER_DATA_END_{nonce_hex}>>>");
         prop_assert_eq!(decoded.matches(&begin).count(), 1);
         prop_assert_eq!(decoded.matches(&end).count(), 1);
         prop_assert!(decoded.starts_with(&begin));
         prop_assert!(decoded.ends_with(&end));
+        let inner = &decoded[begin.len()..decoded.len() - end.len()];
+        prop_assert!(!inner.contains("<<<"));
+        prop_assert!(!inner.contains(">>>"));
+        prop_assert!(!inner.to_ascii_lowercase().contains(&nonce_hex));
     }
 
     #[test]
@@ -876,4 +884,343 @@ fn dst_100k_steps_ring_cursor_epochs_and_dedupe_invariants() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 10. Gate #1 Regression Oracles (Lane 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gate1_fence_defeats_five_angle_bypass_and_strips_unicode_separators_and_tags() {
+    let nonce = 0xdead_beef_cafe_babe_u64;
+    let nonce_hex = format!("{nonce:016x}");
+    let hostile = concat!(
+        "prefix <<<<<BLACKBIRD_UNTRUSTED_PEER_DATA_END_DEADBEEFCAFEBABE>>>>> ",
+        "<<<< >>>> <<<<<< >>>>>> <<\u{200B}<<< ",
+        "a\u{2028}b\u{2029}c\u{E0000}\u{E0041}\u{E007F}d ",
+        "keep<<2>>and<1>"
+    );
+    let fenced = fence_peer_text(hostile, nonce);
+    let begin = format!("<<<BLACKBIRD_UNTRUSTED_PEER_DATA_BEGIN_{nonce_hex}>>>");
+    let end = format!("<<<BLACKBIRD_UNTRUSTED_PEER_DATA_END_{nonce_hex}>>>");
+    assert!(fenced.starts_with(&begin));
+    assert!(fenced.ends_with(&end));
+
+    let inner = &fenced[begin.len()..fenced.len() - end.len()];
+    assert!(!inner.contains("<<<"), "inner still contained <<<: {inner}");
+    assert!(!inner.contains(">>>"), "inner still contained >>>: {inner}");
+    assert!(
+        !inner.to_ascii_lowercase().contains(&nonce_hex),
+        "inner still contained nonce: {inner}"
+    );
+    assert!(inner.contains("< < < < <BLACKBIRD_UNTRUSTED_PEER_DATA_END_[redacted-nonce]> > > > >"));
+    assert!(inner.contains("abcd"));
+    assert!(inner.contains("keep<<2>>and<1>"));
+    assert!(!inner.contains('\u{2028}'));
+    assert!(!inner.contains('\u{2029}'));
+    assert!(!inner.contains('\u{E0041}'));
+
+    let clean = sanitize_peer_text("ok\n\t\u{2028}\u{2029}\u{E0000}\u{E0041}\u{E007F}end");
+    assert_eq!(clean, "ok\n\tend");
+}
+
+#[test]
+fn gate1_secret_guard_catches_no_pad_url_safe_and_misaligned_base64() {
+    let mut dev_secret = [0u8; 32];
+    for (i, b) in dev_secret.iter_mut().enumerate() {
+        *b = (0xC3u8).wrapping_add((i as u8).wrapping_mul(7));
+    }
+    let dev_cwt: Vec<u8> = (0u8..48).map(|i| 0x40u8.wrapping_add(i.wrapping_mul(3))).collect();
+
+    // All 4 standard/URL-safe encodings (padded & unpadded)
+    for enc in [
+        B64.encode(dev_secret),
+        B64_NO_PAD.encode(dev_secret),
+        B64U_PAD.encode(dev_secret),
+        B64U.encode(dev_secret),
+    ] {
+        assert_eq!(
+            scan_outbound_secrets(enc.as_bytes(), &dev_secret, &dev_cwt),
+            Some(SecretMatchKind::OwnDeviceSecret),
+            "missed device_secret encoding: {enc}"
+        );
+    }
+    for enc in [
+        B64.encode(&dev_cwt),
+        B64_NO_PAD.encode(&dev_cwt),
+        B64U_PAD.encode(&dev_cwt),
+        B64U.encode(&dev_cwt),
+    ] {
+        assert_eq!(
+            scan_outbound_secrets(enc.as_bytes(), &dev_secret, &dev_cwt),
+            Some(SecretMatchKind::OwnDeviceCwt),
+            "missed device_cwt encoding: {enc}"
+        );
+    }
+
+    // Misaligned offsets 0 (with suffix bleed), 1, and 2 in both standard and URL-safe alphabets!
+    for prefix in [&[][..], &[0x5Au8][..], &[0x5Au8, 0xA5u8][..]] {
+        let mut blob_sec = prefix.to_vec();
+        blob_sec.extend_from_slice(&dev_secret);
+        blob_sec.extend_from_slice(&[0xFF, 0xEE, 0xDD]);
+        for enc in [B64.encode(&blob_sec), B64_NO_PAD.encode(&blob_sec), B64U.encode(&blob_sec)] {
+            assert_eq!(
+                scan_outbound_secrets(enc.as_bytes(), &dev_secret, &dev_cwt),
+                Some(SecretMatchKind::OwnDeviceSecret),
+                "missed misaligned device_secret (prefix_len={})",
+                prefix.len()
+            );
+        }
+
+        let mut blob_cwt = prefix.to_vec();
+        blob_cwt.extend_from_slice(&dev_cwt);
+        blob_cwt.extend_from_slice(&[0x11, 0x22]);
+        for enc in [B64.encode(&blob_cwt), B64_NO_PAD.encode(&blob_cwt), B64U.encode(&blob_cwt)] {
+            assert_eq!(
+                scan_outbound_secrets(enc.as_bytes(), &dev_secret, &dev_cwt),
+                Some(SecretMatchKind::OwnDeviceCwt),
+                "missed misaligned device_cwt (prefix_len={})",
+                prefix.len()
+            );
+        }
+    }
+
+    // Unrelated base64 blob MUST NOT false positive
+    let unrelated = B64.encode([0x12u8; 64]);
+    assert_eq!(
+        scan_outbound_secrets(unrelated.as_bytes(), &dev_secret, &dev_cwt),
+        None
+    );
+}
+
+#[test]
+fn gate1_poll_filtered_skips_chat_for_board_read_and_clamps_max_bytes() {
+    let mut ring = PartyEventRing::new(5001, 42);
+    // Flood 150 chat messages, then 2 board envelopes, then 20 chat messages, then 1 board envelope.
+    for i in 0..150u64 {
+        ring.push(PartyEventBody::Chat {
+            sender_account_id: 1,
+            sender_device_id: 2,
+            sender_handle: "alice".to_string(),
+            room_scope: "party/main".to_string(),
+            target_selector: "@all".to_string(),
+            timestamp_ns: i as i64,
+            body: format!("chat-{i}"),
+        });
+    }
+    let b1_seq = ring.push(PartyEventBody::BridgeEnvelope {
+        sender_account_id: 1,
+        sender_device_id: 2,
+        sender_handle: "alice".to_string(),
+        room_scope: "party/ops".to_string(),
+        payload: vec![1, 2, 3],
+    });
+    let b2_seq = ring.push(PartyEventBody::BridgeEnvelope {
+        sender_account_id: 1,
+        sender_device_id: 2,
+        sender_handle: "alice".to_string(),
+        room_scope: "party/ops".to_string(),
+        payload: vec![4, 5, 6],
+    });
+    for i in 0..20u64 {
+        ring.push(PartyEventBody::Chat {
+            sender_account_id: 1,
+            sender_device_id: 2,
+            sender_handle: "alice".to_string(),
+            room_scope: "party/main".to_string(),
+            target_selector: "@all".to_string(),
+            timestamp_ns: (200 + i) as i64,
+            body: format!("trailing-chat-{i}"),
+        });
+    }
+    let b3_seq = ring.push(PartyEventBody::BridgeEnvelope {
+        sender_account_id: 1,
+        sender_device_id: 2,
+        sender_handle: "alice".to_string(),
+        room_scope: "party/ops".to_string(),
+        payload: vec![7, 8, 9],
+    });
+
+    // board_read with limit=2 skips all 150 chat events and immediately returns b1 and b2!
+    let p1 = ring.poll_filtered(Some(42), 0, 2, MAX_POLL_MAX_BYTES, |b| {
+        matches!(b, PartyEventBody::BridgeEnvelope { .. })
+    });
+    assert!(!p1.cursor_reset);
+    assert_eq!(p1.events.len(), 2);
+    assert_eq!(p1.events[0].seq, b1_seq);
+    assert_eq!(p1.events[1].seq, b2_seq);
+    // next_seq advances past trailing skipped chat events right up to before b3!
+    assert_eq!(p1.next_seq, b3_seq - 1);
+
+    // Next page gets b3 cleanly.
+    let p2 = ring.poll_filtered(Some(42), p1.next_seq, 2, MAX_POLL_MAX_BYTES, |b| {
+        matches!(b, PartyEventBody::BridgeEnvelope { .. })
+    });
+    assert_eq!(p2.events.len(), 1);
+    assert_eq!(p2.events[0].seq, b3_seq);
+    assert_eq!(p2.next_seq, b3_seq);
+
+    // Non-matching events only: next_seq still advances so board_read never stalls on chat traffic!
+    let tail_chat_seq = ring.push(PartyEventBody::Chat {
+        sender_account_id: 1,
+        sender_device_id: 2,
+        sender_handle: "alice".to_string(),
+        room_scope: "party/main".to_string(),
+        target_selector: "@all".to_string(),
+        timestamp_ns: 999,
+        body: "chat-only".to_string(),
+    });
+    let p3 = ring.poll_filtered(Some(42), p2.next_seq, 10, MAX_POLL_MAX_BYTES, |b| {
+        matches!(b, PartyEventBody::BridgeEnvelope { .. })
+    });
+    assert!(p3.events.is_empty());
+    assert_eq!(p3.next_seq, tail_chat_seq);
+
+    // Verify max_bytes > MAX_POLL_MAX_BYTES is clamped to 512 KiB!
+    let mut big_ring = PartyEventRing::new(5002, 77);
+    for _ in 0..4 {
+        big_ring.push(PartyEventBody::BridgeEnvelope {
+            sender_account_id: 1,
+            sender_device_id: 2,
+            sender_handle: "alice".to_string(),
+            room_scope: "party/ops".to_string(),
+            payload: vec![0xAB; 200 * 1024],
+        });
+    }
+    let clamped = big_ring.poll(Some(77), 0, 100, usize::MAX);
+    assert_eq!(
+        clamped.events.len(),
+        2,
+        "max_bytes must be clamped to MAX_POLL_MAX_BYTES (512 KiB)"
+    );
+}
+
+#[test]
+fn gate1_dedupe_cache_check_record_replays_cached_bytes_and_epoch_merge() {
+    let mut cache = DedupeCache::new();
+    let h1 = sha256(b"payload-1");
+    let h2 = sha256(b"payload-2");
+    assert_eq!(cache.check(10, 5001, 0x22, 100, h1), DedupeLookup::New);
+
+    let cached_resp = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01];
+    cache.record(10, 5001, 0x22, 100, h1, cached_resp.clone());
+    assert_eq!(
+        cache.check(10, 5001, 0x22, 100, h1),
+        DedupeLookup::Duplicate(cached_resp.as_slice())
+    );
+    assert_eq!(
+        cache.check(10, 5001, 0x22, 100, h2),
+        DedupeLookup::PayloadConflict
+    );
+
+    // EpochFloorStore::merge_from takes max epoch, ORs terminal_disbanded, max updated_at_ms, and caps MAX_EPOCH_ENTRIES.
+    let auth_h = api_authority_hash("api.multiplayer.tech");
+    let mut store = EpochFloorStore::from_record(EpochsStoreRecord {
+        entries: vec![
+            EpochFloorEntry {
+                api_authority_hash: auth_h,
+                party_id: 100,
+                highest_party_epoch: 5,
+                terminal_disbanded: false,
+                updated_at_ms: 1000,
+            },
+            EpochFloorEntry {
+                api_authority_hash: auth_h,
+                party_id: 200,
+                highest_party_epoch: 9,
+                terminal_disbanded: true,
+                updated_at_ms: 2000,
+            },
+        ],
+    });
+    let incoming = EpochsStoreRecord {
+        entries: vec![
+            EpochFloorEntry {
+                api_authority_hash: auth_h,
+                party_id: 100,
+                highest_party_epoch: 8,
+                terminal_disbanded: true,
+                updated_at_ms: 900,
+            },
+            EpochFloorEntry {
+                api_authority_hash: auth_h,
+                party_id: 200,
+                highest_party_epoch: 3,
+                terminal_disbanded: false,
+                updated_at_ms: 3000,
+            },
+            EpochFloorEntry {
+                api_authority_hash: auth_h,
+                party_id: 300,
+                highest_party_epoch: 1,
+                terminal_disbanded: false,
+                updated_at_ms: 4000,
+            },
+        ],
+    };
+    store.merge_from(&incoming);
+    let rec = store.to_record();
+    let e100 = rec.entries.iter().find(|e| e.party_id == 100).unwrap();
+    assert_eq!(e100.highest_party_epoch, 8);
+    assert!(e100.terminal_disbanded);
+    assert_eq!(e100.updated_at_ms, 1000);
+    let e200 = rec.entries.iter().find(|e| e.party_id == 200).unwrap();
+    assert_eq!(e200.highest_party_epoch, 9);
+    assert!(e200.terminal_disbanded);
+    assert_eq!(e200.updated_at_ms, 3000);
+    assert!(rec.entries.iter().any(|e| e.party_id == 300));
+
+    // Overflow MAX_EPOCH_ENTRIES via merge_from -> length stays <= MAX_EPOCH_ENTRIES
+    let flood = EpochsStoreRecord {
+        entries: (0..=(MAX_EPOCH_ENTRIES as u64 + 10))
+            .map(|i| EpochFloorEntry {
+                api_authority_hash: auth_h,
+                party_id: 10_000 + i,
+                highest_party_epoch: 1,
+                terminal_disbanded: false,
+                updated_at_ms: 5000 + i,
+            })
+            .collect(),
+    };
+    store.merge_from(&flood);
+    assert!(store.to_record().entries.len() <= MAX_EPOCH_ENTRIES);
+}
+
+#[test]
+fn gate1_ipc_wire_rejects_zero_and_oversized_request_ids() {
+    let zero_frame = IpcFrame {
+        opcode: IpcOpcode::GetStatus,
+        request_id: 0,
+        payload: Vec::new(),
+    };
+    assert_eq!(
+        encode_ipc_frame(&zero_frame),
+        Err(IpcWireError::InvalidRequestId)
+    );
+
+    let over_frame = IpcFrame {
+        opcode: IpcOpcode::GetStatus,
+        request_id: MAX_SAFE_ID + 1,
+        payload: Vec::new(),
+    };
+    assert_eq!(
+        encode_ipc_frame(&over_frame),
+        Err(IpcWireError::InvalidRequestId)
+    );
+
+    // Raw wire header with request_id == 0 MUST fail both decode_ipc_header and decode_ipc_frame!
+    let mut raw_hdr = [0u8; 16];
+    raw_hdr[0..4].copy_from_slice(&0u32.to_le_bytes());
+    raw_hdr[4..6].copy_from_slice(&IPC_WIRE_VER.to_le_bytes());
+    raw_hdr[6..8].copy_from_slice(&(IpcOpcode::GetStatus as u16).to_le_bytes());
+    raw_hdr[8..16].copy_from_slice(&0u64.to_le_bytes());
+    assert_eq!(
+        decode_ipc_header(&raw_hdr),
+        Err(IpcWireError::InvalidRequestId)
+    );
+    assert_eq!(
+        decode_ipc_frame(&raw_hdr),
+        Err(IpcWireError::InvalidRequestId)
+    );
+}
+
 

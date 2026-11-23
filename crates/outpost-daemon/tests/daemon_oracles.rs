@@ -18,13 +18,13 @@ use std::time::{Duration, Instant};
 use outpost_core::ipc_wire::{ClientKind, HelloPayload, IPC_SCHEMA_VER, IpcOpcode};
 use outpost_core::storage_codec::{DaemonInfoRecord, decode_daemon_info, encode_daemon_info};
 use outpost_daemon::{
-    CancellationToken, ClientConfig, DAEMON_INFO_NAME, DAEMON_LOCK_NAME, DaemonClient,
-    DaemonConfig, DaemonError, DaemonHandler, DaemonServer, DrainMode, FlockGuard,
-    ForceStopOutcome, READY_FD, SOCKET_FILE_NAME, SpawnCommand, StateLock, VerifiedDir,
-    atomic_write_in_dir, current_process_start_token, daemonize_in_child, force_stop_daemon,
-    format_device_dir_name, install_daemon_process_hygiene, open_or_create_private_dir,
-    process_start_token, publish_unix_listener, read_file_in_dir, resolve_runtime_dir,
-    validate_sun_path_budget_with_limit,
+    CancellationToken, ClientConfig, DAEMON_INFO_NAME, DAEMON_LOCK_NAME, DAEMON_LOG_NAME,
+    DaemonClient, DaemonConfig, DaemonError, DaemonExitReason, DaemonHandler, DaemonServer,
+    DrainMode, FlockGuard, ForceStopOutcome, READY_FD, SOCKET_FILE_NAME, SpawnCommand, StateLock,
+    VerifiedDir, atomic_write_in_dir, current_process_start_token, daemonize_in_child,
+    force_stop_daemon, format_device_dir_name, install_daemon_process_hygiene,
+    open_or_create_private_dir, process_start_token, publish_unix_listener, read_file_in_dir,
+    resolve_runtime_dir, validate_sun_path_budget_with_limit,
 };
 use tokio::sync::Barrier;
 
@@ -834,6 +834,331 @@ async fn oracle_7_no_fd_leak_no_zombies_and_sigstop_force_stop() {
     shutdown_cleanly(&mut fresh, &vdir).await;
 }
 
+struct InstrumentedHandler {
+    started_epoch: std::sync::atomic::AtomicU64,
+    health_ticks: std::sync::atomic::AtomicU64,
+    client_counts: std::sync::Mutex<Vec<usize>>,
+    drain_modes: std::sync::Mutex<Vec<DrainMode>>,
+    oversized_reply_bytes: usize,
+}
+
+impl InstrumentedHandler {
+    fn new(oversized_reply_bytes: usize) -> Self {
+        Self {
+            started_epoch: std::sync::atomic::AtomicU64::new(0),
+            health_ticks: std::sync::atomic::AtomicU64::new(0),
+            client_counts: std::sync::Mutex::new(Vec::new()),
+            drain_modes: std::sync::Mutex::new(Vec::new()),
+            oversized_reply_bytes,
+        }
+    }
+}
+
+impl DaemonHandler for InstrumentedHandler {
+    async fn handle_request(
+        &self,
+        _conn_id: u64,
+        opcode: IpcOpcode,
+        _request_id: u64,
+        payload: Vec<u8>,
+        _cancel: CancellationToken,
+    ) -> Result<Vec<u8>, (u16, bool, String)> {
+        if opcode == IpcOpcode::PartyPoll && self.oversized_reply_bytes > 0 {
+            return Ok(vec![0x5A; self.oversized_reply_bytes]);
+        }
+        Ok(payload)
+    }
+
+    fn active_party_id(&self) -> u64 {
+        0
+    }
+
+    fn on_daemon_started(&self, daemon_epoch: u64) {
+        self.started_epoch
+            .store(daemon_epoch, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn on_client_count_changed(&self, count: usize) {
+        if let Ok(mut guard) = self.client_counts.lock() {
+            guard.push(count);
+        }
+    }
+
+    async fn health_tick(&self) {
+        self.health_ticks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    async fn on_drain(&self, mode: DrainMode) {
+        if let Ok(mut guard) = self.drain_modes.lock() {
+            guard.push(mode);
+        }
+    }
+}
+
+/// Oracle 8 (Gate #1 Regressions):
+/// - `on_daemon_started(epoch)` fires before connect with exact authoritative `daemon_epoch`
+/// - `on_client_count_changed` tracks `0 -> 1 -> 2 -> 1 -> 0` reliably
+/// - Watchdog `health_tick()` runs directly on coordinator loop with zero false kills
+/// - `DrainMode::StopLeaveParty` is NEVER lost or downgraded under concurrent drain triggers
+/// - Per-client outbound byte cap tears down connection cleanly instead of dropping frames
+async fn oracle_8_gate1_lifecycle_watchdog_drain_and_backpressure() {
+    use std::sync::atomic::Ordering;
+
+    // 8a. Callbacks + Watchdog health_tick + outbound byte-cap teardown.
+    {
+        let tmp = make_short_tempdir();
+        let device_id = 1008;
+        let handler = Arc::new(InstrumentedHandler::new(2048));
+        let mut cfg = DaemonConfig::new(device_id, 100, [0xAA; 32]);
+        cfg.runtime_dir_override = Some(tmp.path().to_path_buf());
+        cfg.idle_timeout = None;
+        cfg.watchdog_interval = Duration::from_millis(35);
+        cfg.watchdog_stall_timeout = Duration::from_millis(1000);
+        cfg.max_outbound_bytes_per_client = 1024;
+
+        let shutdown = CancellationToken::new();
+        let server_task = tokio::spawn(DaemonServer::run_with_shutdown(
+            cfg,
+            Arc::clone(&handler),
+            Some(shutdown.clone()),
+        ));
+
+        let mut client_cfg = ClientConfig::new(
+            device_id,
+            HelloPayload {
+                ipc_schema_ver: IPC_SCHEMA_VER,
+                build_order: 100,
+                build_digest: [0xAA; 32],
+                client_kind: ClientKind::Cli,
+                client_pid: std::process::id(),
+            },
+        );
+        client_cfg.runtime_dir_override = Some(tmp.path().to_path_buf());
+        client_cfg.spawn_command = None;
+        client_cfg.exit_wait_timeout = Duration::from_millis(25);
+
+        // Wait until in-process server publishes d.sock.
+        let mut c1 = loop {
+            match DaemonClient::connect_or_spawn(&client_cfg).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(Duration::from_millis(15)).await,
+            }
+        };
+
+        let started_epoch = handler.started_epoch.load(Ordering::SeqCst);
+        assert_ne!(started_epoch, 0, "on_daemon_started must fire before accept");
+        assert_eq!(
+            c1.ack().daemon_epoch,
+            started_epoch,
+            "HelloAck.daemon_epoch must match on_daemon_started(epoch)"
+        );
+
+        let c2 = DaemonClient::connect_or_spawn(&client_cfg)
+            .await
+            .expect("second client connect");
+
+        // Wait for >= 3 coordinator watchdog health ticks on healthy server.
+        let tick_deadline = Instant::now() + Duration::from_secs(2);
+        while handler.health_ticks.load(Ordering::SeqCst) < 3 {
+            assert!(
+                Instant::now() < tick_deadline,
+                "watchdog health_tick did not advance on coordinator loop"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Trigger outbound byte-cap breach on c1 (2048 > 1024): connection MUST tear down!
+        let oversized_res = tokio::time::timeout(
+            Duration::from_secs(2),
+            c1.request(IpcOpcode::PartyPoll, Vec::new()),
+        )
+        .await
+        .expect("oversized reply must tear down connection promptly, not hang");
+        assert!(
+            oversized_res.is_err(),
+            "expected connection teardown on outbound byte-cap breach, got {oversized_res:?}"
+        );
+        drop(c1);
+        drop(c2);
+
+        // Wait until client count transitions back down to 0.
+        let zero_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let last = handler
+                .client_counts
+                .lock()
+                .expect("lock counts")
+                .last()
+                .copied();
+            if last == Some(0) {
+                break;
+            }
+            assert!(
+                Instant::now() < zero_deadline,
+                "on_client_count_changed never returned to 0"
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        let counts = handler.client_counts.lock().expect("lock counts").clone();
+        assert!(
+            counts.contains(&1) && counts.contains(&2) && counts.last() == Some(&0),
+            "unexpected client count sequence: {counts:?}"
+        );
+
+        shutdown.cancel();
+        let exit = server_task
+            .await
+            .expect("server join")
+            .expect("server exit ok");
+        assert_eq!(exit, DaemonExitReason::ExternalShutdown);
+    }
+
+    // 8b. Concurrent drain race: `StopLeaveParty` must NEVER be lost or downgraded to `StopDetach`!
+    for round in 0u64..15 {
+        let tmp = make_short_tempdir();
+        let device_id = 1100 + round;
+        let handler = Arc::new(InstrumentedHandler::new(0));
+        let mut cfg = DaemonConfig::new(device_id, 100, [0xAA; 32]);
+        cfg.runtime_dir_override = Some(tmp.path().to_path_buf());
+        cfg.idle_timeout = Some(Duration::from_millis(25));
+        cfg.watchdog_interval = Duration::from_millis(50);
+
+        let shutdown = CancellationToken::new();
+        let server_task = tokio::spawn(DaemonServer::run_with_shutdown(
+            cfg,
+            Arc::clone(&handler),
+            Some(shutdown.clone()),
+        ));
+
+        let mut client_cfg = ClientConfig::new(
+            device_id,
+            HelloPayload {
+                ipc_schema_ver: IPC_SCHEMA_VER,
+                build_order: 100,
+                build_digest: [0xAA; 32],
+                client_kind: ClientKind::Cli,
+                client_pid: std::process::id(),
+            },
+        );
+        client_cfg.runtime_dir_override = Some(tmp.path().to_path_buf());
+        client_cfg.spawn_command = None;
+        client_cfg.exit_wait_timeout = Duration::from_millis(25);
+
+        let mut c_leave = loop {
+            match DaemonClient::connect_or_spawn(&client_cfg).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
+        let mut c_detach = DaemonClient::connect_or_spawn(&client_cfg)
+            .await
+            .expect("connect second client");
+
+        // Send StopLeaveParty, and the instant the server commits & ACKs it, race both
+        // external_shutdown AND a second StopDetach request!
+        c_leave
+            .send_drain_and_shutdown(DrainMode::StopLeaveParty)
+            .await
+            .expect("send StopLeaveParty");
+        shutdown.cancel();
+        let _ = c_detach.send_drain_and_shutdown(DrainMode::StopDetach).await;
+
+        let exit = server_task
+            .await
+            .expect("server join")
+            .expect("server exit");
+        assert_eq!(
+            exit,
+            DaemonExitReason::DrainRequested(DrainMode::StopLeaveParty),
+            "round {round}: StopLeaveParty was lost or downgraded to {exit:?}"
+        );
+        let modes = handler.drain_modes.lock().expect("drain modes").clone();
+        assert_eq!(
+            modes,
+            vec![DrainMode::StopLeaveParty],
+            "round {round}: on_drain received wrong mode: {modes:?}"
+        );
+    }
+}
+
+/// Oracle 9 (Gate #1 Regressions):
+/// - Component-wise `open_or_create_private_dir` rejects nested non-root intermediate symlinks
+///   and non-directory components while succeeding through root-owned macOS `/var -> private/var`
+/// - `daemon.log` rotates atomically to `daemon.log.1` on spawn when `> 4 MiB`
+async fn oracle_9_gate1_component_walk_and_log_rotation() {
+    let tmp = make_short_tempdir();
+    let device_id = 1009;
+
+    // 9a. Nested non-root intermediate symlink MUST be rejected even with deep descendants.
+    let target = tmp.path().join("real_target");
+    std::fs::create_dir(&target).expect("mkdir target");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let mid_link = tmp.path().join("nonroot_mid");
+    std::os::unix::fs::symlink(&target, &mid_link).expect("symlink mid");
+    let deep_through_link = mid_link.join("nested").join("leaf");
+    match open_or_create_private_dir(&deep_through_link) {
+        Err(DaemonError::SymlinkRejected { .. }) => {}
+        other => panic!("expected SymlinkRejected on nested non-root symlink, got {other:?}"),
+    }
+
+    // Regular file as intermediate component MUST fail closed with InsecureDirectory.
+    let reg_file = tmp.path().join("not_a_dir");
+    std::fs::write(&reg_file, b"hello").expect("write regular file");
+    match open_or_create_private_dir(&reg_file.join("child")) {
+        Err(DaemonError::InsecureDirectory { .. }) => {}
+        other => panic!("expected InsecureDirectory on regular file component, got {other:?}"),
+    }
+
+    // On macOS, verify paths traversing root-owned `/var -> private/var` succeed cleanly!
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            tmp.path().starts_with(Path::new("/var/folders")),
+            "expected macOS tempdir under /var/folders (through /var -> private/var), got {}",
+            tmp.path().display()
+        );
+        let mac_dir = tmp.path().join("var_walk_ok").join("leaf");
+        let vdir = open_or_create_private_dir(&mac_dir)
+            .expect("open_or_create_private_dir must succeed through root-owned /var symlink");
+        assert!(vdir.path_matches_inode().expect("inode match"));
+    }
+
+    // 9b. `daemon.log` rotation on spawn when > 4 MiB.
+    let rdir_path = resolve_runtime_dir(device_id, Some(tmp.path())).expect("resolve dir");
+    let vdir = open_or_create_private_dir(&rdir_path).expect("open runtime dir");
+    let oversized_len = (4 * 1024 * 1024) + 1024;
+    let log_path = rdir_path.join(DAEMON_LOG_NAME);
+    std::fs::write(&log_path, vec![b'X'; oversized_len]).expect("write >4MiB daemon.log");
+    std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o600)).expect("chmod log");
+
+    let spec = WorkerSpec::new(device_id, tmp.path().to_path_buf());
+    let cfg = spec.client_config(ClientKind::Cli, IPC_SCHEMA_VER, 100, 0xAA, false);
+    let mut client = DaemonClient::connect_or_spawn(&cfg)
+        .await
+        .expect("spawn daemon with oversized daemon.log");
+
+    let rotated_st = vdir
+        .stat_entry(outpost_daemon::os_unix::DAEMON_LOG_OLD_NAME)
+        .expect("stat daemon.log.1")
+        .expect("daemon.log.1 must exist after rotation");
+    assert_eq!(
+        rotated_st.st_size as usize, oversized_len,
+        "rotated daemon.log.1 must preserve previous >4MiB log"
+    );
+    let cur_st = vdir
+        .stat_entry(DAEMON_LOG_NAME)
+        .expect("stat daemon.log")
+        .expect("new daemon.log must exist");
+    assert!(
+        (cur_st.st_size as usize) < 4 * 1024 * 1024,
+        "new daemon.log must be fresh after rotation (got {} bytes)",
+        cur_st.st_size
+    );
+
+    shutdown_cleanly(&mut client, &vdir).await;
+}
+
 fn main() -> ExitCode {
     if std::env::var(ENV_DAEMON_MODE).as_deref() == Ok("1") {
         run_daemon_worker();
@@ -879,6 +1204,14 @@ fn main() -> ExitCode {
         (
             "oracle_7_no_fd_leak_no_zombies_and_sigstop_force_stop",
             || Box::pin(oracle_7_no_fd_leak_no_zombies_and_sigstop_force_stop()),
+        ),
+        (
+            "oracle_8_gate1_lifecycle_watchdog_drain_and_backpressure",
+            || Box::pin(oracle_8_gate1_lifecycle_watchdog_drain_and_backpressure()),
+        ),
+        (
+            "oracle_9_gate1_component_walk_and_log_rotation",
+            || Box::pin(oracle_9_gate1_component_walk_and_log_rotation()),
         ),
     ];
 

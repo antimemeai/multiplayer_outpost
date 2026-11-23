@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard};
+use std::time::{Duration, Instant};
 
 use outpost_core::ipc_wire::{HelloAckPayload, IPC_SCHEMA_VER, IpcFrame, IpcOpcode};
 use outpost_core::storage_codec::{DaemonInfoRecord, encode_daemon_info};
@@ -45,6 +45,18 @@ pub trait DaemonHandler: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Vec<u8>, (u16, bool, String)>> + Send;
 
     fn active_party_id(&self) -> u64;
+
+    /// Called once after the authoritative `daemon_epoch` is generated and before
+    /// the Unix socket is published or readiness is signaled.
+    fn on_daemon_started(&self, _daemon_epoch: u64) {}
+
+    /// Called whenever the authenticated client count changes (on connect and disconnect).
+    fn on_client_count_changed(&self, _count: usize) {}
+
+    /// Called directly from the coordinator loop when answering OS watchdog heartbeats.
+    fn health_tick(&self) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 
     fn on_drain(&self, _mode: DrainMode) -> impl Future<Output = ()> + Send {
         async {}
@@ -123,7 +135,7 @@ struct SharedState {
     next_conn_id: AtomicU64,
     idle_notify: Notify,
     drain_notify: Notify,
-    drain_reason: Mutex<Option<DaemonExitReason>>,
+    drain_reason: StdMutex<Option<DaemonExitReason>>,
     config: DaemonConfig,
     daemon_epoch: u64,
     daemon_pid: u32,
@@ -136,6 +148,18 @@ impl SharedState {
             1 => LifecycleState::Draining,
             _ => LifecycleState::Exited,
         }
+    }
+
+    fn lock_drain_reason(&self) -> StdMutexGuard<'_, Option<DaemonExitReason>> {
+        match self.drain_reason.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn drain_reason_or(&self, fallback: DaemonExitReason) -> DaemonExitReason {
+        let guard = self.lock_drain_reason();
+        guard.unwrap_or(fallback)
     }
 
     fn try_begin_draining(&self) -> bool {
@@ -163,25 +187,57 @@ impl SharedState {
             .store(LifecycleState::Exited as u8, Ordering::SeqCst);
     }
 
-    async fn trigger_drain(&self, reason: DaemonExitReason) {
-        if self.try_begin_draining() {
-            let mut guard = self.drain_reason.lock().await;
-            if guard.is_none() {
-                *guard = Some(reason);
-            }
+    /// Atomically records `reason` and transitions `Serving -> Draining` under the
+    /// synchronous `drain_reason` lock so no caller can ever observe `Draining` before
+    /// `drain_reason` is populated.
+    fn trigger_drain(&self, reason: DaemonExitReason) -> bool {
+        let mut guard = self.lock_drain_reason();
+        if self.state() != LifecycleState::Serving {
+            return false;
+        }
+        *guard = Some(reason);
+        let transitioned = self.try_begin_draining();
+        drop(guard);
+        if transitioned {
             self.drain_notify.notify_waiters();
+        }
+        transitioned
+    }
+
+    /// Atomically transitions `Serving -> Draining` for autonomous idle exit if and
+    /// only if `is_still_idle()` holds while serialized with `trigger_drain`.
+    fn try_begin_idle_drain<F>(&self, is_still_idle: F) -> Result<bool, DaemonExitReason>
+    where
+        F: FnOnce() -> bool,
+    {
+        let mut guard = self.lock_drain_reason();
+        if self.state() != LifecycleState::Serving {
+            return Err(guard.unwrap_or(DaemonExitReason::ExternalShutdown));
+        }
+        if !self.try_begin_draining() {
+            return Err(guard.unwrap_or(DaemonExitReason::ExternalShutdown));
+        }
+        if is_still_idle() {
+            *guard = Some(DaemonExitReason::IdleTimeout);
+            Ok(true)
+        } else {
+            self.revert_draining_to_serving();
+            Ok(false)
         }
     }
 }
 
-struct ClientGuard {
+struct ClientGuard<H: DaemonHandler> {
     shared: Arc<SharedState>,
+    handler: Arc<H>,
 }
 
-impl Drop for ClientGuard {
+impl<H: DaemonHandler> Drop for ClientGuard<H> {
     fn drop(&mut self) {
         let prev = self.shared.connected_clients.fetch_sub(1, Ordering::SeqCst);
-        if prev == 1 {
+        let now = prev.saturating_sub(1);
+        self.handler.on_client_count_changed(now);
+        if now == 0 {
             self.shared.idle_notify.notify_waiters();
         }
     }
@@ -234,14 +290,16 @@ impl DaemonServer {
 
     /// Runs the local daemon IPC server with an optional external shutdown token.
     pub async fn run_with_shutdown<H: DaemonHandler>(
-        config: DaemonConfig,
+        mut config: DaemonConfig,
         handler: Arc<H>,
         external_shutdown: Option<CancellationToken>,
     ) -> Result<DaemonExitReason, DaemonError> {
-        let ready_fd = config.ready_fd;
-        let res = Self::run_inner(config, handler, external_shutdown).await;
+        // Take `ready_fd` strictly once here so `send_ready_reply_and_close` is
+        // guaranteed to be called at most once across all success & error paths.
+        let mut ready_fd = config.ready_fd.take();
+        let res = Self::run_inner(config, handler, external_shutdown, &mut ready_fd).await;
         if let Err(ref err) = res
-            && let Some(fd) = ready_fd
+            && let Some(fd) = ready_fd.take()
         {
             send_ready_reply_and_close(
                 fd,
@@ -252,11 +310,11 @@ impl DaemonServer {
     }
 
     async fn run_inner<H: DaemonHandler>(
-        mut config: DaemonConfig,
+        config: DaemonConfig,
         handler: Arc<H>,
         external_shutdown: Option<CancellationToken>,
+        ready_fd: &mut Option<RawFd>,
     ) -> Result<DaemonExitReason, DaemonError> {
-        let ready_fd = config.ready_fd.take();
         let runtime_path =
             resolve_runtime_dir(config.device_id, config.runtime_dir_override.as_deref())?;
         let dir = Arc::new(open_or_create_private_dir(&runtime_path)?);
@@ -266,7 +324,7 @@ impl DaemonServer {
         let mut idle_startup_lock: Option<FlockGuard> = None;
 
         let Some(daemon_lock) = FlockGuard::try_lock_exclusive(&dir, DAEMON_LOCK_NAME)? else {
-            if let Some(fd) = ready_fd {
+            if let Some(fd) = ready_fd.take() {
                 send_ready_reply_and_close(
                     fd,
                     &outpost_core::ipc_wire::ReadyReply::AlreadyRunning,
@@ -276,9 +334,12 @@ impl DaemonServer {
         };
         let daemon_lock = Arc::new(daemon_lock);
 
-        let daemon_epoch = generate_daemon_epoch();
+        let daemon_epoch = generate_daemon_epoch()?;
         let daemon_pid = std::process::id();
         let start_token = current_process_start_token()?;
+
+        // Notify handler of authoritative daemon_epoch BEFORE publishing d.sock / readiness.
+        handler.on_daemon_started(daemon_epoch);
 
         let published = publish_unix_listener(&dir, &daemon_lock)?;
         let sock_dev = published.sock_dev;
@@ -302,6 +363,12 @@ impl DaemonServer {
         let listener = UnixListener::from_std(published.listener)
             .map_err(|e| DaemonError::io("tokio UnixListener::from_std", e))?;
 
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|e| DaemonError::io("register SIGTERM", e))?;
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .map_err(|e| DaemonError::io("register SIGINT", e))?;
+
         let shared = Arc::new(SharedState {
             lifecycle: AtomicU8::new(LifecycleState::Serving as u8),
             connected_clients: AtomicUsize::new(0),
@@ -309,21 +376,15 @@ impl DaemonServer {
             next_conn_id: AtomicU64::new(1),
             idle_notify: Notify::new(),
             drain_notify: Notify::new(),
-            drain_reason: Mutex::new(None),
+            drain_reason: StdMutex::new(None),
             config: config.clone(),
             daemon_epoch,
             daemon_pid,
         });
 
-        // Coordinator heartbeat channel: proves the main Tokio runtime is making progress.
+        // Coordinator heartbeat channel: directly probed by the main select! loop + handler.health_tick().
         let (hb_tx, mut hb_rx) = mpsc::channel::<u64>(4);
-        let last_hb_ack_ms = Arc::new(AtomicU64::new(monotonic_boottime_ms()));
-        let hb_ack_clone = Arc::clone(&last_hb_ack_ms);
-        let hb_task = tokio::spawn(async move {
-            while let Some(_seq) = hb_rx.recv().await {
-                hb_ack_clone.store(monotonic_boottime_ms(), Ordering::Release);
-            }
-        });
+        let last_hb_ack_seq = Arc::new(AtomicU64::new(0));
 
         // Dedicated OS watchdog thread outside Tokio.
         let watchdog_stop = Arc::new(AtomicBool::new(false));
@@ -333,7 +394,7 @@ impl DaemonServer {
             Arc::clone(&shared),
             Arc::clone(&watchdog_stop),
             hb_tx,
-            last_hb_ack_ms,
+            Arc::clone(&last_hb_ack_seq),
             WatchdogInodes {
                 lock_dev,
                 lock_ino,
@@ -343,18 +404,12 @@ impl DaemonServer {
         )?;
 
         // Signal readiness to spawning parent over FD 3 and close FD 3!
-        if let Some(fd) = ready_fd {
+        if let Some(fd) = ready_fd.take() {
             send_ready_reply_and_close(
                 fd,
                 &outpost_core::ipc_wire::ReadyReply::Ok { daemon_epoch },
             );
         }
-
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .map_err(|e| DaemonError::io("register SIGTERM", e))?;
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .map_err(|e| DaemonError::io("register SIGINT", e))?;
 
         let mut idle_since_ms: Option<u64> = None;
         let idle_poll_interval = config
@@ -364,8 +419,7 @@ impl DaemonServer {
 
         let exit_reason = loop {
             if shared.state() != LifecycleState::Serving {
-                let guard = shared.drain_reason.lock().await;
-                break guard.unwrap_or(DaemonExitReason::ExternalShutdown);
+                break shared.drain_reason_or(DaemonExitReason::ExternalShutdown);
             }
 
             // Update sleep-aware idle timestamp.
@@ -386,26 +440,25 @@ impl DaemonServer {
                                 idle_since_ms = Some(monotonic_boottime_ms());
                             }
                             Some(startup_guard) => {
-                                // 2. Atomically transition Serving -> Draining.
-                                if shared.try_begin_draining() {
-                                    // 3. Re-check idle invariants under startup.lock!
-                                    let still_idle =
-                                        shared.connected_clients.load(Ordering::SeqCst) == 0
-                                            && shared.pending_handshakes.load(Ordering::SeqCst)
-                                                == 0
-                                            && handler.active_party_id() == 0;
-                                    if still_idle {
+                                // 2. Atomically transition Serving -> Draining and re-check idle invariants.
+                                match shared.try_begin_idle_drain(|| {
+                                    shared.connected_clients.load(Ordering::SeqCst) == 0
+                                        && shared.pending_handshakes.load(Ordering::SeqCst) == 0
+                                        && handler.active_party_id() == 0
+                                }) {
+                                    Ok(true) => {
                                         idle_startup_lock = Some(startup_guard);
                                         break DaemonExitReason::IdleTimeout;
                                     }
-                                    // A client arrived just before Draining; revert & resume.
-                                    shared.revert_draining_to_serving();
-                                    drop(startup_guard);
-                                    idle_since_ms = None;
-                                } else {
-                                    drop(startup_guard);
-                                    let guard = shared.drain_reason.lock().await;
-                                    break guard.unwrap_or(DaemonExitReason::ExternalShutdown);
+                                    Ok(false) => {
+                                        // A client arrived just before Draining; revert & resume.
+                                        drop(startup_guard);
+                                        idle_since_ms = None;
+                                    }
+                                    Err(existing_reason) => {
+                                        drop(startup_guard);
+                                        break existing_reason;
+                                    }
                                 }
                             }
                         }
@@ -423,17 +476,16 @@ impl DaemonServer {
 
                 _ = drain_wait => {
                     if shared.state() != LifecycleState::Serving {
-                        let guard = shared.drain_reason.lock().await;
-                        break guard.unwrap_or(DaemonExitReason::ExternalShutdown);
+                        break shared.drain_reason_or(DaemonExitReason::ExternalShutdown);
                     }
                 }
                 _ = sigterm.recv() => {
-                    shared.trigger_drain(DaemonExitReason::Signal).await;
-                    break DaemonExitReason::Signal;
+                    let _ = shared.trigger_drain(DaemonExitReason::Signal);
+                    break shared.drain_reason_or(DaemonExitReason::Signal);
                 }
                 _ = sigint.recv() => {
-                    shared.trigger_drain(DaemonExitReason::Signal).await;
-                    break DaemonExitReason::Signal;
+                    let _ = shared.trigger_drain(DaemonExitReason::Signal);
+                    break shared.drain_reason_or(DaemonExitReason::Signal);
                 }
                 _ = async {
                     if let Some(ref tok) = external_shutdown {
@@ -442,8 +494,12 @@ impl DaemonServer {
                         std::future::pending::<()>().await;
                     }
                 } => {
-                    shared.trigger_drain(DaemonExitReason::ExternalShutdown).await;
-                    break DaemonExitReason::ExternalShutdown;
+                    let _ = shared.trigger_drain(DaemonExitReason::ExternalShutdown);
+                    break shared.drain_reason_or(DaemonExitReason::ExternalShutdown);
+                }
+                Some(seq) = hb_rx.recv() => {
+                    handler.health_tick().await;
+                    last_hb_ack_seq.store(seq, Ordering::Release);
                 }
                 accept_res = listener.accept() => {
                     match accept_res {
@@ -484,7 +540,7 @@ impl DaemonServer {
         };
 
         // Ensure state is Draining, stop accepting, unlink verified `d.sock`.
-        let _ = shared.try_begin_draining();
+        let _ = shared.trigger_drain(exit_reason);
         drop(listener);
         let _ = dir.unlink_if_matches(SOCKET_FILE_NAME, sock_dev, sock_ino);
 
@@ -496,7 +552,6 @@ impl DaemonServer {
 
         shared.mark_exited();
         watchdog_stop.store(true, Ordering::SeqCst);
-        hb_task.abort();
         let _ = watchdog_handle.join();
 
         // Explicitly drop `daemon_lock` BEFORE `idle_startup_lock` so no client can
@@ -521,33 +576,52 @@ fn spawn_watchdog_thread(
     shared: Arc<SharedState>,
     stop: Arc<AtomicBool>,
     hb_tx: mpsc::Sender<u64>,
-    last_hb_ack_ms: Arc<AtomicU64>,
+    last_hb_ack_seq: Arc<AtomicU64>,
     inodes: WatchdogInodes,
 ) -> Result<std::thread::JoinHandle<()>, DaemonError> {
-    let interval = shared.config.watchdog_interval;
-    let stall_timeout_ms = shared.config.watchdog_stall_timeout.as_millis() as u64;
+    let interval = shared.config.watchdog_interval.max(Duration::from_millis(1));
+    let stall_timeout = shared.config.watchdog_stall_timeout;
+    let drain_hard_deadline = shared
+        .config
+        .drain_timeout
+        .saturating_add(Duration::from_secs(5));
     let sleep_step = interval.min(Duration::from_millis(50));
 
     std::thread::Builder::new()
         .name("outpost-watchdog".to_string())
         .spawn(move || {
             let mut seq = 1u64;
-            let mut last_check_ms = monotonic_boottime_ms();
-            let interval_ms = interval.as_millis().max(1) as u64;
+            let mut last_check = Instant::now();
+            let mut pending_ping: Option<(u64, Instant)> = None;
+            let mut drain_started_at: Option<Instant> = None;
 
             while !stop.load(Ordering::Acquire) {
                 std::thread::sleep(sleep_step);
                 if stop.load(Ordering::Acquire) {
                     break;
                 }
-                let now_ms = monotonic_boottime_ms();
-                if now_ms.saturating_sub(last_check_ms) < interval_ms {
+                if last_check.elapsed() < interval {
                     continue;
                 }
-                last_check_ms = now_ms;
+                last_check = Instant::now();
 
-                if shared.state() != LifecycleState::Serving {
-                    break;
+                match shared.state() {
+                    LifecycleState::Exited => break,
+                    LifecycleState::Draining => {
+                        let started = drain_started_at.get_or_insert_with(Instant::now);
+                        if started.elapsed() > drain_hard_deadline {
+                            write_log_lock_free(
+                                b"outpost-daemon watchdog: drain stalled past hard deadline, calling _exit(2)\n",
+                            );
+                            unsafe {
+                                libc::_exit(2);
+                            }
+                        }
+                        continue;
+                    }
+                    LifecycleState::Serving => {
+                        drain_started_at = None;
+                    }
                 }
 
                 // 1. Inode self-fence: verify dir, daemon.lock, and d.sock all match.
@@ -573,13 +647,9 @@ fn spawn_watchdog_thread(
                     write_log_lock_free(
                         b"outpost-daemon watchdog: inode self-fence triggered, draining cleanly\n",
                     );
-                    if shared.try_begin_draining() {
-                        if let Ok(mut guard) = shared.drain_reason.try_lock() {
-                            *guard = Some(DaemonExitReason::WatchdogInodeMismatch);
-                        }
-                        shared.drain_notify.notify_waiters();
-                    }
-                    break;
+                    let _ = shared.trigger_drain(DaemonExitReason::WatchdogInodeMismatch);
+                    drain_started_at.get_or_insert_with(Instant::now);
+                    continue;
                 }
 
                 // Touch atime on lock files to protect against macOS dirhelper / tmpfiles.d.
@@ -593,16 +663,27 @@ fn spawn_watchdog_thread(
                     );
                 }
 
-                // 2. Coordinator event-loop heartbeat progress check.
-                let _ = hb_tx.try_send(seq);
-                seq = seq.wrapping_add(1);
-                let ack_ms = last_hb_ack_ms.load(Ordering::Acquire);
-                if now_ms.saturating_sub(ack_ms) > stall_timeout_ms {
-                    write_log_lock_free(
-                        b"outpost-daemon watchdog: coordinator stalled past timeout, calling _exit(2)\n",
-                    );
-                    unsafe {
-                        libc::_exit(2);
+                // 2. Coordinator event-loop heartbeat progress check on awake-only Instant.
+                if let Some((sent_seq, sent_at)) = pending_ping {
+                    if last_hb_ack_seq.load(Ordering::Acquire) >= sent_seq {
+                        pending_ping = None;
+                    } else if sent_at.elapsed() > stall_timeout {
+                        write_log_lock_free(
+                            b"outpost-daemon watchdog: coordinator stalled past timeout, calling _exit(2)\n",
+                        );
+                        unsafe {
+                            libc::_exit(2);
+                        }
+                    }
+                }
+
+                if pending_ping.is_none() {
+                    match hb_tx.try_send(seq) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {
+                            pending_ping = Some((seq, Instant::now()));
+                            seq = seq.saturating_add(1);
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {}
                     }
                 }
             }
@@ -655,10 +736,12 @@ async fn handle_connection<H: DaemonHandler>(
 
     // Atomically increment `connected_clients` BEFORE completing pending handshake
     // so there is zero gap where both counters are 0 while a client is authenticating!
-    shared.connected_clients.fetch_add(1, Ordering::SeqCst);
+    let prev_clients = shared.connected_clients.fetch_add(1, Ordering::SeqCst);
     let _client_guard = ClientGuard {
         shared: Arc::clone(&shared),
+        handler: Arc::clone(&handler),
     };
+    handler.on_client_count_changed(prev_clients.saturating_add(1));
     pending_guard.complete();
 
     // Double-check state after incrementing connected_clients in case idle exit raced.
@@ -700,12 +783,23 @@ async fn handle_connection<H: DaemonHandler>(
     let queued_bytes = Arc::new(AtomicUsize::new(0));
     let queued_bytes_w = Arc::clone(&queued_bytes);
     let max_out_bytes = shared.config.max_outbound_bytes_per_client;
+    let conn_close = CancellationToken::new();
+    let conn_close_w = conn_close.clone();
 
     let writer_task = tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
+        loop {
+            let frame = tokio::select! {
+                biased;
+                _ = conn_close_w.cancelled() => break,
+                maybe_frame = out_rx.recv() => match maybe_frame {
+                    Some(f) => f,
+                    None => break,
+                }
+            };
             let sz = frame.payload.len();
             queued_bytes_w.fetch_sub(sz, Ordering::AcqRel);
             if write_ipc_frame(&mut writer, &frame).await.is_err() {
+                conn_close_w.cancel();
                 break;
             }
         }
@@ -715,9 +809,13 @@ async fn handle_connection<H: DaemonHandler>(
         Arc::new(Mutex::new(HashMap::new()));
 
     loop {
-        let frame = match read_ipc_frame(&mut reader).await {
-            Ok(Some(f)) => f,
-            _ => break,
+        let frame = tokio::select! {
+            biased;
+            _ = conn_close.cancelled() => break,
+            res = read_ipc_frame(&mut reader) => match res {
+                Ok(Some(f)) => f,
+                _ => break,
+            }
         };
 
         if frame.opcode == IpcOpcode::Cancel {
@@ -735,13 +833,13 @@ async fn handle_connection<H: DaemonHandler>(
             let Ok(mode) = decode_drain_payload(&frame.payload) else {
                 break;
             };
+            let _ = shared.trigger_drain(DaemonExitReason::DrainRequested(mode));
             let reply = IpcFrame {
                 opcode: IpcOpcode::DrainAndShutdown,
                 request_id: frame.request_id,
                 payload: Vec::new(),
             };
-            let _ = out_tx.send(reply).await;
-            shared.trigger_drain(DaemonExitReason::DrainRequested(mode)).await;
+            let _ = tokio::time::timeout(Duration::from_millis(200), out_tx.send(reply)).await;
             break;
         }
 
@@ -760,7 +858,10 @@ async fn handle_connection<H: DaemonHandler>(
                 request_id: frame.request_id,
                 payload: encode_error_payload(503, true, "daemon_draining"),
             };
-            let _ = send_bounded(&out_tx, &queued_bytes, max_out_bytes, err_frame).await;
+            if !send_bounded(&out_tx, &queued_bytes, max_out_bytes, &conn_close, err_frame).await {
+                conn_close.cancel();
+                break;
+            }
             continue;
         }
 
@@ -778,7 +879,10 @@ async fn handle_connection<H: DaemonHandler>(
                     request_id: frame.request_id,
                     payload: encode_error_payload(429, true, "too_many_inflight_requests"),
                 };
-                if !send_bounded(&out_tx, &queued_bytes, max_out_bytes, err_frame).await {
+                if !send_bounded(&out_tx, &queued_bytes, max_out_bytes, &conn_close, err_frame)
+                    .await
+                {
+                    conn_close.cancel();
                     break;
                 }
                 continue;
@@ -790,6 +894,7 @@ async fn handle_connection<H: DaemonHandler>(
         let inflight_c = Arc::clone(&inflight);
         let out_tx_c = out_tx.clone();
         let queued_bytes_c = Arc::clone(&queued_bytes);
+        let conn_close_c = conn_close.clone();
         let req_id = frame.request_id;
         let op = frame.opcode;
         let payload = frame.payload;
@@ -814,7 +919,10 @@ async fn handle_connection<H: DaemonHandler>(
                     payload: encode_error_payload(code, retryable, &msg),
                 },
             };
-            let _ = send_bounded(&out_tx_c, &queued_bytes_c, max_out_bytes, reply).await;
+            if !send_bounded(&out_tx_c, &queued_bytes_c, max_out_bytes, &conn_close_c, reply).await
+            {
+                conn_close_c.cancel();
+            }
         });
     }
 
@@ -833,15 +941,29 @@ async fn send_bounded(
     tx: &mpsc::Sender<IpcFrame>,
     queued_bytes: &AtomicUsize,
     max_bytes: usize,
+    conn_close: &CancellationToken,
     frame: IpcFrame,
 ) -> bool {
     let sz = frame.payload.len();
-    let prev = queued_bytes.fetch_add(sz, Ordering::AcqRel);
-    if prev.saturating_add(sz) > max_bytes {
-        queued_bytes.fetch_sub(sz, Ordering::AcqRel);
-        return false;
+    let mut cur = queued_bytes.load(Ordering::Acquire);
+    loop {
+        let Some(next) = cur.checked_add(sz) else {
+            return false;
+        };
+        if next > max_bytes {
+            return false;
+        }
+        match queued_bytes.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
     }
-    if tx.send(frame).await.is_err() {
+    let sent = tokio::select! {
+        biased;
+        _ = conn_close.cancelled() => false,
+        res = tx.send(frame) => res.is_ok(),
+    };
+    if !sent {
         queued_bytes.fetch_sub(sz, Ordering::AcqRel);
         return false;
     }

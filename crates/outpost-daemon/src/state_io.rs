@@ -45,7 +45,7 @@ pub fn atomic_write_in_dir(dirfd: RawFd, name: &str, bytes: &[u8]) -> Result<(),
     let mut file_fd: Option<OwnedFd> = None;
 
     for _ in 0..16 {
-        let suffix = random_u32();
+        let suffix = random_u32()?;
         tmp_name = format!(".{name}.tmp.{suffix:08x}");
         let candidate_c = leaf_name_to_cstring(&tmp_name)?;
         let raw_fd = unsafe {
@@ -189,6 +189,28 @@ fn write_all_fd(fd: RawFd, mut data: &[u8]) -> Result<(), DaemonError> {
 }
 
 fn fsync_fd(fd: RawFd) -> Result<(), DaemonError> {
+    #[cfg(target_os = "macos")]
+    {
+        loop {
+            let rc = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
+            if rc == 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            let raw = err.raw_os_error();
+            if raw == Some(libc::ENOTSUP)
+                || raw == Some(libc::EINVAL)
+                || raw == Some(libc::ENOTTY)
+            {
+                break;
+            }
+            return Err(DaemonError::io("fcntl(F_FULLFSYNC)", err));
+        }
+    }
+
     loop {
         let rc = unsafe { libc::fsync(fd) };
         if rc == 0 {

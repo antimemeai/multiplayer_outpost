@@ -10,6 +10,9 @@
 //! - Mandatory peer allowlist enforced in `EndpointHooks` + accept loop before any
 //!   streams or datagrams are processed; `revoke_peer` immediately closes active
 //!   QUIC connections.
+//! - Deterministic simultaneous-dial glare tie-break (`4409 SUPERSEDED`):
+//!   opposite-direction healthy connections are resolved by smaller `EndpointId` initiator.
+//! - Strict byte-budgeted inbound & outbound queues with RAII semaphore permits.
 //! - 3-lane framing:
 //!   - Lane 0 (`Control`): Bidirectional Stream 0, `u32` LE length-prefixed, <= 64 KiB, priority 10.
 //!   - Lane 1 (`Causal`): Bidirectional Stream 4, `u32` LE length-prefixed, <= 4 MiB, priority 0.
@@ -27,7 +30,7 @@ use core::fmt;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -37,10 +40,8 @@ use iroh::endpoint::{
     ConnectingError, Connection, ConnectionError, EndpointHooks, Incoming, QuicTransportConfig,
     RecvStream, SendDatagramError, SendStream, VarInt, presets,
 };
-use iroh::{
-    Endpoint, EndpointAddr, EndpointId, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey,
-    TransportAddr,
-};
+pub use iroh::{Endpoint, EndpointAddr, Watcher};
+use iroh::{EndpointId, PublicKey, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use mp_protocol::{
     DirectAddr, EndpointDescriptor, MAX_DIRECT_ADDRS, MAX_RELAY_URL_BYTES, RelayPolicy,
     TransportKind,
@@ -49,7 +50,7 @@ use outpost_core::p2p_wire::{
     P2pLane, P2pPartyFrame, P2pWireError, decode_p2p_party_frame, encode_p2p_party_frame,
 };
 use outpost_core::trust::effective_relay_policy;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use url::Url;
 
@@ -74,10 +75,17 @@ const SEND_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(2);
 
 const LANE_CHANNEL_CAPACITY: usize = 256;
+const LIFECYCLE_EVENT_CAPACITY: usize = 1024;
 const CONTROL_EVENT_CAPACITY: usize = 1024;
 const CAUSAL_EVENT_CAPACITY: usize = 2048;
 const EPHEMERAL_EVENT_CAPACITY: usize = 512;
 const MAX_CONCURRENT_INBOUND_HANDSHAKES: usize = 64;
+
+const INBOUND_CONTROL_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+const INBOUND_CAUSAL_BYTE_BUDGET: usize = 16 * 1024 * 1024;
+const INBOUND_EPHEMERAL_BYTE_BUDGET: usize = 512 * 1024;
+const OUTBOUND_CONTROL_BYTE_BUDGET: usize = 1024 * 1024;
+const OUTBOUND_CAUSAL_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct PartyP2pConfig {
@@ -148,16 +156,31 @@ impl fmt::Display for P2pError {
 
 impl std::error::Error for P2pError {}
 
+struct BudgetedEvent {
+    event: P2pTransportEvent,
+    _permit: OwnedSemaphorePermit,
+}
+
+struct BudgetedFrame {
+    payload: Bytes,
+    _permit: OwnedSemaphorePermit,
+}
+
 struct ActivePeer {
     conn_id: u64,
+    is_outbound: bool,
     conn: Connection,
-    control_tx: mpsc::Sender<Bytes>,
-    causal_tx: mpsc::Sender<Bytes>,
+    control_tx: mpsc::Sender<BudgetedFrame>,
+    control_budget: Arc<Semaphore>,
+    causal_tx: mpsc::Sender<BudgetedFrame>,
+    causal_budget: Arc<Semaphore>,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl ActivePeer {
-    fn abort_tasks(&mut self) {
+    fn shutdown(&mut self) {
+        self.control_budget.close();
+        self.causal_budget.close();
         for task in self.tasks.drain(..) {
             task.abort();
         }
@@ -165,17 +188,22 @@ impl ActivePeer {
 }
 
 struct SharedState {
+    local_id: EndpointId,
     relay_policy: RelayPolicy,
     pinned_relay_url: Option<RelayUrl>,
     pinned_relay_url_str: Option<String>,
     allowed_peers: RwLock<HashSet<EndpointId>>,
     peers: RwLock<HashMap<EndpointId, ActivePeer>>,
     next_conn_id: AtomicU64,
-    closed: AtomicBool,
-    lifecycle_tx: mpsc::UnboundedSender<P2pTransportEvent>,
-    control_tx: mpsc::Sender<P2pTransportEvent>,
-    causal_tx: mpsc::Sender<P2pTransportEvent>,
-    ephemeral_tx: mpsc::Sender<P2pTransportEvent>,
+    closed: Arc<AtomicBool>,
+    closed_notify: Arc<Notify>,
+    lifecycle_tx: mpsc::Sender<P2pTransportEvent>,
+    control_tx: mpsc::Sender<BudgetedEvent>,
+    control_budget: Arc<Semaphore>,
+    causal_tx: mpsc::Sender<BudgetedEvent>,
+    causal_budget: Arc<Semaphore>,
+    ephemeral_tx: mpsc::Sender<BudgetedEvent>,
+    ephemeral_budget: Arc<Semaphore>,
 }
 
 impl SharedState {
@@ -210,11 +238,11 @@ impl SharedState {
         };
         if let Some(mut peer) = removed {
             peer.conn.close(VarInt::from_u32(close_code), reason);
-            peer.abort_tasks();
+            peer.shutdown();
             if emit_disconnect {
                 let _ = self
                     .lifecycle_tx
-                    .send(P2pTransportEvent::PeerDisconnected {
+                    .try_send(P2pTransportEvent::PeerDisconnected {
                         peer_pubkey: *peer_id.as_bytes(),
                         reason_code: close_code,
                     });
@@ -282,130 +310,18 @@ impl EndpointHooks for AllowlistHooks {
     }
 }
 
-pub struct PartyP2pTransport {
+/// Concurrent, `Arc`-shareable control & send handle for an active per-party P2P endpoint.
+///
+/// All methods take `&self`, allowing concurrent per-peer dialing, sending, allowlist updates,
+/// revocation, and roaming observation without head-of-line blocking or event-loop deadlocks.
+pub struct PartyP2pHandle {
     local_device_id: u64,
     endpoint: Endpoint,
     shared: Arc<SharedState>,
-    accept_task: Option<JoinHandle<()>>,
-    lifecycle_rx: mpsc::UnboundedReceiver<P2pTransportEvent>,
-    control_rx: mpsc::Receiver<P2pTransportEvent>,
-    causal_rx: mpsc::Receiver<P2pTransportEvent>,
-    ephemeral_rx: mpsc::Receiver<P2pTransportEvent>,
+    accept_task: Mutex<Option<JoinHandle<()>>>,
 }
 
-impl PartyP2pTransport {
-    pub async fn spawn(config: PartyP2pConfig) -> Result<Self, P2pError> {
-        let raw_relay = config
-            .pinned_relay_url
-            .as_deref()
-            .filter(|s| !s.is_empty());
-
-        let parsed_relay = match (config.effective_relay_policy, raw_relay) {
-            (RelayPolicy::ForceRelays, None) => {
-                return Err(P2pError::PolicyViolation(
-                    "force_relays requires a valid https:// pinned_relay_url".into(),
-                ));
-            }
-            (RelayPolicy::ForceRelays, Some(raw)) => Some(validate_relay_url(raw)?),
-            (RelayPolicy::AllowRelays, Some(raw)) => Some(validate_relay_url(raw)?),
-            (RelayPolicy::AllowRelays, None) => None,
-            (RelayPolicy::NoRelays, Some(_)) => {
-                return Err(P2pError::PolicyViolation(
-                    "no_relays forbids pinned_relay_url".into(),
-                ));
-            }
-            (RelayPolicy::NoRelays, None) => None,
-        };
-
-        let (pinned_relay_url, pinned_relay_url_str) = match parsed_relay {
-            Some((url, canonical)) => (Some(url), Some(canonical)),
-            None => (None, None),
-        };
-
-        let secret_key = SecretKey::from_bytes(&config.device_secret);
-
-        let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
-        let (control_tx, control_rx) = mpsc::channel(CONTROL_EVENT_CAPACITY);
-        let (causal_tx, causal_rx) = mpsc::channel(CAUSAL_EVENT_CAPACITY);
-        let (ephemeral_tx, ephemeral_rx) = mpsc::channel(EPHEMERAL_EVENT_CAPACITY);
-
-        let shared = Arc::new(SharedState {
-            relay_policy: config.effective_relay_policy,
-            pinned_relay_url: pinned_relay_url.clone(),
-            pinned_relay_url_str,
-            allowed_peers: RwLock::new(HashSet::new()),
-            peers: RwLock::new(HashMap::new()),
-            next_conn_id: AtomicU64::new(0),
-            closed: AtomicBool::new(false),
-            lifecycle_tx,
-            control_tx,
-            causal_tx,
-            ephemeral_tx,
-        });
-
-        let hooks = AllowlistHooks {
-            shared: Arc::clone(&shared),
-        };
-
-        let mut transport_cfg = QuicTransportConfig::builder()
-            .max_concurrent_bidi_streams(VarInt::from_u32(2))
-            .max_concurrent_uni_streams(VarInt::from_u32(0))
-            .datagram_receive_buffer_size(Some(65_536))
-            .datagram_send_buffer_size(65_536)
-            .allow_spin(false)
-            .keep_alive_interval(Duration::from_secs(5));
-        if let Ok(idle) = Duration::from_secs(30).try_into() {
-            transport_cfg = transport_cfg.max_idle_timeout(Some(idle));
-        }
-
-        let mut builder = Endpoint::builder(presets::Minimal)
-            .secret_key(secret_key)
-            .alpns(vec![ALPN.to_vec()])
-            .max_tls_tickets(0)
-            .transport_config(transport_cfg.build())
-            .hooks(hooks);
-
-        builder = match config.effective_relay_policy {
-            RelayPolicy::ForceRelays => {
-                let Some(url) = pinned_relay_url else {
-                    return Err(P2pError::PolicyViolation(
-                        "force_relays requires pinned_relay_url".into(),
-                    ));
-                };
-                builder
-                    .clear_ip_transports()
-                    .addr_filter(AddrFilter::relay_only())
-                    .relay_mode(RelayMode::Custom(RelayMap::from(url)))
-            }
-            RelayPolicy::NoRelays => builder.relay_mode(RelayMode::Disabled),
-            RelayPolicy::AllowRelays => {
-                if let Some(url) = pinned_relay_url {
-                    builder.relay_mode(RelayMode::Custom(RelayMap::from(url)))
-                } else {
-                    builder.relay_mode(RelayMode::Disabled)
-                }
-            }
-        };
-
-        let endpoint = builder
-            .bind()
-            .await
-            .map_err(|e| P2pError::Transport(e.to_string()))?;
-
-        let accept_task = tokio::spawn(accept_loop(endpoint.clone(), Arc::clone(&shared)));
-
-        Ok(Self {
-            local_device_id: config.local_device_id,
-            endpoint,
-            shared,
-            accept_task: Some(accept_task),
-            lifecycle_rx,
-            control_rx,
-            causal_rx,
-            ephemeral_rx,
-        })
-    }
-
+impl PartyP2pHandle {
     pub fn local_pubkey(&self) -> [u8; 32] {
         *self.endpoint.id().as_bytes()
     }
@@ -416,6 +332,26 @@ impl PartyP2pTransport {
 
     pub fn effective_relay_policy(&self) -> RelayPolicy {
         self.shared.relay_policy
+    }
+
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// Awaits `iroh::Endpoint::online()` bounded by `timeout`.
+    /// No-op under `RelayPolicy::NoRelays` (or when no relay is configured).
+    pub async fn wait_online(&self, timeout: Duration) {
+        if self.shared.relay_policy == RelayPolicy::NoRelays
+            || self.shared.pinned_relay_url.is_none()
+        {
+            return;
+        }
+        let _ = tokio::time::timeout(timeout, self.endpoint.online()).await;
+    }
+
+    /// Returns a watcher yielding updates whenever the local `EndpointAddr` changes (roaming).
+    pub fn watch_addr(&self) -> impl Watcher<Value = EndpointAddr> + use<> {
+        self.endpoint.watch_addr()
     }
 
     pub fn is_peer_connected(&self, pubkey: &[u8; 32]) -> bool {
@@ -487,7 +423,19 @@ impl PartyP2pTransport {
         }
     }
 
+    /// Replaces the peer allowlist, disconnecting removed peers with `CLOSE_PEER_REVOKED (4403)`.
     pub fn set_allowed_peers(&self, pubkeys: HashSet<[u8; 32]>) {
+        self.set_allowed_peers_with_close_code(pubkeys, CLOSE_PEER_REVOKED);
+    }
+
+    /// Replaces the peer allowlist, disconnecting removed peers with the supplied QUIC
+    /// application close code (e.g. `CLOSE_UNAUTHORIZED (4401)` for temporary lease/churn
+    /// suspension or `CLOSE_PEER_REVOKED (4403)` for explicit revocation).
+    pub fn set_allowed_peers_with_close_code(
+        &self,
+        pubkeys: HashSet<[u8; 32]>,
+        close_code: u32,
+    ) {
         if self.shared.closed.load(Ordering::Acquire) {
             return;
         }
@@ -521,7 +469,7 @@ impl PartyP2pTransport {
             self.shared.close_and_remove_peer(
                 &peer_id,
                 None,
-                CLOSE_PEER_REVOKED,
+                close_code,
                 b"peer_removed_from_allowlist",
                 true,
             );
@@ -706,6 +654,13 @@ impl PartyP2pTransport {
         let (control_send, control_recv, causal_send, causal_recv) = match setup {
             Ok(Ok(streams)) => streams,
             Ok(Err(err)) => {
+                // If the remote closed our losing glare dial with 4409 SUPERSEDED and we
+                // already hold a live connection to `peer_id`, treat connect_peer as succeeded.
+                if is_superseded_close(&conn.close_reason())
+                    && self.is_peer_connected(&target.device_pubkey)
+                {
+                    return Ok(());
+                }
                 if conn.close_reason().is_none() {
                     conn.close(
                         VarInt::from_u32(CLOSE_PROTOCOL_VIOLATION),
@@ -728,6 +683,7 @@ impl PartyP2pTransport {
         register_active_peer(
             &self.shared,
             peer_id,
+            true,
             conn,
             control_send,
             control_recv,
@@ -760,7 +716,7 @@ impl PartyP2pTransport {
         }
 
         enum SendHandle {
-            Stream(mpsc::Sender<Bytes>),
+            Stream(mpsc::Sender<BudgetedFrame>, Arc<Semaphore>),
             Datagram(Connection),
         }
 
@@ -777,18 +733,34 @@ impl PartyP2pTransport {
                 return Err(P2pError::PeerNotConnected);
             }
             match lane {
-                P2pLane::Control => SendHandle::Stream(active.control_tx.clone()),
-                P2pLane::Causal => SendHandle::Stream(active.causal_tx.clone()),
+                P2pLane::Control => {
+                    SendHandle::Stream(active.control_tx.clone(), Arc::clone(&active.control_budget))
+                }
+                P2pLane::Causal => {
+                    SendHandle::Stream(active.causal_tx.clone(), Arc::clone(&active.causal_budget))
+                }
                 P2pLane::Ephemeral => SendHandle::Datagram(active.conn.clone()),
             }
         };
 
         let payload = Bytes::from(encoded);
         match handle {
-            SendHandle::Stream(tx) => {
-                match tokio::time::timeout(SEND_QUEUE_TIMEOUT, tx.send(payload)).await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(_)) => Err(P2pError::PeerNotConnected),
+            SendHandle::Stream(tx, budget) => {
+                let units = byte_budget_units(payload.len());
+                let send_fut = async {
+                    let permit = budget
+                        .acquire_many_owned(units)
+                        .await
+                        .map_err(|_| P2pError::PeerNotConnected)?;
+                    tx.send(BudgetedFrame {
+                        payload,
+                        _permit: permit,
+                    })
+                    .await
+                    .map_err(|_| P2pError::PeerNotConnected)
+                };
+                match tokio::time::timeout(SEND_QUEUE_TIMEOUT, send_fut).await {
+                    Ok(res) => res,
                     Err(_) => Err(P2pError::Timeout),
                 }
             }
@@ -800,57 +772,20 @@ impl PartyP2pTransport {
         }
     }
 
-    /// Receives the next transport event using a biased select that strictly prioritizes
-    /// Lifecycle and Control (Lane 0) events ahead of Causal (Lane 1) and Ephemeral (Lane 2).
-    pub async fn recv_event(&mut self) -> Option<P2pTransportEvent> {
-        let mut lifecycle_open = true;
-        let mut control_open = true;
-        let mut causal_open = true;
-        let mut ephemeral_open = true;
-
-        loop {
-            if !lifecycle_open && !control_open && !causal_open && !ephemeral_open {
-                return None;
-            }
-            tokio::select! {
-                biased;
-                ev = self.lifecycle_rx.recv(), if lifecycle_open => {
-                    match ev {
-                        Some(event) => return Some(event),
-                        None => lifecycle_open = false,
-                    }
-                }
-                ev = self.control_rx.recv(), if control_open => {
-                    match ev {
-                        Some(event) => return Some(event),
-                        None => control_open = false,
-                    }
-                }
-                ev = self.causal_rx.recv(), if causal_open => {
-                    match ev {
-                        Some(event) => return Some(event),
-                        None => causal_open = false,
-                    }
-                }
-                ev = self.ephemeral_rx.recv(), if ephemeral_open => {
-                    match ev {
-                        Some(event) => return Some(event),
-                        None => ephemeral_open = false,
-                    }
-                }
-            }
-        }
-    }
-
-    pub async fn close(mut self) {
+    pub async fn close(&self) {
         self.shutdown_peers_and_tasks();
         let _ = tokio::time::timeout(CLOSE_ENDPOINT_TIMEOUT, self.endpoint.close()).await;
     }
 
-    fn shutdown_peers_and_tasks(&mut self) {
+    fn shutdown_peers_and_tasks(&self) {
         if self.shared.closed.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.shared.control_budget.close();
+        self.shared.causal_budget.close();
+        self.shared.ephemeral_budget.close();
+        self.shared.closed_notify.notify_waiters();
+
         let drained: Vec<ActivePeer> = {
             let mut peers = self
                 .shared
@@ -862,18 +797,348 @@ impl PartyP2pTransport {
         for mut peer in drained {
             peer.conn
                 .close(VarInt::from_u32(CLOSE_SHUTDOWN), b"endpoint_shutdown");
-            peer.abort_tasks();
+            peer.shutdown();
         }
-        if let Some(task) = self.accept_task.take() {
+        let task = {
+            let mut guard = self
+                .accept_task
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            guard.take()
+        };
+        if let Some(task) = task {
             task.abort();
         }
     }
 }
 
-impl Drop for PartyP2pTransport {
+impl Drop for PartyP2pHandle {
     fn drop(&mut self) {
         self.shutdown_peers_and_tasks();
     }
+}
+
+/// Dedicated inbound event receiver stream returned by [`PartyP2pTransport::split`].
+pub struct P2pEventStream {
+    closed: Arc<AtomicBool>,
+    closed_notify: Arc<Notify>,
+    lifecycle_rx: mpsc::Receiver<P2pTransportEvent>,
+    control_rx: mpsc::Receiver<BudgetedEvent>,
+    causal_rx: mpsc::Receiver<BudgetedEvent>,
+    ephemeral_rx: mpsc::Receiver<BudgetedEvent>,
+}
+
+impl P2pEventStream {
+    fn try_recv_prioritized(&mut self) -> Option<P2pTransportEvent> {
+        if let Ok(ev) = self.lifecycle_rx.try_recv() {
+            return Some(ev);
+        }
+        if let Ok(ev) = self.control_rx.try_recv() {
+            return Some(ev.event);
+        }
+        if let Ok(ev) = self.causal_rx.try_recv() {
+            return Some(ev.event);
+        }
+        if let Ok(ev) = self.ephemeral_rx.try_recv() {
+            return Some(ev.event);
+        }
+        None
+    }
+
+    /// Receives the next transport event using a biased select that strictly prioritizes
+    /// Lifecycle and Control (Lane 0) events ahead of Causal (Lane 1) and Ephemeral (Lane 2).
+    pub async fn recv_event(&mut self) -> Option<P2pTransportEvent> {
+        let mut lifecycle_open = true;
+        let mut control_open = true;
+        let mut causal_open = true;
+        let mut ephemeral_open = true;
+
+        loop {
+            if let Some(ev) = self.try_recv_prioritized() {
+                return Some(ev);
+            }
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            if !lifecycle_open && !control_open && !causal_open && !ephemeral_open {
+                return None;
+            }
+
+            let closed_notify = Arc::clone(&self.closed_notify);
+            let notified = closed_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            // Re-check closed flag after registering notification to avoid lost wakeups.
+            if self.closed.load(Ordering::Acquire) {
+                return self.try_recv_prioritized();
+            }
+
+            tokio::select! {
+                biased;
+                ev = self.lifecycle_rx.recv(), if lifecycle_open => {
+                    match ev {
+                        Some(event) => return Some(event),
+                        None => lifecycle_open = false,
+                    }
+                }
+                ev = self.control_rx.recv(), if control_open => {
+                    match ev {
+                        Some(budgeted) => return Some(budgeted.event),
+                        None => control_open = false,
+                    }
+                }
+                ev = self.causal_rx.recv(), if causal_open => {
+                    match ev {
+                        Some(budgeted) => return Some(budgeted.event),
+                        None => causal_open = false,
+                    }
+                }
+                ev = self.ephemeral_rx.recv(), if ephemeral_open => {
+                    match ev {
+                        Some(budgeted) => return Some(budgeted.event),
+                        None => ephemeral_open = false,
+                    }
+                }
+                () = &mut notified => {
+                    // Loop back to drain any buffered events before returning None.
+                }
+            }
+        }
+    }
+}
+
+pub struct PartyP2pTransport {
+    local_device_id: u64,
+    handle: Arc<PartyP2pHandle>,
+    events: P2pEventStream,
+}
+
+impl PartyP2pTransport {
+    pub async fn spawn(config: PartyP2pConfig) -> Result<Self, P2pError> {
+        let raw_relay = config
+            .pinned_relay_url
+            .as_deref()
+            .filter(|s| !s.is_empty());
+
+        let parsed_relay = match (config.effective_relay_policy, raw_relay) {
+            (RelayPolicy::ForceRelays, None) => {
+                return Err(P2pError::PolicyViolation(
+                    "force_relays requires a valid https:// pinned_relay_url".into(),
+                ));
+            }
+            (RelayPolicy::ForceRelays, Some(raw)) => Some(validate_relay_url(raw)?),
+            (RelayPolicy::AllowRelays, Some(raw)) => Some(validate_relay_url(raw)?),
+            (RelayPolicy::AllowRelays, None) => None,
+            (RelayPolicy::NoRelays, Some(_)) => {
+                return Err(P2pError::PolicyViolation(
+                    "no_relays forbids pinned_relay_url".into(),
+                ));
+            }
+            (RelayPolicy::NoRelays, None) => None,
+        };
+
+        let (pinned_relay_url, pinned_relay_url_str) = match parsed_relay {
+            Some((url, canonical)) => (Some(url), Some(canonical)),
+            None => (None, None),
+        };
+
+        let secret_key = SecretKey::from_bytes(&config.device_secret);
+        let local_id = secret_key.public();
+
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(LIFECYCLE_EVENT_CAPACITY);
+        let (control_tx, control_rx) = mpsc::channel(CONTROL_EVENT_CAPACITY);
+        let (causal_tx, causal_rx) = mpsc::channel(CAUSAL_EVENT_CAPACITY);
+        let (ephemeral_tx, ephemeral_rx) = mpsc::channel(EPHEMERAL_EVENT_CAPACITY);
+
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_notify = Arc::new(Notify::new());
+
+        let shared = Arc::new(SharedState {
+            local_id,
+            relay_policy: config.effective_relay_policy,
+            pinned_relay_url: pinned_relay_url.clone(),
+            pinned_relay_url_str,
+            allowed_peers: RwLock::new(HashSet::new()),
+            peers: RwLock::new(HashMap::new()),
+            next_conn_id: AtomicU64::new(0),
+            closed: Arc::clone(&closed),
+            closed_notify: Arc::clone(&closed_notify),
+            lifecycle_tx,
+            control_tx,
+            control_budget: Arc::new(Semaphore::new(INBOUND_CONTROL_BYTE_BUDGET)),
+            causal_tx,
+            causal_budget: Arc::new(Semaphore::new(INBOUND_CAUSAL_BYTE_BUDGET)),
+            ephemeral_tx,
+            ephemeral_budget: Arc::new(Semaphore::new(INBOUND_EPHEMERAL_BYTE_BUDGET)),
+        });
+
+        let hooks = AllowlistHooks {
+            shared: Arc::clone(&shared),
+        };
+
+        let mut transport_cfg = QuicTransportConfig::builder()
+            .max_concurrent_bidi_streams(VarInt::from_u32(2))
+            .max_concurrent_uni_streams(VarInt::from_u32(0))
+            .datagram_receive_buffer_size(Some(65_536))
+            .datagram_send_buffer_size(65_536)
+            .allow_spin(false)
+            .keep_alive_interval(Duration::from_secs(5));
+        if let Ok(idle) = Duration::from_secs(30).try_into() {
+            transport_cfg = transport_cfg.max_idle_timeout(Some(idle));
+        }
+
+        let mut builder = Endpoint::builder(presets::Minimal)
+            .secret_key(secret_key)
+            .alpns(vec![ALPN.to_vec()])
+            .max_tls_tickets(0)
+            .transport_config(transport_cfg.build())
+            .hooks(hooks);
+
+        builder = match config.effective_relay_policy {
+            RelayPolicy::ForceRelays => {
+                let Some(url) = pinned_relay_url else {
+                    return Err(P2pError::PolicyViolation(
+                        "force_relays requires pinned_relay_url".into(),
+                    ));
+                };
+                builder
+                    .clear_ip_transports()
+                    .addr_filter(AddrFilter::relay_only())
+                    .relay_mode(RelayMode::Custom(RelayMap::from(url)))
+            }
+            RelayPolicy::NoRelays => builder.relay_mode(RelayMode::Disabled),
+            RelayPolicy::AllowRelays => {
+                if let Some(url) = pinned_relay_url {
+                    builder.relay_mode(RelayMode::Custom(RelayMap::from(url)))
+                } else {
+                    builder.relay_mode(RelayMode::Disabled)
+                }
+            }
+        };
+
+        let endpoint = builder
+            .bind()
+            .await
+            .map_err(|e| P2pError::Transport(e.to_string()))?;
+
+        let accept_task = tokio::spawn(accept_loop(endpoint.clone(), Arc::clone(&shared)));
+
+        let handle = Arc::new(PartyP2pHandle {
+            local_device_id: config.local_device_id,
+            endpoint,
+            shared,
+            accept_task: Mutex::new(Some(accept_task)),
+        });
+
+        let events = P2pEventStream {
+            closed,
+            closed_notify,
+            lifecycle_rx,
+            control_rx,
+            causal_rx,
+            ephemeral_rx,
+        };
+
+        Ok(Self {
+            local_device_id: config.local_device_id,
+            handle,
+            events,
+        })
+    }
+
+    /// Splits this transport into a concurrently shareable [`Arc<PartyP2pHandle>`] and a
+    /// dedicated [`P2pEventStream`].
+    pub fn split(self) -> (Arc<PartyP2pHandle>, P2pEventStream) {
+        (self.handle, self.events)
+    }
+
+    /// Returns a cloned [`Arc<PartyP2pHandle>`] for concurrent control/send operations.
+    pub fn handle(&self) -> Arc<PartyP2pHandle> {
+        Arc::clone(&self.handle)
+    }
+
+    pub fn local_pubkey(&self) -> [u8; 32] {
+        self.handle.local_pubkey()
+    }
+
+    pub const fn local_device_id(&self) -> u64 {
+        self.local_device_id
+    }
+
+    pub fn effective_relay_policy(&self) -> RelayPolicy {
+        self.handle.effective_relay_policy()
+    }
+
+    pub fn endpoint(&self) -> &Endpoint {
+        self.handle.endpoint()
+    }
+
+    pub async fn wait_online(&self, timeout: Duration) {
+        self.handle.wait_online(timeout).await;
+    }
+
+    pub fn watch_addr(&self) -> impl Watcher<Value = EndpointAddr> + use<> {
+        self.handle.watch_addr()
+    }
+
+    pub fn is_peer_connected(&self, pubkey: &[u8; 32]) -> bool {
+        self.handle.is_peer_connected(pubkey)
+    }
+
+    pub fn local_endpoint_descriptor(&self) -> EndpointDescriptor {
+        self.handle.local_endpoint_descriptor()
+    }
+
+    pub fn set_allowed_peers(&self, pubkeys: HashSet<[u8; 32]>) {
+        self.handle.set_allowed_peers(pubkeys);
+    }
+
+    pub fn set_allowed_peers_with_close_code(
+        &self,
+        pubkeys: HashSet<[u8; 32]>,
+        close_code: u32,
+    ) {
+        self.handle
+            .set_allowed_peers_with_close_code(pubkeys, close_code);
+    }
+
+    pub fn revoke_peer(&self, pubkey: [u8; 32], close_code: u32) {
+        self.handle.revoke_peer(pubkey, close_code);
+    }
+
+    pub async fn connect_peer(&self, target: PeerDialTarget) -> Result<(), P2pError> {
+        self.handle.connect_peer(target).await
+    }
+
+    pub async fn send_frame(
+        &self,
+        peer_pubkey: [u8; 32],
+        frame: &P2pPartyFrame,
+    ) -> Result<(), P2pError> {
+        self.handle.send_frame(peer_pubkey, frame).await
+    }
+
+    /// Receives the next transport event using a biased select that strictly prioritizes
+    /// Lifecycle and Control (Lane 0) events ahead of Causal (Lane 1) and Ephemeral (Lane 2).
+    pub async fn recv_event(&mut self) -> Option<P2pTransportEvent> {
+        self.events.recv_event().await
+    }
+
+    pub async fn close(self) {
+        self.handle.close().await;
+    }
+}
+
+fn byte_budget_units(byte_len: usize) -> u32 {
+    u32::try_from(byte_len.max(1)).unwrap_or(u32::MAX)
+}
+
+fn is_superseded_close(reason: &Option<ConnectionError>) -> bool {
+    matches!(
+        reason,
+        Some(ConnectionError::ApplicationClosed(app))
+            if app.error_code.into_inner() == u64::from(CLOSE_SUPERSEDED)
+    )
 }
 
 fn validate_relay_url(raw: &str) -> Result<(RelayUrl, String), P2pError> {
@@ -1025,11 +1290,12 @@ fn wire_error_close_code(err: P2pWireError) -> u32 {
 
 async fn write_framed_stream(
     mut send: SendStream,
-    mut rx: mpsc::Receiver<Bytes>,
+    mut rx: mpsc::Receiver<BudgetedFrame>,
     conn: Connection,
     shared: Arc<SharedState>,
 ) {
-    while let Some(payload) = rx.recv().await {
+    while let Some(budgeted) = rx.recv().await {
+        let payload = budgeted.payload;
         let Ok(len_u32) = u32::try_from(payload.len()) else {
             conn.close(VarInt::from_u32(CLOSE_FRAME_TOO_LARGE), b"frame_too_large");
             return;
@@ -1045,6 +1311,7 @@ async fn write_framed_stream(
             }
             return;
         }
+        drop(budgeted._permit);
     }
     let _ = send.finish();
 }
@@ -1102,9 +1369,40 @@ async fn read_framed_stream(
             lane,
             frame,
         };
+        let units = byte_budget_units(len);
         let send_res = match lane {
-            P2pLane::Control => shared.control_tx.send(event).await.is_ok(),
-            P2pLane::Causal => shared.causal_tx.send(event).await.is_ok(),
+            P2pLane::Control => {
+                let Ok(permit) = Arc::clone(&shared.control_budget)
+                    .acquire_many_owned(units)
+                    .await
+                else {
+                    return;
+                };
+                shared
+                    .control_tx
+                    .send(BudgetedEvent {
+                        event,
+                        _permit: permit,
+                    })
+                    .await
+                    .is_ok()
+            }
+            P2pLane::Causal => {
+                let Ok(permit) = Arc::clone(&shared.causal_budget)
+                    .acquire_many_owned(units)
+                    .await
+                else {
+                    return;
+                };
+                shared
+                    .causal_tx
+                    .send(BudgetedEvent {
+                        event,
+                        _permit: permit,
+                    })
+                    .await
+                    .is_ok()
+            }
             P2pLane::Ephemeral => true,
         };
         if !send_res {
@@ -1119,40 +1417,39 @@ async fn read_datagram_loop(peer_id: EndpointId, conn: Connection, shared: Arc<S
         let Ok(dgram) = conn.read_datagram().await else {
             return;
         };
-        if dgram.len() > max_bytes {
-            conn.close(
-                VarInt::from_u32(CLOSE_FRAME_TOO_LARGE),
-                b"datagram_too_large",
-            );
-            return;
-        }
         if !shared.is_allowed(&peer_id) {
             conn.close(VarInt::from_u32(CLOSE_PEER_REVOKED), b"peer_revoked");
             return;
         }
-        let frame = match decode_p2p_party_frame(P2pLane::Ephemeral, &dgram) {
-            Ok(frame) => frame,
-            Err(err) => {
-                conn.close(
-                    VarInt::from_u32(wire_error_close_code(err)),
-                    b"invalid_datagram_frame",
-                );
-                return;
-            }
+        if dgram.len() > max_bytes {
+            // Drop oversized unreliable datagram cleanly without closing the QUIC connection.
+            continue;
+        }
+        let Ok(frame) = decode_p2p_party_frame(P2pLane::Ephemeral, &dgram) else {
+            // Drop malformed unreliable datagram cleanly without closing the QUIC connection.
+            continue;
         };
-        let _ = shared
-            .ephemeral_tx
-            .try_send(P2pTransportEvent::FrameReceived {
+        let units = byte_budget_units(dgram.len());
+        let Ok(permit) = Arc::clone(&shared.ephemeral_budget).try_acquire_many_owned(units) else {
+            // Drop datagram when ephemeral byte budget is saturated; never block!
+            continue;
+        };
+        let _ = shared.ephemeral_tx.try_send(BudgetedEvent {
+            event: P2pTransportEvent::FrameReceived {
                 peer_pubkey: *peer_id.as_bytes(),
                 lane: P2pLane::Ephemeral,
                 frame,
-            });
+            },
+            _permit: permit,
+        });
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_active_peer(
     shared: &Arc<SharedState>,
     peer_id: EndpointId,
+    is_outbound: bool,
     conn: Connection,
     control_send: SendStream,
     control_recv: RecvStream,
@@ -1168,70 +1465,92 @@ fn register_active_peer(
         return Err(P2pError::PeerNotAllowed);
     }
 
-    let conn_id = shared.next_conn_id.fetch_add(1, Ordering::Relaxed) + 1;
-    let (control_tx, control_rx) = mpsc::channel(LANE_CHANNEL_CAPACITY);
-    let (causal_tx, causal_rx) = mpsc::channel(LANE_CHANNEL_CAPACITY);
-
-    let t_ctrl_w = tokio::spawn(write_framed_stream(
-        control_send,
-        control_rx,
-        conn.clone(),
-        Arc::clone(shared),
-    ));
-    let t_caus_w = tokio::spawn(write_framed_stream(
-        causal_send,
-        causal_rx,
-        conn.clone(),
-        Arc::clone(shared),
-    ));
-    let t_ctrl_r = tokio::spawn(read_framed_stream(
-        control_recv,
-        P2pLane::Control,
-        peer_id,
-        conn.clone(),
-        Arc::clone(shared),
-    ));
-    let t_caus_r = tokio::spawn(read_framed_stream(
-        causal_recv,
-        P2pLane::Causal,
-        peer_id,
-        conn.clone(),
-        Arc::clone(shared),
-    ));
-    let t_dgram_r = tokio::spawn(read_datagram_loop(
-        peer_id,
-        conn.clone(),
-        Arc::clone(shared),
-    ));
-
-    let watcher_shared = Arc::clone(shared);
-    let watcher_conn = conn.clone();
-    let t_watcher = tokio::spawn(async move {
-        let err = watcher_conn.closed().await;
-        let code = close_reason_code(&err);
-        watcher_shared.close_and_remove_peer(&peer_id, Some(conn_id), code, b"closed", true);
-    });
-
-    let active = ActivePeer {
-        conn_id,
-        conn,
-        control_tx,
-        causal_tx,
-        tasks: vec![
-            t_ctrl_w, t_caus_w, t_ctrl_r, t_caus_r, t_dgram_r, t_watcher,
-        ],
-    };
-
     let old = {
         let mut peers = shared.peers.write().unwrap_or_else(PoisonError::into_inner);
-        if !shared.is_allowed(&peer_id) || shared.closed.load(Ordering::Acquire) {
-            let mut dropped = active;
-            dropped
-                .conn
-                .close(VarInt::from_u32(CLOSE_PEER_REVOKED), b"peer_revoked");
-            dropped.abort_tasks();
+        if shared.closed.load(Ordering::Acquire) {
+            drop(peers);
+            conn.close(VarInt::from_u32(CLOSE_SHUTDOWN), b"endpoint_closed");
+            return Err(P2pError::Closed);
+        }
+        if !shared.is_allowed(&peer_id) {
+            drop(peers);
+            conn.close(VarInt::from_u32(CLOSE_PEER_REVOKED), b"peer_revoked");
             return Err(P2pError::PeerNotAllowed);
         }
+
+        // Deterministic simultaneous-dial glare tie-break on healthy opposite-direction connections:
+        // the connection initiated by the lexicographically smaller EndpointId wins.
+        if let Some(existing) = peers.get(&peer_id)
+            && existing.conn.close_reason().is_none()
+            && existing.is_outbound != is_outbound
+        {
+            let keep_outbound = shared.local_id.as_bytes() < peer_id.as_bytes();
+            if existing.is_outbound == keep_outbound {
+                drop(peers);
+                conn.close(VarInt::from_u32(CLOSE_SUPERSEDED), b"superseded");
+                return Ok(());
+            }
+        }
+
+        let conn_id = shared.next_conn_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let (control_tx, control_rx) = mpsc::channel(LANE_CHANNEL_CAPACITY);
+        let (causal_tx, causal_rx) = mpsc::channel(LANE_CHANNEL_CAPACITY);
+        let control_budget = Arc::new(Semaphore::new(OUTBOUND_CONTROL_BYTE_BUDGET));
+        let causal_budget = Arc::new(Semaphore::new(OUTBOUND_CAUSAL_BYTE_BUDGET));
+
+        let t_ctrl_w = tokio::spawn(write_framed_stream(
+            control_send,
+            control_rx,
+            conn.clone(),
+            Arc::clone(shared),
+        ));
+        let t_caus_w = tokio::spawn(write_framed_stream(
+            causal_send,
+            causal_rx,
+            conn.clone(),
+            Arc::clone(shared),
+        ));
+        let t_ctrl_r = tokio::spawn(read_framed_stream(
+            control_recv,
+            P2pLane::Control,
+            peer_id,
+            conn.clone(),
+            Arc::clone(shared),
+        ));
+        let t_caus_r = tokio::spawn(read_framed_stream(
+            causal_recv,
+            P2pLane::Causal,
+            peer_id,
+            conn.clone(),
+            Arc::clone(shared),
+        ));
+        let t_dgram_r = tokio::spawn(read_datagram_loop(
+            peer_id,
+            conn.clone(),
+            Arc::clone(shared),
+        ));
+
+        let watcher_shared = Arc::clone(shared);
+        let watcher_conn = conn.clone();
+        let t_watcher = tokio::spawn(async move {
+            let err = watcher_conn.closed().await;
+            let code = close_reason_code(&err);
+            watcher_shared.close_and_remove_peer(&peer_id, Some(conn_id), code, b"closed", true);
+        });
+
+        let active = ActivePeer {
+            conn_id,
+            is_outbound,
+            conn,
+            control_tx,
+            control_budget,
+            causal_tx,
+            causal_budget,
+            tasks: vec![
+                t_ctrl_w, t_caus_w, t_ctrl_r, t_caus_r, t_dgram_r, t_watcher,
+            ],
+        };
+
         peers.insert(peer_id, active)
     };
 
@@ -1239,12 +1558,14 @@ fn register_active_peer(
         previous
             .conn
             .close(VarInt::from_u32(CLOSE_SUPERSEDED), b"superseded");
-        previous.abort_tasks();
+        previous.shutdown();
     }
 
-    let _ = shared.lifecycle_tx.send(P2pTransportEvent::PeerConnected {
-        peer_pubkey: *peer_id.as_bytes(),
-    });
+    let _ = shared
+        .lifecycle_tx
+        .try_send(P2pTransportEvent::PeerConnected {
+            peer_pubkey: *peer_id.as_bytes(),
+        });
     Ok(())
 }
 
@@ -1325,6 +1646,7 @@ async fn handle_incoming_connection(incoming: Incoming, shared: Arc<SharedState>
             let _ = register_active_peer(
                 &shared,
                 remote_id,
+                false,
                 conn,
                 control_send,
                 control_recv,

@@ -23,7 +23,9 @@ use mp_protocol::{
 use serde::{Deserialize, Serialize};
 
 use crate::clock::wall_now_ms;
-use crate::tls::{DEFAULT_API_AUTHORITY, connect_tls13, default_tls13_client_config, parse_authority};
+use crate::tls::{
+    DEFAULT_API_AUTHORITY, canonicalize_authority, connect_tls13, default_tls13_client_config,
+};
 use crate::ws::{Mp1WsClient, Mp1WsTarget, WsConnectError};
 
 /// Hard cap on inbound HTTP response bodies (`16 KiB`).
@@ -280,9 +282,11 @@ impl ControlClientConfig {
     }
 
     /// Creates a config pinned to a custom canonical authority with default TLS 1.3 `webpki-roots`.
+    ///
+    /// Canonicalizes the authority by lowercasing the ASCII hostname and stripping default `:443`.
     pub fn new(authority: impl Into<String>) -> Result<Self, ControlError> {
-        let authority = authority.into();
-        let _ = parse_authority(&authority)?;
+        let raw = authority.into();
+        let authority = canonicalize_authority(&raw)?;
         Ok(Self {
             authority,
             tls_config: default_tls13_client_config()?,
@@ -330,10 +334,20 @@ impl fmt::Debug for ControlClient {
 }
 
 #[derive(Debug, Deserialize)]
-struct ApiErrorBody {
-    error: Option<String>,
-    server_now_ms: Option<u64>,
-    retry_after_ms: Option<u64>,
+pub(crate) struct ApiErrorBody {
+    pub(crate) error: Option<String>,
+    pub(crate) server_now_ms: Option<u64>,
+    pub(crate) retry_after_ms: Option<u64>,
+}
+
+/// RAII guard that aborts a spawned HTTP/1.1 connection driver task on drop
+/// (including timeout cancellation and early error returns).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Raw bounded HTTP response.
@@ -397,12 +411,22 @@ impl ControlClient {
     }
 
     /// Connects an RFC 6455 `MP1` WebSocket with an explicit signer.
+    ///
+    /// Automatically handles a single `401 clock_skew` upgrade rejection by updating
+    /// the scoped outbound-signing `clock_offset_ms` and retrying once with a fresh
+    /// RFC 9421 nonce and timestamp.
     pub async fn connect_ws_with_signer(
         &self,
         signer: &RequestSigner,
         target: Mp1WsTarget,
     ) -> Result<Mp1WsClient, WsConnectError> {
-        Mp1WsClient::connect(&self.config, signer, self.clock_offset_ms(), target).await
+        match Mp1WsClient::connect(&self.config, signer, self.clock_offset_ms(), target).await {
+            Err(WsConnectError::ClockSkew { server_now_ms }) => {
+                let _ = self.record_server_clock_ms(server_now_ms);
+                Mp1WsClient::connect(&self.config, signer, self.clock_offset_ms(), target).await
+            }
+            other => other,
+        }
     }
 
     fn require_device_signer(&self) -> Result<&RequestSigner, ControlError> {
@@ -437,11 +461,12 @@ impl ControlClient {
         }
         validate_path_and_query(method, path, query)?;
 
+        let canonical_authority = canonicalize_authority(&self.config.authority)?;
         for attempt in 0..2u8 {
             let signed = sign_request(
                 signer,
                 method,
-                &self.config.authority,
+                &canonical_authority,
                 path,
                 query,
                 &body,
@@ -496,13 +521,13 @@ impl ControlClient {
             .await?;
 
             let io = TokioIo::new(tls);
-            let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-                .await
-                .map_err(ControlError::Http)?;
+            let mut h1 = hyper::client::conn::http1::Builder::new();
+            h1.max_buf_size(MAX_RESPONSE_HEADERS_BYTES + MAX_RESPONSE_BODY_BYTES);
+            let (mut sender, conn) = h1.handshake(io).await.map_err(ControlError::Http)?;
 
-            let conn_task = tokio::spawn(async move {
+            let _conn_guard = AbortOnDrop(tokio::spawn(async move {
                 let _ = conn.await;
-            });
+            }));
 
             let uri = if query.len() > 1 {
                 format!("{path}{query}")
@@ -510,10 +535,12 @@ impl ControlClient {
                 path.to_owned()
             };
 
+            let canonical_authority = canonicalize_authority(&self.config.authority)?;
+
             let mut req_builder = Request::builder()
                 .method(to_http_method(method))
                 .uri(&uri)
-                .header(http::header::HOST, &self.config.authority)
+                .header(http::header::HOST, &canonical_authority)
                 .header(http::header::CONNECTION, "close");
 
             if let Some(s) = signed {
@@ -558,7 +585,6 @@ impl ControlClient {
             let status = resp.status();
 
             if status.is_redirection() {
-                conn_task.abort();
                 return Err(ControlError::UnexpectedRedirect {
                     status: status.as_u16(),
                 });
@@ -571,7 +597,6 @@ impl ControlClient {
                     .saturating_add(value.as_bytes().len())
                     .saturating_add(4);
                 if header_bytes > MAX_RESPONSE_HEADERS_BYTES {
-                    conn_task.abort();
                     return Err(ControlError::ResponseHeadersTooLarge);
                 }
             }
@@ -584,7 +609,6 @@ impl ControlClient {
                 match parsed {
                     Some(n) if n <= MAX_RESPONSE_BODY_BYTES => {}
                     _ => {
-                        conn_task.abort();
                         return Err(ControlError::ResponseTooLarge);
                     }
                 }
@@ -596,14 +620,12 @@ impl ControlClient {
                 let frame = frame_res.map_err(ControlError::Http)?;
                 if let Some(data) = frame.data_ref() {
                     if buf.len().saturating_add(data.len()) > MAX_RESPONSE_BODY_BYTES {
-                        conn_task.abort();
                         return Err(ControlError::ResponseTooLarge);
                     }
                     buf.extend_from_slice(data);
                 }
             }
 
-            conn_task.abort();
             Ok(RawHttpResponse {
                 status: status.as_u16(),
                 body: buf.freeze(),

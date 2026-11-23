@@ -1,15 +1,18 @@
 //! Binary persistence helpers under `StateLock` and TLS 1.3 control-plane config builder.
 
+#[cfg(any(test, feature = "test-tls-overrides"))]
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(any(test, feature = "test-tls-overrides"))]
 use base64::Engine as _;
+#[cfg(any(test, feature = "test-tls-overrides"))]
 use base64::engine::general_purpose::STANDARD as B64;
 use mp_protocol::{MAX_SAFE_ID, sha256};
-use outpost_control::{
-    ControlClientConfig, ControlError, build_tls13_client_config_with_roots,
-};
+#[cfg(any(test, feature = "test-tls-overrides"))]
+use outpost_control::build_tls13_client_config_with_roots;
+use outpost_control::{ControlClientConfig, ControlError};
 use outpost_core::storage_codec::{
     DefaultDeviceRecord, DeviceRecord, EpochsStoreRecord, PeersStoreRecord, PendingDeviceRecord,
     PendingRegRecord, decode_default_device, decode_device_record, decode_epochs_store,
@@ -21,6 +24,7 @@ use outpost_daemon::{
     DaemonError, StateLock, VerifiedDir, atomic_write_in_dir, format_device_dir_name,
     open_or_create_private_dir, read_file_in_dir, resolve_state_dir,
 };
+#[cfg(any(test, feature = "test-tls-overrides"))]
 use rustls::pki_types::CertificateDer;
 
 use crate::build_info::encode_hex;
@@ -28,6 +32,7 @@ use crate::build_info::encode_hex;
 pub const DEFAULT_DEVICE_FILE: &str = "default_device.bin";
 pub const PENDING_DEV_FILE: &str = "pending_dev.bin";
 pub const PENDING_REG_FILE: &str = "pending_reg.bin";
+pub const PENDING_REG_CWT_FILE: &str = "pending_reg.cwt";
 pub const PEERS_FILE: &str = "peers.bin";
 pub const EPOCHS_FILE: &str = "epochs.bin";
 pub const DEVICES_SUBDIR: &str = "devices";
@@ -113,6 +118,29 @@ pub fn save_default_device_id(
         .map_err(|e| e.to_string())
 }
 
+/// Scans `<state_dir>/devices/d<13hex>.dev.bin` and returns all valid enrolled device IDs sorted.
+pub fn list_enrolled_device_ids(state_dir_path: &Path) -> Vec<u64> {
+    let dev_path = state_dir_path.join(DEVICES_SUBDIR);
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dev_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if let Some(s) = name.to_str()
+                && let Some(hex) = s.strip_prefix('d').and_then(|r| r.strip_suffix(".dev.bin"))
+                && hex.len() == 13
+                && let Ok(id) = u64::from_str_radix(hex, 16)
+                && id > 0
+                && id <= MAX_SAFE_ID
+            {
+                found.push(id);
+            }
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
 pub fn resolve_active_device_id(
     state_dir_path: &Path,
     cli_device_id: Option<u64>,
@@ -140,26 +168,11 @@ pub fn resolve_active_device_id(
         return Ok(id);
     }
     // Fallback: if exactly one `d<13hex>.dev.bin` exists, use it.
-    let dev_path = state_dir_path.join(DEVICES_SUBDIR);
-    if let Ok(entries) = std::fs::read_dir(&dev_path) {
-        let mut found = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if let Some(s) = name.to_str()
-                && let Some(hex) = s.strip_prefix('d').and_then(|r| r.strip_suffix(".dev.bin"))
-                && hex.len() == 13
-                && let Ok(id) = u64::from_str_radix(hex, 16)
-                && id > 0
-                && id <= MAX_SAFE_ID
-            {
-                found.push(id);
-            }
-        }
-        if found.len() == 1
-            && let Some(&only) = found.first()
-        {
-            return Ok(only);
-        }
+    let found = list_enrolled_device_ids(state_dir_path);
+    if found.len() == 1
+        && let Some(&only) = found.first()
+    {
+        return Ok(only);
     }
     Err("no enrolled device found; run `mp-outpost device init` or pass --device-id".to_string())
 }
@@ -243,59 +256,81 @@ pub fn save_pending_reg(
     atomic_write_in_dir(state_dir.as_raw_fd(), PENDING_REG_FILE, &bytes).map_err(|e| e.to_string())
 }
 
+pub fn load_pending_reg_cwt(state_dir: &VerifiedDir) -> Result<Option<Vec<u8>>, String> {
+    read_file_in_dir(state_dir.as_raw_fd(), PENDING_REG_CWT_FILE, 1024).map_err(|e| e.to_string())
+}
+
+pub fn save_pending_reg_cwt(
+    state_dir: &VerifiedDir,
+    _lock: &StateLock,
+    cwt: &[u8],
+) -> Result<(), String> {
+    atomic_write_in_dir(state_dir.as_raw_fd(), PENDING_REG_CWT_FILE, cwt).map_err(|e| e.to_string())
+}
+
 pub fn pubkey_fingerprint_hex(root_pubkey: &[u8; 32]) -> String {
     encode_hex(&sha256(root_pubkey))
 }
 
-/// Builds a TLS 1.3-only `ControlClientConfig` for `authority`, honoring explicit
-/// `OUTPOST_TEST_CONNECT_ADDR` and `OUTPOST_TEST_CA_PEM` env overrides ONLY when set
-/// (while strictly preserving SNI, `Host`, and RFC 9421 `@authority`).
+/// Builds a TLS 1.3-only `ControlClientConfig` for `authority`.
+///
+/// Production/default builds NEVER honor `OUTPOST_TEST_CONNECT_ADDR` or `OUTPOST_TEST_CA_PEM`.
+/// Those test overrides are compiled in ONLY under `#[cfg(any(test, feature = "test-tls-overrides"))]`.
 pub fn build_control_client_config(authority: &str) -> Result<ControlClientConfig, ControlError> {
-    let mut cfg = ControlClientConfig::new(authority)?;
-
-    if let Ok(raw_addr) = std::env::var("OUTPOST_TEST_CONNECT_ADDR") {
-        let trimmed = raw_addr.trim();
-        if !trimmed.is_empty() {
-            let addr = trimmed.parse::<SocketAddr>().map_err(|e| {
-                ControlError::InvalidRequest(format!("invalid OUTPOST_TEST_CONNECT_ADDR: {e}"))
-            })?;
-            cfg = cfg.with_connect_addr(addr);
-        }
+    #[cfg(not(any(test, feature = "test-tls-overrides")))]
+    {
+        ControlClientConfig::new(authority)
     }
 
-    if let Ok(raw_ca) = std::env::var("OUTPOST_TEST_CA_PEM") {
-        let trimmed = raw_ca.trim();
-        if !trimmed.is_empty() {
-            let pem_text = if trimmed.contains("-----BEGIN CERTIFICATE-----") {
-                trimmed.to_string()
-            } else {
-                std::fs::read_to_string(trimmed).map_err(|e| {
-                    ControlError::TlsConfig(format!(
-                        "failed to read OUTPOST_TEST_CA_PEM file '{trimmed}': {e}"
-                    ))
-                })?
-            };
-            let ders = parse_pem_certificates(&pem_text)?;
-            if ders.is_empty() {
-                return Err(ControlError::TlsConfig(
-                    "OUTPOST_TEST_CA_PEM contained no certificates".to_string(),
-                ));
-            }
-            let mut roots = rustls::RootCertStore::empty();
-            for der in ders {
-                roots
-                    .add(der)
-                    .map_err(|e| ControlError::TlsConfig(format!("invalid CA cert: {e}")))?;
-            }
-            let tls_cfg = build_tls13_client_config_with_roots(roots)?;
-            cfg = cfg.with_tls_config(tls_cfg);
-        }
-    }
+    #[cfg(any(test, feature = "test-tls-overrides"))]
+    {
+        let mut cfg = ControlClientConfig::new(authority)?;
 
-    Ok(cfg)
+        if let Ok(raw_addr) = std::env::var("OUTPOST_TEST_CONNECT_ADDR") {
+            let trimmed = raw_addr.trim();
+            if !trimmed.is_empty() {
+                let addr = trimmed.parse::<SocketAddr>().map_err(|e| {
+                    ControlError::InvalidRequest(format!("invalid OUTPOST_TEST_CONNECT_ADDR: {e}"))
+                })?;
+                cfg = cfg.with_connect_addr(addr);
+            }
+        }
+
+        if let Ok(raw_ca) = std::env::var("OUTPOST_TEST_CA_PEM") {
+            let trimmed = raw_ca.trim();
+            if !trimmed.is_empty() {
+                let pem_text = if trimmed.contains("-----BEGIN CERTIFICATE-----") {
+                    trimmed.to_string()
+                } else {
+                    std::fs::read_to_string(trimmed).map_err(|e| {
+                        ControlError::TlsConfig(format!(
+                            "failed to read OUTPOST_TEST_CA_PEM file '{trimmed}': {e}"
+                        ))
+                    })?
+                };
+                let ders = parse_pem_certificates(&pem_text)?;
+                if ders.is_empty() {
+                    return Err(ControlError::TlsConfig(
+                        "OUTPOST_TEST_CA_PEM contained no certificates".to_string(),
+                    ));
+                }
+                let mut roots = rustls::RootCertStore::empty();
+                for der in ders {
+                    roots
+                        .add(der)
+                        .map_err(|e| ControlError::TlsConfig(format!("invalid CA cert: {e}")))?;
+                }
+                let tls_cfg = build_tls13_client_config_with_roots(roots)?;
+                cfg = cfg.with_tls_config(tls_cfg);
+            }
+        }
+
+        Ok(cfg)
+    }
 }
 
 /// Owned minimal PEM certificate parser (zero external crate dependencies).
+#[cfg(any(test, feature = "test-tls-overrides"))]
 fn parse_pem_certificates(pem: &str) -> Result<Vec<CertificateDer<'static>>, ControlError> {
     const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
     const END: &str = "-----END CERTIFICATE-----";

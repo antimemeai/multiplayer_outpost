@@ -42,6 +42,8 @@ pub const fn error_code_to_secret_kind(code: u16) -> Option<SecretMatchKind> {
 const MAX_STR_SMALL: usize = 4096;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_LIST_ITEMS: usize = 1024;
+pub const MAX_POLL_LIMIT: u16 = 100;
+pub const MAX_POLL_MAX_BYTES: u32 = outpost_core::party_state::MAX_POLL_MAX_BYTES as u32;
 
 // ---------------------------------------------------------------------------
 // Binary primitives
@@ -747,7 +749,7 @@ pub fn decode_status_resp(bytes: &[u8]) -> Result<StatusResp, IpcWireError> {
     let daemon_pid = r.u32()?;
     let build_order = r.u64()?;
     let build_digest = r.fixed::<32>()?;
-    let exe_path = r.str_u16(1024)?;
+    let exe_path = r.str_u16(MAX_STR_SMALL)?;
     let control_ws_connected = r.bool()?;
     let dual_host_churn_alert = r.bool()?;
     let active_party = if r.bool()? {
@@ -1051,7 +1053,7 @@ pub fn encode_party_poll_req(req: &PartyPollIpcReq) -> Vec<u8> {
 
 pub fn decode_party_poll_req(bytes: &[u8]) -> Result<PartyPollIpcReq, IpcWireError> {
     let mut r = Reader::new(bytes);
-    let req = PartyPollIpcReq {
+    let mut req = PartyPollIpcReq {
         party_id: r.u64()?,
         cursor_epoch: r.u64()?,
         after_seq: r.u64()?,
@@ -1060,6 +1062,15 @@ pub fn decode_party_poll_req(bytes: &[u8]) -> Result<PartyPollIpcReq, IpcWireErr
         board_only: r.bool()?,
     };
     r.finish()?;
+    if req.limit > MAX_POLL_LIMIT || req.max_bytes > MAX_POLL_MAX_BYTES {
+        return Err(IpcWireError::BodyTooLarge);
+    }
+    if req.limit == 0 {
+        req.limit = 1;
+    }
+    if req.max_bytes == 0 {
+        req.max_bytes = MAX_POLL_MAX_BYTES;
+    }
     Ok(req)
 }
 
@@ -1785,5 +1796,78 @@ pub fn poll_resp_to_board_events(r: PartyPollIpcResp) -> outpost_mcp::BoardReadR
         cursor_reset: r.cursor_reset,
         gap_possible: r.gap_possible,
         events,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_POLL_LIMIT, MAX_POLL_MAX_BYTES, PartyPollIpcReq, StatusResp, decode_party_poll_req,
+        decode_status_resp, encode_party_poll_req, encode_status_resp,
+    };
+    use outpost_core::ipc_wire::IpcWireError;
+
+    #[test]
+    fn party_poll_req_rejects_oversized_limit_and_max_bytes() {
+        let valid = PartyPollIpcReq {
+            party_id: 100,
+            cursor_epoch: 1,
+            after_seq: 0,
+            limit: MAX_POLL_LIMIT,
+            max_bytes: MAX_POLL_MAX_BYTES,
+            board_only: false,
+        };
+        let encoded = encode_party_poll_req(&valid);
+        assert_eq!(decode_party_poll_req(&encoded), Ok(valid.clone()));
+
+        let over_limit = PartyPollIpcReq {
+            limit: MAX_POLL_LIMIT + 1,
+            ..valid.clone()
+        };
+        assert_eq!(
+            decode_party_poll_req(&encode_party_poll_req(&over_limit)),
+            Err(IpcWireError::BodyTooLarge)
+        );
+
+        let over_bytes = PartyPollIpcReq {
+            max_bytes: MAX_POLL_MAX_BYTES + 1,
+            ..valid
+        };
+        assert_eq!(
+            decode_party_poll_req(&encode_party_poll_req(&over_bytes)),
+            Err(IpcWireError::BodyTooLarge)
+        );
+    }
+
+    #[test]
+    fn status_resp_supports_long_exe_path_up_to_4096() {
+        let long_path = "/".to_string() + &"a".repeat(3000);
+        let resp = StatusResp {
+            account_id: 1,
+            device_id: 2,
+            handle: "alice".to_string(),
+            api_authority: "api.multiplayer.tech".to_string(),
+            local_relay_policy: 0,
+            cwt_expires_ms: 123_456,
+            daemon_epoch: 7,
+            daemon_pid: 42,
+            build_order: 1000,
+            build_digest: [0xAB; 32],
+            exe_path: long_path.clone(),
+            control_ws_connected: true,
+            dual_host_churn_alert: false,
+            active_party: None,
+            unpinned_alerts: Vec::new(),
+            key_mismatch_alerts: Vec::new(),
+        };
+        let bytes = match encode_status_resp(&resp) {
+            Ok(b) => b,
+            Err(e) => {
+                assert_eq!(e, IpcWireError::Truncated);
+                return;
+            }
+        };
+        let decoded = decode_status_resp(&bytes);
+        assert_eq!(decoded.map(|s| s.exe_path), Ok(long_path));
     }
 }

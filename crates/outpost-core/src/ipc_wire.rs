@@ -213,7 +213,7 @@ pub fn encode_ipc_frame(frame: &IpcFrame) -> Result<Vec<u8>, IpcWireError> {
     if frame.payload.len() > MAX_IPC_BODY_BYTES {
         return Err(IpcWireError::BodyTooLarge);
     }
-    if frame.request_id > MAX_SAFE_ID {
+    if frame.request_id == 0 || frame.request_id > MAX_SAFE_ID {
         return Err(IpcWireError::InvalidRequestId);
     }
     let mut out = Vec::with_capacity(IPC_HEADER_BYTES + frame.payload.len());
@@ -256,7 +256,7 @@ pub fn decode_ipc_header(header: &[u8; IPC_HEADER_BYTES]) -> Result<(usize, IpcO
     }
     let opcode = IpcOpcode::from_u16(u16::from_le_bytes(op_arr))?;
     let request_id = u64::from_le_bytes(req_arr);
-    if request_id > MAX_SAFE_ID {
+    if request_id == 0 || request_id > MAX_SAFE_ID {
         return Err(IpcWireError::InvalidRequestId);
     }
     Ok((body_len, opcode, request_id))

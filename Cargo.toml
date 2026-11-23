@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/mp-protocol",
     "crates/outpost-core",
     "crates/outpost-control",
     "crates/outpost-p2p",
@@ -18,13 +19,14 @@ publish = false
 
 [workspace.dependencies]
 base64 = "0.22"
+blake3 = "1.8"
 bytes = "1.12"
 ciborium = "0.2"
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
 hyper = { version = "1.12", default-features = false, features = ["client", "http1"] }
 iroh = { version = "1.5.0", default-features = false, features = ["tls-ring"] }
 libc = "0.2"
-mp-protocol = { path = "../multiplayer_site/crates/mp-protocol" }
+mp-protocol = { path = "crates/mp-protocol" }
 proptest = "1.6"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0", features = ["derive"] }

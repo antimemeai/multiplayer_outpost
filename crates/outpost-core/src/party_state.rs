@@ -11,6 +11,7 @@ use crate::storage_codec::{EpochFloorEntry, EpochsStoreRecord, MAX_EPOCH_ENTRIES
 pub const MAX_RING_EVENTS: usize = 512;
 pub const MAX_RING_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_POLL_MAX_BYTES: usize = 512 * 1024;
+pub const MAX_POLL_MAX_BYTES: usize = 512 * 1024;
 pub const MAX_DEDUPE_ENTRIES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +148,20 @@ impl PartyEventRing {
         limit: usize,
         max_bytes: usize,
     ) -> PollResult {
+        self.poll_filtered(cursor_epoch, after_seq, limit, max_bytes, |_| true)
+    }
+
+    pub fn poll_filtered<F>(
+        &self,
+        cursor_epoch: Option<u64>,
+        after_seq: u64,
+        limit: usize,
+        max_bytes: usize,
+        mut predicate: F,
+    ) -> PollResult
+    where
+        F: FnMut(&PartyEventBody) -> bool,
+    {
         let epoch_mismatch = cursor_epoch.is_some_and(|e| e != 0 && e != self.daemon_epoch);
         if epoch_mismatch || after_seq > self.next_seq {
             return PollResult {
@@ -160,27 +175,33 @@ impl PartyEventRing {
         }
 
         let eff_limit = limit.clamp(1, 100);
-        let eff_budget = max_bytes.max(1);
+        let eff_budget = max_bytes.clamp(1, MAX_POLL_MAX_BYTES);
         let mut out = Vec::new();
         let mut used_bytes = 0usize;
-        let mut last_returned = after_seq;
+        let mut last_seq = after_seq;
 
         for (ev, sz) in &self.events {
             if ev.seq <= after_seq {
                 continue;
             }
-            if !out.is_empty() && (out.len() >= eff_limit || used_bytes.saturating_add(*sz) > eff_budget) {
+            if !predicate(&ev.body) {
+                last_seq = ev.seq;
+                continue;
+            }
+            if !out.is_empty()
+                && (out.len() >= eff_limit || used_bytes.saturating_add(*sz) > eff_budget)
+            {
                 break;
             }
             out.push(ev.clone());
             used_bytes = used_bytes.saturating_add(*sz);
-            last_returned = ev.seq;
+            last_seq = ev.seq;
         }
 
         let gap_possible = after_seq < self.dropped_before_seq;
         PollResult {
             daemon_epoch: self.daemon_epoch,
-            next_seq: last_returned,
+            next_seq: last_seq,
             dropped_before_seq: self.dropped_before_seq,
             cursor_reset: false,
             gap_possible,
@@ -196,6 +217,13 @@ pub enum DedupeOutcome {
     PayloadConflict,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupeLookup<'a> {
+    New,
+    Duplicate(&'a [u8]),
+    PayloadConflict,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct DedupeKey {
     client_id: u64,
@@ -204,15 +232,80 @@ struct DedupeKey {
     client_msg_id: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DedupeEntry {
+    payload_hash: Sha256Digest,
+    response_bytes: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DedupeCache {
     order: VecDeque<DedupeKey>,
-    entries: BTreeMap<DedupeKey, Sha256Digest>,
+    entries: BTreeMap<DedupeKey, DedupeEntry>,
 }
 
 impl DedupeCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn check(
+        &self,
+        client_id: u64,
+        party_id: u64,
+        opcode: u16,
+        client_msg_id: u64,
+        payload_hash: Sha256Digest,
+    ) -> DedupeLookup<'_> {
+        let key = DedupeKey {
+            client_id,
+            party_id,
+            opcode,
+            client_msg_id,
+        };
+        if let Some(existing) = self.entries.get(&key) {
+            if existing.payload_hash == payload_hash {
+                DedupeLookup::Duplicate(existing.response_bytes.as_deref().unwrap_or(&[]))
+            } else {
+                DedupeLookup::PayloadConflict
+            }
+        } else {
+            DedupeLookup::New
+        }
+    }
+
+    pub fn record(
+        &mut self,
+        client_id: u64,
+        party_id: u64,
+        opcode: u16,
+        client_msg_id: u64,
+        payload_hash: Sha256Digest,
+        response_bytes: Vec<u8>,
+    ) {
+        let key = DedupeKey {
+            client_id,
+            party_id,
+            opcode,
+            client_msg_id,
+        };
+        let entry = DedupeEntry {
+            payload_hash,
+            response_bytes: Some(response_bytes),
+        };
+        if let std::collections::btree_map::Entry::Occupied(mut existing) = self.entries.entry(key) {
+            existing.insert(entry);
+            return;
+        }
+        while self.entries.len() >= MAX_DEDUPE_ENTRIES {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key);
+        self.entries.insert(key, entry);
     }
 
     pub fn check_or_insert(
@@ -230,7 +323,7 @@ impl DedupeCache {
             client_msg_id,
         };
         if let Some(existing) = self.entries.get(&key) {
-            return if *existing == payload_hash {
+            return if existing.payload_hash == payload_hash {
                 DedupeOutcome::Duplicate
             } else {
                 DedupeOutcome::PayloadConflict
@@ -244,7 +337,13 @@ impl DedupeCache {
             }
         }
         self.order.push_back(key);
-        self.entries.insert(key, payload_hash);
+        self.entries.insert(
+            key,
+            DedupeEntry {
+                payload_hash,
+                response_bytes: None,
+            },
+        );
         DedupeOutcome::New
     }
 }
@@ -272,6 +371,32 @@ impl EpochFloorStore {
     pub fn to_record(&self) -> EpochsStoreRecord {
         EpochsStoreRecord {
             entries: self.entries.values().copied().collect(),
+        }
+    }
+
+    pub fn merge_from(&mut self, other: &EpochsStoreRecord) {
+        for incoming in &other.entries {
+            let key = (incoming.api_authority_hash, incoming.party_id);
+            if let Some(existing) = self.entries.get_mut(&key) {
+                existing.highest_party_epoch =
+                    existing.highest_party_epoch.max(incoming.highest_party_epoch);
+                existing.terminal_disbanded |= incoming.terminal_disbanded;
+                existing.updated_at_ms = existing.updated_at_ms.max(incoming.updated_at_ms);
+            } else {
+                self.entries.insert(key, *incoming);
+                while self.entries.len() > MAX_EPOCH_ENTRIES {
+                    if let Some(oldest_key) = self
+                        .entries
+                        .iter()
+                        .min_by_key(|(_, v)| v.updated_at_ms)
+                        .map(|(k, _)| *k)
+                    {
+                        self.entries.remove(&oldest_key);
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
     }
 

@@ -318,41 +318,60 @@ impl VerifiedDir {
     }
 }
 
-/// Creates missing parent directories with mode `0700`, opens the leaf directory
-/// with `O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, and verifies via `fstat`
-/// that `S_ISDIR`, `st_uid == geteuid()`, and `(st_mode & 0o777) == 0o700`.
+/// Walks every path component from `/` via `openat(O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`
+/// and `mkdirat(..., 0o700)` to create missing directories without path-based TOCTOU,
+/// and verifies the final leaf FD via `fstat` that `S_ISDIR`, `st_uid == geteuid()`,
+/// and `(st_mode & 0o777) == 0o700`.
 ///
-/// Rejects symlinks and overly broad permissions (e.g. `0755`) fail-closed!
+/// Rejects ALL leaf symlinks, ALL non-root intermediate symlinks (regardless of UID),
+/// and overly broad permissions (e.g. `0755`) fail-closed! Root-owned OS alias symlinks
+/// on non-leaf components (e.g. macOS `/var -> private/var`) are permitted.
 pub fn open_or_create_private_dir(path: &Path) -> Result<VerifiedDir, DaemonError> {
     validate_path_hygiene(path)?;
     let euid = unsafe { libc::geteuid() };
 
-    // Reject a user-owned symlink anywhere along the path (while allowing OS
-    // root-owned symlinks such as `/var -> private/var` on macOS).
-    reject_user_owned_symlinks(path, euid)?;
+    let comps: Vec<&OsStr> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(name),
+            Component::RootDir | Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                None
+            }
+        })
+        .collect();
+    if comps.is_empty() {
+        return Err(DaemonError::InsecureDirectory {
+            path: path.to_path_buf(),
+            reason: "root directory cannot be used as a private directory",
+        });
+    }
 
-    // Ensure missing parent components exist with mode 0700.
-    create_missing_dirs_0700(path)?;
-
-    let cpath = path_to_cstring(path)?;
-    let fd = unsafe {
+    let root_raw = unsafe {
         libc::open(
-            cpath.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            c"/".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
-    if fd < 0 {
-        let err = io::Error::last_os_error();
-        let raw = err.raw_os_error();
-        if raw == Some(libc::ELOOP) || raw == Some(libc::ENOTDIR) {
-            return Err(DaemonError::SymlinkRejected {
-                path: path.to_path_buf(),
-            });
-        }
-        return Err(DaemonError::io("open private dir", err));
+    if root_raw < 0 {
+        return Err(DaemonError::io("open root dir", io::Error::last_os_error()));
     }
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    let st = fstat_fd(owned.as_raw_fd())?;
+    let mut cur_fd = unsafe { OwnedFd::from_raw_fd(root_raw) };
+    let mut cur_path = PathBuf::from("/");
+    let total = comps.len();
+
+    for (idx, comp) in comps.into_iter().enumerate() {
+        cur_path.push(comp);
+        let is_leaf = idx + 1 == total;
+        let cname = CString::new(comp.as_bytes()).map_err(|_| DaemonError::InvalidPath {
+            path: cur_path.clone(),
+            reason: "path component contains interior NUL byte",
+        })?;
+
+        let next_fd = open_or_create_component(cur_fd.as_raw_fd(), &cname, &cur_path, is_leaf)?;
+        cur_fd = next_fd;
+    }
+
+    let st = fstat_fd(cur_fd.as_raw_fd())?;
 
     if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
         return Err(DaemonError::InsecureDirectory {
@@ -376,57 +395,88 @@ pub fn open_or_create_private_dir(path: &Path) -> Result<VerifiedDir, DaemonErro
 
     let (dev, ino) = stat_dev_ino(&st);
     Ok(VerifiedDir {
-        fd: owned,
+        fd: cur_fd,
         path: path.to_path_buf(),
         dev,
         ino,
     })
 }
 
-fn reject_user_owned_symlinks(path: &Path, euid: u32) -> Result<(), DaemonError> {
-    let mut cur = PathBuf::new();
-    let total_components = path.components().count();
-    for (idx, comp) in path.components().enumerate() {
-        cur.push(comp);
-        if idx == 0 {
-            continue;
-        }
-        let is_leaf = idx + 1 == total_components;
-        let ccur = path_to_cstring(&cur)?;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::lstat(ccur.as_ptr(), &mut st) };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::NotFound {
-                break;
+fn open_or_create_component(
+    parent_fd: RawFd,
+    cname: &CString,
+    cur_path: &Path,
+    is_leaf: bool,
+) -> Result<OwnedFd, DaemonError> {
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let raw = unsafe { libc::openat(parent_fd, cname.as_ptr(), flags) };
+    if raw >= 0 {
+        return Ok(unsafe { OwnedFd::from_raw_fd(raw) });
+    }
+    let mut err = io::Error::last_os_error();
+
+    if err.kind() == io::ErrorKind::NotFound {
+        let mrc = unsafe { libc::mkdirat(parent_fd, cname.as_ptr(), 0o700) };
+        if mrc != 0 {
+            let merr = io::Error::last_os_error();
+            if merr.kind() != io::ErrorKind::AlreadyExists {
+                return Err(DaemonError::io("mkdirat 0700", merr));
             }
-            return Err(DaemonError::io("lstat directory component", err));
+        }
+        let retry = unsafe { libc::openat(parent_fd, cname.as_ptr(), flags) };
+        if retry >= 0 {
+            return Ok(unsafe { OwnedFd::from_raw_fd(retry) });
+        }
+        err = io::Error::last_os_error();
+    }
+
+    let raw_err = err.raw_os_error();
+    if raw_err == Some(libc::ELOOP) || raw_err == Some(libc::ENOTDIR) {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let frc = unsafe {
+            libc::fstatat(
+                parent_fd,
+                cname.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if frc != 0 {
+            return Err(DaemonError::io(
+                "fstatat directory component",
+                io::Error::last_os_error(),
+            ));
         }
         let is_symlink = (st.st_mode & libc::S_IFMT) == libc::S_IFLNK;
-        if is_symlink && (is_leaf || st.st_uid == euid) {
-            return Err(DaemonError::SymlinkRejected { path: cur });
-        }
-    }
-    Ok(())
-}
-
-fn create_missing_dirs_0700(path: &Path) -> Result<(), DaemonError> {
-    let mut cur = PathBuf::new();
-    for comp in path.components() {
-        cur.push(comp);
-        if cur == Path::new("/") {
-            continue;
-        }
-        let ccur = path_to_cstring(&cur)?;
-        let rc = unsafe { libc::mkdir(ccur.as_ptr(), 0o700) };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::AlreadyExists {
-                return Err(DaemonError::io("mkdir 0700", err));
+        if is_symlink {
+            if is_leaf || st.st_uid != 0 {
+                return Err(DaemonError::SymlinkRejected {
+                    path: cur_path.to_path_buf(),
+                });
             }
+            // Non-leaf root-owned OS alias symlink (e.g. `/var -> private/var`, `/tmp -> private/tmp`).
+            let follow_fd = unsafe {
+                libc::openat(
+                    parent_fd,
+                    cname.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if follow_fd < 0 {
+                return Err(DaemonError::io(
+                    "openat root-owned symlink dir",
+                    io::Error::last_os_error(),
+                ));
+            }
+            return Ok(unsafe { OwnedFd::from_raw_fd(follow_fd) });
         }
+        return Err(DaemonError::InsecureDirectory {
+            path: cur_path.to_path_buf(),
+            reason: "path component is not a directory",
+        });
     }
-    Ok(())
+
+    Err(DaemonError::io("openat private dir component", err))
 }
 
 pub(crate) fn path_to_cstring(path: &Path) -> Result<CString, DaemonError> {

@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mp_protocol::MAX_SAFE_ID;
+use outpost_control::sleep_aware_now_ms;
 use outpost_core::ipc_wire::{ClientKind, HelloPayload, IPC_SCHEMA_VER, IpcFrame, IpcOpcode};
 use outpost_daemon::{
     ClientConfig, DaemonClient, DaemonError, SpawnCommand, decode_error_payload,
@@ -27,8 +28,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::build_info::{build_digest, build_order, encode_hex};
 use crate::ipc_payloads::{
-    ERR_INVALID_PARAMS, PartyPollIpcReq, PartyPostBoardReq, PartySendChatReq, PartyWaitIpcReq,
-    decode_friends_list_resp, decode_party_list_resp, decode_party_members_resp,
+    ERR_INVALID_PARAMS, ERR_NOT_FOUND, PartyPollIpcReq, PartyPostBoardReq, PartySendChatReq,
+    PartyWaitIpcReq, decode_friends_list_resp, decode_party_list_resp, decode_party_members_resp,
     decode_party_poll_resp, decode_send_result_resp, decode_status_resp, encode_party_poll_req,
     encode_party_post_board_req, encode_party_send_chat_req, encode_party_wait_req,
     encode_u64_req, error_code_to_secret_kind, poll_resp_to_board_events, relay_policy_name,
@@ -38,8 +39,68 @@ use crate::storage::{pubkey_fingerprint_hex, resolve_active_device_id};
 
 const RECONNECT_BUDGET: Duration = Duration::from_secs(30);
 const IDLE_DROP_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_PARTY_WAIT_MS: u32 = 45_000;
+const PARTY_WAIT_IPC_GRACE_MS: u64 = 5_000;
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<IpcFrame, DaemonError>>>>>;
+
+/// RAII drop guard that cleans up the `pending` entry and transmits an IPC `Cancel` frame
+/// if `MultiplexedConn::request` is dropped early (e.g. MCP cancellation or timeout).
+struct PendingCancelGuard {
+    pending: PendingMap,
+    out_tx: mpsc::Sender<IpcFrame>,
+    request_id: u64,
+    cancel_req_id: u64,
+    armed: bool,
+}
+
+impl PendingCancelGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingCancelGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let removed_sync = if let Ok(mut guard) = self.pending.try_lock() {
+            guard.remove(&self.request_id);
+            true
+        } else {
+            false
+        };
+        let cancel_frame = encode_cancel_payload(self.request_id).ok().map(|payload| IpcFrame {
+            opcode: IpcOpcode::Cancel,
+            request_id: self.cancel_req_id,
+            payload,
+        });
+        let unsent_frame = match cancel_frame {
+            Some(frame) => match self.out_tx.try_send(frame) {
+                Ok(()) => None,
+                Err(mpsc::error::TrySendError::Full(f)) => Some(f),
+                Err(mpsc::error::TrySendError::Closed(_)) => None,
+            },
+            None => None,
+        };
+        if !removed_sync || unsent_frame.is_some() {
+            let pending = Arc::clone(&self.pending);
+            let out_tx = self.out_tx.clone();
+            let req_id = self.request_id;
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    if !removed_sync {
+                        pending.lock().await.remove(&req_id);
+                    }
+                    if let Some(frame) = unsent_frame {
+                        let _ = out_tx.send(frame).await;
+                    }
+                });
+            }
+        }
+    }
+}
 
 /// Multiplexed IPC client over a single `UnixStream` allowing concurrent requests and `Cancel`.
 struct MultiplexedConn {
@@ -49,7 +110,6 @@ struct MultiplexedConn {
     alive: Arc<AtomicBool>,
     active_party_id: AtomicU64,
     last_activity_ms: AtomicU64,
-    start_instant: Instant,
     upgrade_available: bool,
     reader_task: tokio::task::JoinHandle<()>,
     writer_task: tokio::task::JoinHandle<()>,
@@ -110,8 +170,7 @@ impl MultiplexedConn {
             next_req_id: AtomicU64::new(2),
             alive,
             active_party_id: AtomicU64::new(ack.active_party_id),
-            last_activity_ms: AtomicU64::new(0),
-            start_instant: Instant::now(),
+            last_activity_ms: AtomicU64::new(sleep_aware_now_ms()),
             upgrade_available,
             reader_task,
             writer_task,
@@ -123,12 +182,12 @@ impl MultiplexedConn {
     }
 
     fn touch(&self) {
-        let elapsed = self.start_instant.elapsed().as_millis() as u64;
-        self.last_activity_ms.store(elapsed, Ordering::Release);
+        self.last_activity_ms
+            .store(sleep_aware_now_ms(), Ordering::Release);
     }
 
     fn idle_duration(&self) -> Duration {
-        let now_ms = self.start_instant.elapsed().as_millis() as u64;
+        let now_ms = sleep_aware_now_ms();
         let last = self.last_activity_ms.load(Ordering::Acquire);
         Duration::from_millis(now_ms.saturating_sub(last))
     }
@@ -165,8 +224,17 @@ impl MultiplexedConn {
         self.touch();
 
         let request_id = self.alloc_req_id();
+        let cancel_req_id = self.alloc_req_id();
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(request_id, tx);
+
+        let mut guard = PendingCancelGuard {
+            pending: Arc::clone(&self.pending),
+            out_tx: self.out_tx.clone(),
+            request_id,
+            cancel_req_id,
+            armed: true,
+        };
 
         let frame = IpcFrame {
             opcode,
@@ -174,6 +242,7 @@ impl MultiplexedConn {
             payload,
         };
         if self.out_tx.send(frame).await.is_err() {
+            guard.disarm();
             self.pending.lock().await.remove(&request_id);
             self.alive.store(false, Ordering::Release);
             return Err(BackendError::DaemonDisconnected);
@@ -184,6 +253,7 @@ impl MultiplexedConn {
                 tokio::select! {
                     biased;
                     _ = tok.cancelled() => {
+                        guard.disarm();
                         self.pending.lock().await.remove(&request_id);
                         self.send_cancel(request_id).await;
                         return Err(BackendError::ToolError {
@@ -191,15 +261,24 @@ impl MultiplexedConn {
                             message: "request cancelled".to_string(),
                         });
                     }
-                    r = rx => match r {
-                        Ok(Ok(f)) => f,
-                        Ok(Err(_)) | Err(_) => return Err(BackendError::DaemonDisconnected),
+                    r = rx => {
+                        guard.disarm();
+                        match r {
+                            Ok(Ok(f)) => f,
+                            Ok(Err(_)) | Err(_) => return Err(BackendError::DaemonDisconnected),
+                        }
                     }
                 }
             }
             None => match rx.await {
-                Ok(Ok(f)) => f,
-                Ok(Err(_)) | Err(_) => return Err(BackendError::DaemonDisconnected),
+                Ok(Ok(f)) => {
+                    guard.disarm();
+                    f
+                }
+                Ok(Err(_)) | Err(_) => {
+                    guard.disarm();
+                    return Err(BackendError::DaemonDisconnected);
+                }
             },
         };
 
@@ -232,6 +311,7 @@ pub struct DaemonMcpBridge {
     runtime_dir_override: Option<PathBuf>,
     device_id_override: Option<u64>,
     conn: Arc<Mutex<Option<Arc<MultiplexedConn>>>>,
+    connect_lock: Mutex<()>,
     idle_reaper_started: AtomicBool,
 }
 
@@ -247,6 +327,7 @@ impl DaemonMcpBridge {
             runtime_dir_override,
             device_id_override,
             conn: Arc::new(Mutex::new(None)),
+            connect_lock: Mutex::new(()),
             idle_reaper_started: AtomicBool::new(false),
         })
     }
@@ -278,6 +359,19 @@ impl DaemonMcpBridge {
     async fn get_or_connect(&self) -> Result<Arc<MultiplexedConn>, BackendError> {
         self.ensure_idle_reaper_started();
 
+        // Fast path: reuse healthy existing connection without serializing on `connect_lock`.
+        {
+            let guard = self.conn.lock().await;
+            if let Some(ref c) = *guard
+                && c.is_alive()
+            {
+                return Ok(Arc::clone(c));
+            }
+        }
+
+        // Single-flight connection lock prevents concurrent tool calls from stampeding
+        // `DaemonClient::connect_or_spawn`.
+        let _connect_guard = self.connect_lock.lock().await;
         {
             let guard = self.conn.lock().await;
             if let Some(ref c) = *guard
@@ -328,6 +422,20 @@ impl DaemonMcpBridge {
                     tokio::time::sleep(nap).await;
                     backoff_ms = (backoff_ms.saturating_mul(2)).min(2000);
                 }
+            }
+        }
+    }
+
+    async fn clear_active_party_if_not_found(&self, party_id: u64, err: &BackendError) {
+        let not_found_code = format!("ipc_{ERR_NOT_FOUND}");
+        if let BackendError::ToolError { code, .. } = err
+            && code == &not_found_code
+        {
+            let guard = self.conn.lock().await;
+            if let Some(ref c) = *guard
+                && c.active_party_id.load(Ordering::Acquire) == party_id
+            {
+                c.active_party_id.store(0, Ordering::Release);
             }
         }
     }
@@ -526,11 +634,19 @@ impl McpOutpostBackend for DaemonMcpBridge {
 
     fn party_members(&self, party_id: u64) -> BoxFuture<'_, Result<Value, BackendError>> {
         Box::pin(async move {
-            let (raw, _conn) = self
+            let (raw, conn) = match self
                 .call_ipc(IpcOpcode::PartyMembers, encode_u64_req(party_id), None)
-                .await?;
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    self.clear_active_party_if_not_found(party_id, &e).await;
+                    return Err(e);
+                }
+            };
             let resp =
                 decode_party_members_resp(&raw).map_err(|_| BackendError::DaemonDisconnected)?;
+            conn.active_party_id.store(resp.party_id, Ordering::Release);
             let members: Vec<Value> = resp
                 .members
                 .iter()
@@ -560,8 +676,9 @@ impl McpOutpostBackend for DaemonMcpBridge {
 
     fn party_send(&self, req: PartySendReq) -> BoxFuture<'_, Result<Value, BackendError>> {
         Box::pin(async move {
+            let party_id = req.party_id;
             let wire_req = PartySendChatReq {
-                party_id: req.party_id,
+                party_id,
                 client_msg_id: req.client_msg_id,
                 room_scope: req.room_scope.unwrap_or_else(|| "party/main".to_string()),
                 target_device_id: req.target_device_id,
@@ -569,8 +686,15 @@ impl McpOutpostBackend for DaemonMcpBridge {
             };
             let encoded = encode_party_send_chat_req(&wire_req)
                 .map_err(|e| BackendError::InvalidParams(e.to_string()))?;
-            let (raw, _conn) = self.call_ipc(IpcOpcode::PartySendChat, encoded, None).await?;
+            let (raw, conn) = match self.call_ipc(IpcOpcode::PartySendChat, encoded, None).await {
+                Ok(v) => v,
+                Err(e) => {
+                    self.clear_active_party_if_not_found(party_id, &e).await;
+                    return Err(e);
+                }
+            };
             let resp = decode_send_result_resp(&raw).map_err(|_| BackendError::DaemonDisconnected)?;
+            conn.active_party_id.store(resp.party_id, Ordering::Release);
             Ok(json!({
                 "party_id": resp.party_id,
                 "client_msg_id": resp.client_msg_id,
@@ -583,18 +707,27 @@ impl McpOutpostBackend for DaemonMcpBridge {
 
     fn board_post(&self, req: BoardPostReq) -> BoxFuture<'_, Result<Value, BackendError>> {
         Box::pin(async move {
+            let party_id = req.party_id;
             let wire_req = PartyPostBoardReq {
-                party_id: req.party_id,
+                party_id,
                 client_msg_id: req.client_msg_id,
                 room_scope: req.room_scope,
                 payload: req.payload,
             };
             let encoded = encode_party_post_board_req(&wire_req)
                 .map_err(|e| BackendError::InvalidParams(e.to_string()))?;
-            let (raw, _conn) = self
+            let (raw, conn) = match self
                 .call_ipc(IpcOpcode::PartyPostBoard, encoded, None)
-                .await?;
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    self.clear_active_party_if_not_found(party_id, &e).await;
+                    return Err(e);
+                }
+            };
             let resp = decode_send_result_resp(&raw).map_err(|_| BackendError::DaemonDisconnected)?;
+            conn.active_party_id.store(resp.party_id, Ordering::Release);
             Ok(json!({
                 "party_id": resp.party_id,
                 "client_msg_id": resp.client_msg_id,
@@ -607,36 +740,64 @@ impl McpOutpostBackend for DaemonMcpBridge {
 
     fn party_poll(&self, req: PartyPollReq) -> BoxFuture<'_, Result<PartyPollResp, BackendError>> {
         Box::pin(async move {
+            let party_id = req.party_id;
             let wire_req = PartyPollIpcReq {
-                party_id: req.party_id,
+                party_id,
                 cursor_epoch: req.cursor_epoch.unwrap_or(0),
                 after_seq: req.after_seq,
                 limit: req.limit,
                 max_bytes: req.max_bytes,
                 board_only: false,
             };
-            let (raw, _conn) = self
+            let (raw, conn) = match self
                 .call_ipc(IpcOpcode::PartyPoll, encode_party_poll_req(&wire_req), None)
-                .await?;
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    self.clear_active_party_if_not_found(party_id, &e).await;
+                    return Err(e);
+                }
+            };
             let resp = decode_party_poll_resp(&raw).map_err(|_| BackendError::DaemonDisconnected)?;
+            let next_active = if resp.cursor_reset && resp.next_seq == 0 && resp.events.is_empty() {
+                0
+            } else {
+                resp.party_id
+            };
+            conn.active_party_id.store(next_active, Ordering::Release);
             Ok(resp.into())
         })
     }
 
     fn board_read(&self, req: PartyPollReq) -> BoxFuture<'_, Result<BoardReadResp, BackendError>> {
         Box::pin(async move {
+            let party_id = req.party_id;
             let wire_req = PartyPollIpcReq {
-                party_id: req.party_id,
+                party_id,
                 cursor_epoch: req.cursor_epoch.unwrap_or(0),
                 after_seq: req.after_seq,
                 limit: req.limit,
                 max_bytes: req.max_bytes,
                 board_only: true,
             };
-            let (raw, _conn) = self
+            let (raw, conn) = match self
                 .call_ipc(IpcOpcode::PartyPoll, encode_party_poll_req(&wire_req), None)
-                .await?;
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    self.clear_active_party_if_not_found(party_id, &e).await;
+                    return Err(e);
+                }
+            };
             let resp = decode_party_poll_resp(&raw).map_err(|_| BackendError::DaemonDisconnected)?;
+            let next_active = if resp.cursor_reset && resp.next_seq == 0 && resp.events.is_empty() {
+                0
+            } else {
+                resp.party_id
+            };
+            conn.active_party_id.store(next_active, Ordering::Release);
             Ok(poll_resp_to_board_events(resp))
         })
     }
@@ -648,20 +809,46 @@ impl McpOutpostBackend for DaemonMcpBridge {
         _progress: Option<ProgressSender>,
     ) -> BoxFuture<'_, Result<PartyPollResp, BackendError>> {
         Box::pin(async move {
+            let party_id = req.party_id;
+            let capped_ms = req.timeout_ms.clamp(1, MAX_PARTY_WAIT_MS);
+            let total_budget = Duration::from_millis(
+                u64::from(capped_ms).saturating_add(PARTY_WAIT_IPC_GRACE_MS),
+            );
             let wire_req = PartyWaitIpcReq {
-                party_id: req.party_id,
+                party_id,
                 cursor_epoch: req.cursor_epoch.unwrap_or(0),
                 after_seq: req.after_seq,
-                timeout_ms: req.timeout_ms,
+                timeout_ms: capped_ms,
             };
-            let (raw, _conn) = self
-                .call_ipc(
+            let call_res = tokio::time::timeout(
+                total_budget,
+                self.call_ipc(
                     IpcOpcode::PartyWait,
                     encode_party_wait_req(&wire_req),
                     Some(cancel),
-                )
-                .await?;
+                ),
+            )
+            .await;
+
+            let (raw, conn) = match call_res {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    self.clear_active_party_if_not_found(party_id, &e).await;
+                    return Err(e);
+                }
+                Err(_) => {
+                    // Bounded wait deadline exceeded; dropping `call_ipc` triggers
+                    // `PendingCancelGuard` to send an IPC `Cancel` frame.
+                    return Err(BackendError::DaemonDisconnected);
+                }
+            };
             let resp = decode_party_poll_resp(&raw).map_err(|_| BackendError::DaemonDisconnected)?;
+            let next_active = if resp.cursor_reset && resp.next_seq == 0 && resp.events.is_empty() {
+                0
+            } else {
+                resp.party_id
+            };
+            conn.active_party_id.store(next_active, Ordering::Release);
             Ok(resp.into())
         })
     }

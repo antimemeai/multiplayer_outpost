@@ -1448,3 +1448,339 @@ async fn oracle_typed_rest_endpoints_match_exact_server_contract() {
 
     srv.await.expect("server task");
 }
+
+// ===========================================================================
+// Oracle 7: Gate #1 Hardening Regressions (Authority Canonicalization, Strict
+//           ALPN, Bounded WS Upgrade Headers, Safe Sec-WebSocket-Accept,
+//           WS 401 clock_skew Auto-Retry)
+// ===========================================================================
+
+fn make_server_acceptor_with_alpn(
+    pki: &TestPki,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    alpn_protocols: Vec<Vec<u8>>,
+) -> TlsAcceptor {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut cfg = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(versions)
+        .expect("server protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![pki.cert_der.clone()], pki.key_der.clone_key())
+        .expect("server cert");
+    cfg.alpn_protocols = alpn_protocols;
+    TlsAcceptor::from(Arc::new(cfg))
+}
+
+#[tokio::test]
+async fn oracle_authority_canonicalization_and_strict_alpn_enforcement() {
+    // 1. Canonicalization unit checks
+    let cfg_default_port =
+        ControlClientConfig::new("API.MULTIPLAYER.TECH:443").expect("canonical default port");
+    assert_eq!(cfg_default_port.authority, "api.multiplayer.tech");
+
+    let cfg_custom_port =
+        ControlClientConfig::new("API.MULTIPLAYER.TECH:8443").expect("canonical custom port");
+    assert_eq!(cfg_custom_port.authority, "api.multiplayer.tech:8443");
+
+    assert!(matches!(
+        ControlClientConfig::new("api.multiplayer.tech:0443"),
+        Err(ControlError::InvalidAuthority(_))
+    ));
+    assert!(matches!(
+        ControlClientConfig::new("api.multiplayer.tech:0"),
+        Err(ControlError::InvalidAuthority(_))
+    ));
+
+    let pki = generate_test_pki();
+
+    // 2. Server with NO ALPN negotiated must be rejected on both REST and WS!
+    let no_alpn_acceptor =
+        make_server_acceptor_with_alpn(&pki, &[&rustls::version::TLS13], vec![]);
+    let listener_no_alpn = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr_no_alpn = listener_no_alpn.local_addr().expect("local_addr");
+
+    let srv_no_alpn = tokio::spawn(async move {
+        for _ in 0..2 {
+            if let Ok((tcp, _)) = listener_no_alpn.accept().await {
+                let _ = no_alpn_acceptor.accept(tcp).await;
+            }
+        }
+    });
+
+    let signer = RequestSigner::device(
+        AccountId::new(1001).expect("acct"),
+        DeviceId::new(2002).expect("dev"),
+        [71u8; 32],
+    );
+    let client_no_alpn = ControlClient::with_device_signer(
+        ControlClientConfig::new("API.MULTIPLAYER.TECH:443")
+            .expect("canonical")
+            .with_tls_config(Arc::clone(&pki.client_tls13))
+            .with_connect_addr(addr_no_alpn)
+            .with_request_timeout(Duration::from_secs(5)),
+        signer.clone(),
+    );
+
+    let rest_err = client_no_alpn
+        .health()
+        .await
+        .expect_err("missing ALPN must fail REST");
+    assert!(
+        matches!(rest_err, ControlError::TlsPolicyViolation(_)),
+        "expected TlsPolicyViolation on missing ALPN, got {rest_err:?}"
+    );
+
+    let ws_err = client_no_alpn
+        .connect_ws(Mp1WsTarget::Account)
+        .await
+        .expect_err("missing ALPN must fail WS");
+    assert!(
+        matches!(
+            ws_err,
+            WsConnectError::Transport(ControlError::TlsPolicyViolation(_))
+        ),
+        "expected TlsPolicyViolation on missing ALPN WS, got {ws_err:?}"
+    );
+    srv_no_alpn.await.expect("srv_no_alpn");
+
+    // 3. Uppercase + `:443` authority works end-to-end with lowercase Host & RFC 9421 @authority
+    let tls13_acceptor = make_server_acceptor(&pki, &[&rustls::version::TLS13]);
+    let listener_ok = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr_ok = listener_ok.local_addr().expect("local_addr");
+    let dev_pubkey = signer.verifying_pubkey();
+
+    let srv_ok = tokio::spawn(async move {
+        let (tcp, _) = listener_ok.accept().await.expect("accept");
+        let mut tls = tls13_acceptor.accept(tcp).await.expect("tls");
+        let req = read_http_request(&mut tls).await;
+        assert_eq!(
+            req.headers.get("host").map(String::as_str),
+            Some("api.multiplayer.tech")
+        );
+        verify_rfc9421_request(
+            &Rfc9421Request {
+                method: HttpMethod::Get,
+                authority: req.headers.get("host").map(String::as_str).unwrap_or(""),
+                path: &req.path,
+                query: &req.query,
+                content_type: None,
+                content_digest: None,
+                has_content_encoding: false,
+                body: &[],
+                signature_input: req.headers.get("signature-input").expect("sig-in"),
+                signature: req.headers.get("signature").expect("sig"),
+            },
+            "api.multiplayer.tech",
+            &dev_pubkey,
+            wall_now_secs(),
+        )
+        .expect("canonical authority RFC 9421 verification must pass");
+        let body = r#"{"friends":[]}"#;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        tls.write_all(resp.as_bytes()).await.expect("write");
+        tls.shutdown().await.expect("shutdown");
+    });
+
+    let client_ok = ControlClient::with_device_signer(
+        ControlClientConfig::new("API.MULTIPLAYER.TECH:443")
+            .expect("canonical")
+            .with_tls_config(Arc::clone(&pki.client_tls13))
+            .with_connect_addr(addr_ok)
+            .with_request_timeout(Duration::from_secs(5)),
+        signer,
+    );
+    let friends = client_ok
+        .list_friends()
+        .await
+        .expect("canonicalized authority call must succeed");
+    assert!(friends.friends.is_empty());
+    srv_ok.await.expect("srv_ok");
+}
+
+#[tokio::test]
+async fn oracle_ws_upgrade_bounded_headers_hostile_accept_and_401_clock_skew_retry() {
+    let pki = generate_test_pki();
+    let tls13_acceptor = make_server_acceptor(&pki, &[&rustls::version::TLS13]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let acct_id = AccountId::new(1001).expect("acct");
+    let dev_id = DeviceId::new(2002).expect("dev");
+    let dev_secret = [72u8; 32];
+    let dev_pubkey = SigningKey::from_bytes(&dev_secret)
+        .verifying_key()
+        .to_bytes();
+
+    let hello_msg = Mp1Message::HelloAck {
+        session_id: SessionId::new(4242).expect("sid"),
+        server_now_ms: wall_now_ms() + 180_000,
+        ping_interval_ms: 20_000,
+    };
+    let hello_bytes = encode_frame(1, &hello_msg).expect("encode hello");
+    let skew_ms: i64 = 180_000;
+    let nonces = Arc::new(Mutex::new(Vec::<String>::new()));
+    let nonces_srv = Arc::clone(&nonces);
+
+    let srv = tokio::spawn(async move {
+        // Connection 1: Oversized > 8 KiB WS upgrade headers (16 KiB without \r\n\r\n)
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 1");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 1");
+            let _req = read_http_request(&mut tls).await;
+            let mut big = b"HTTP/1.1 101 Switching Protocols\r\nX-Pad: ".to_vec();
+            big.extend(std::iter::repeat_n(b'A', 16 * 1024));
+            big.extend_from_slice(b"\r\n\r\n");
+            let _ = tls.write_all(&big).await;
+            let _ = tls.shutdown().await;
+        }
+
+        // Connection 2: Hostile oversized non-base64 Sec-WebSocket-Accept (must NOT panic!)
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 2");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 2");
+            let _req = read_http_request(&mut tls).await;
+            let hostile_accept = "!".repeat(256);
+            let resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {hostile_accept}\r\nSec-WebSocket-Protocol: mp1\r\n\r\n"
+            );
+            let _ = tls.write_all(resp.as_bytes()).await;
+            let _ = tls.shutdown().await;
+        }
+
+        // Connection 3: Wrong valid-base64 Sec-WebSocket-Accept (must reject cleanly)
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 3");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 3");
+            let _req = read_http_request(&mut tls).await;
+            let resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: mp1\r\n\r\n";
+            let _ = tls.write_all(resp.as_bytes()).await;
+            let _ = tls.shutdown().await;
+        }
+
+        // Connections 4 & 5: WS 401 clock_skew on attempt 0 -> auto-retry succeeds on attempt 1!
+        for attempt in 0..2u8 {
+            let (tcp, _) = listener.accept().await.expect("accept skew");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls skew");
+            let req = read_http_request(&mut tls).await;
+            assert_eq!(req.method, "GET");
+            assert_eq!(req.path, "/v1/ws");
+
+            let sig_input = req.headers.get("signature-input").expect("sig-in");
+            let sig = req.headers.get("signature").expect("sig");
+            let parsed_si =
+                mp_protocol::parse_signature_input(sig_input).expect("parse signature-input");
+            nonces_srv.lock().expect("lock").push(parsed_si.nonce);
+
+            let server_now_ms = (wall_now_ms() as i64 + skew_ms) as u64;
+            let server_now_s = (server_now_ms / 1000) as i64;
+            let verify_res = verify_rfc9421_request(
+                &Rfc9421Request {
+                    method: HttpMethod::Get,
+                    authority: req.headers.get("host").map(String::as_str).unwrap_or(""),
+                    path: &req.path,
+                    query: &req.query,
+                    content_type: None,
+                    content_digest: None,
+                    has_content_encoding: false,
+                    body: &[],
+                    signature_input: sig_input,
+                    signature: sig,
+                },
+                TEST_AUTHORITY,
+                &dev_pubkey,
+                server_now_s,
+            );
+
+            if attempt == 0 {
+                assert_eq!(
+                    verify_res.expect_err("attempt 0 must hit ClockSkew"),
+                    Rfc9421Error::ClockSkew
+                );
+                let body = format!(r#"{{"error":"clock_skew","server_now_ms":{server_now_ms}}}"#);
+                let resp = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                tls.write_all(resp.as_bytes()).await.expect("write 401");
+                tls.shutdown().await.expect("shutdown 401");
+            } else {
+                verify_res.expect("attempt 1 must pass RFC 9421 verification after clock sync");
+                let accept = ws_accept_value(req.headers.get("sec-websocket-key").expect("key"));
+                let mut coalesced = format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: mp1\r\n\r\n"
+                )
+                .into_bytes();
+                coalesced.extend_from_slice(&encode_server_ws_frame(true, 0x2, &hello_bytes));
+                tls.write_all(&coalesced).await.expect("write 101");
+                tls.flush().await.expect("flush 101");
+            }
+        }
+    });
+
+    let signer = RequestSigner::device(acct_id, dev_id, dev_secret);
+    let client = ControlClient::with_device_signer(make_client_config(&pki, addr), signer);
+
+    // 1. Oversized > 8 KiB upgrade headers rejected without buffering
+    let err_hdrs = client
+        .connect_ws(Mp1WsTarget::Account)
+        .await
+        .expect_err("oversized headers must fail");
+    assert!(
+        matches!(err_hdrs, WsConnectError::ResponseHeadersTooLarge),
+        "expected ResponseHeadersTooLarge, got {err_hdrs:?}"
+    );
+
+    // 2. Hostile oversized non-base64 Sec-WebSocket-Accept rejected cleanly (no panic!)
+    let err_hostile = client
+        .connect_ws(Mp1WsTarget::Account)
+        .await
+        .expect_err("hostile Sec-WebSocket-Accept must fail");
+    assert!(
+        matches!(err_hostile, WsConnectError::InvalidUpgradeResponse(_)),
+        "expected InvalidUpgradeResponse, got {err_hostile:?}"
+    );
+
+    // 3. Mismatched valid-base64 Sec-WebSocket-Accept rejected cleanly
+    let err_mismatch = client
+        .connect_ws(Mp1WsTarget::Account)
+        .await
+        .expect_err("mismatched Sec-WebSocket-Accept must fail");
+    assert!(
+        matches!(err_mismatch, WsConnectError::InvalidUpgradeResponse(_)),
+        "expected InvalidUpgradeResponse, got {err_mismatch:?}"
+    );
+
+    // 4. WS 401 clock_skew auto-retry updates offset, refreshes nonce, and connects!
+    let mut ws = client
+        .connect_ws(Mp1WsTarget::Account)
+        .await
+        .expect("WS connect must succeed after 401 clock_skew auto-retry");
+
+    let ev = ws.next_event().await.expect("ev").expect("hello frame");
+    assert!(matches!(
+        ev,
+        Mp1WsEvent::Frame {
+            message: Mp1Message::HelloAck { .. },
+            ..
+        }
+    ));
+
+    let learned_offset = client.clock_offset_ms();
+    assert!(
+        (learned_offset - skew_ms).abs() < 5_000,
+        "expected WS clock offset near {skew_ms}, got {learned_offset}"
+    );
+
+    srv.await.expect("server task");
+    let recorded = nonces.lock().expect("lock");
+    assert_eq!(recorded.len(), 2);
+    assert_ne!(
+        recorded[0], recorded[1],
+        "WS clock_skew retry MUST generate a fresh RFC 9421 nonce"
+    );
+}

@@ -1,0 +1,213 @@
+name: Release Prebuilt Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build & Package (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: darwin-arm64
+          - os: ubuntu-24.04
+            target: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve and validate release version
+        id: meta
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            ver="${INPUT_VERSION}"
+          else
+            ver="${GITHUB_REF_NAME}"
+          fi
+          case "$ver" in
+            ''|v|*..*|*/*|v*[!0-9A-Za-z._-]*)
+              echo "Invalid release version: $ver" >&2
+              exit 2 ;;
+            v*) ;;
+            *)
+              echo "Release version must start with 'v': $ver" >&2
+              exit 2 ;;
+          esac
+          printf 'version=%s\n' "$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Verify Rust version
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Run workspace tests and clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build, verify, and package release tarball
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/package-release.sh
+          ./scripts/package-release.sh \
+            --version "$RELEASE_VERSION" \
+            --target "$RELEASE_TARGET" \
+            --out-dir dist
+
+      - name: Upload packaged release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve and validate release version
+        id: meta
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            ver="${INPUT_VERSION}"
+          else
+            ver="${GITHUB_REF_NAME}"
+          fi
+          case "$ver" in
+            ''|v|*..*|*/*|v*[!0-9A-Za-z._-]*)
+              echo "Invalid release version: $ver" >&2
+              exit 2 ;;
+            v*) ;;
+            *)
+              echo "Release version must start with 'v': $ver" >&2
+              exit 2 ;;
+          esac
+          printf 'version=%s\n' "$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Download all target artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-dist-*
+          path: downloaded-dist
+
+      - name: Merge SHA256SUMS.txt, release-manifest.json, and installer
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          cp scripts/install-outpost.sh release-assets/install-outpost.sh
+          chmod 755 release-assets/install-outpost.sh
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+
+          version = os.environ["RELEASE_VERSION"]
+          in_root = Path("downloaded-dist")
+          out_dir = Path("release-assets")
+
+          checksums = {}
+          assets = {}
+          commit = "unknown"
+
+          for dist_dir in sorted(in_root.glob("release-dist-*")):
+              for tarball in sorted(dist_dir.glob("mp-outpost-*.tar.gz")):
+                  shutil.copy2(tarball, out_dir / tarball.name)
+              sums_file = dist_dir / "SHA256SUMS.txt"
+              if sums_file.is_file():
+                  for line in sums_file.read_text(encoding="utf-8").splitlines():
+                      parts = line.strip().split(None, 1)
+                      if len(parts) == 2:
+                          checksums[parts[1].lstrip("*").strip()] = parts[0].lower()
+              manifest_file = dist_dir / "release-manifest.json"
+              if manifest_file.is_file():
+                  data = json.loads(manifest_file.read_text(encoding="utf-8"))
+                  if data.get("commit") and commit == "unknown":
+                      commit = data["commit"]
+                  for asset in data.get("assets", []):
+                      assets[asset["target"]] = asset
+
+          if not checksums or not assets:
+              raise SystemExit("No release tarballs or manifests found to publish")
+
+          sums_lines = [f"{checksums[name]}  {name}\n" for name in sorted(checksums)]
+          (out_dir / "SHA256SUMS.txt").write_text("".join(sums_lines), encoding="utf-8")
+
+          merged_manifest = {
+              "version": version,
+              "commit": commit,
+              "assets": [assets[t] for t in sorted(assets)],
+          }
+          (out_dir / "release-manifest.json").write_text(
+              json.dumps(merged_manifest, indent=2) + "\n", encoding="utf-8"
+          )
+          PY
+
+          (cd release-assets && sha256sum -c SHA256SUMS.txt)
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_VERSION" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_VERSION" release-assets/* \
+              --title "mp-outpost ${RELEASE_VERSION}" \
+              --generate-notes
+          fi

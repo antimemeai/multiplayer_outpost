@@ -144,7 +144,6 @@ fn run_daemon_entrypoint(daemon_args: DaemonSubcommandArgs) {
     }
 
     let exit_code = rt.block_on(async move {
-        app.start_background_tasks();
         let handler = Arc::new(AppDaemonHandler::new(app));
         match DaemonServer::run(cfg, handler).await {
             Ok(_) => 0,

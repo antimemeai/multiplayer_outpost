@@ -76,12 +76,16 @@ pub fn monotonic_boottime_ms() -> u64 {
 }
 
 /// Fills `buf` with OS CSPRNG bytes.
-pub fn fill_random(buf: &mut [u8]) {
+pub fn fill_random(buf: &mut [u8]) -> Result<(), DaemonError> {
+    if buf.is_empty() {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     {
         unsafe {
             libc::arc4random_buf(buf.as_mut_ptr().cast(), buf.len());
         }
+        Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -96,37 +100,47 @@ pub fn fill_random(buf: &mut [u8]) {
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                break;
+                if err.raw_os_error() == Some(libc::ENOSYS) {
+                    break;
+                }
+                return Err(DaemonError::io("getrandom", err));
+            }
+            if n == 0 {
+                return Err(DaemonError::io(
+                    "getrandom",
+                    io::Error::new(io::ErrorKind::UnexpectedEof, "getrandom returned 0 bytes"),
+                ));
             }
             offset = offset.saturating_add(n as usize);
         }
         if offset < buf.len() {
-            // Fallback to /dev/urandom if getrandom ever failed unexpectedly.
-            if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-                use std::io::Read;
-                if let Some(dst) = buf.get_mut(offset..) {
-                    let _ = f.read_exact(dst);
-                }
+            use std::io::Read;
+            let mut f = std::fs::File::open("/dev/urandom")
+                .map_err(|e| DaemonError::io("open /dev/urandom", e))?;
+            if let Some(dst) = buf.get_mut(offset..) {
+                f.read_exact(dst)
+                    .map_err(|e| DaemonError::io("read /dev/urandom", e))?;
             }
         }
+        Ok(())
     }
 }
 
-pub fn random_u32() -> u32 {
+pub fn random_u32() -> Result<u32, DaemonError> {
     let mut b = [0u8; 4];
-    fill_random(&mut b);
-    u32::from_le_bytes(b)
+    fill_random(&mut b)?;
+    Ok(u32::from_le_bytes(b))
 }
 
-pub fn random_u64() -> u64 {
+pub fn random_u64() -> Result<u64, DaemonError> {
     let mut b = [0u8; 8];
-    fill_random(&mut b);
-    u64::from_le_bytes(b)
+    fill_random(&mut b)?;
+    Ok(u64::from_le_bytes(b))
 }
 
 /// Generates a non-zero CSPRNG `daemon_epoch` strictly within `1..=MAX_SAFE_ID`.
-pub fn generate_daemon_epoch() -> u64 {
-    (random_u64() % MAX_SAFE_ID).saturating_add(1)
+pub fn generate_daemon_epoch() -> Result<u64, DaemonError> {
+    Ok((random_u64()? % MAX_SAFE_ID).saturating_add(1))
 }
 
 /// Lock-free write to the daemon log file descriptor (safe in panic hooks & watchdog).
@@ -146,6 +160,7 @@ pub fn write_log_lock_free(msg: &[u8]) {
 /// Opens rotating `daemon.log` (`2 x 4 MiB`, `0600`) inside `dir`.
 pub fn open_rotating_log(dir: &VerifiedDir) -> Result<OwnedFd, DaemonError> {
     if let Some(st) = dir.stat_entry(DAEMON_LOG_NAME)?
+        && (st.st_mode & libc::S_IFMT) == libc::S_IFREG
         && st.st_size >= 0
         && (st.st_size as u64) >= MAX_LOG_BYTES
     {
@@ -284,17 +299,36 @@ impl FlockGuard {
 
 fn open_lock_file(dir: &VerifiedDir, name: &str) -> Result<(OwnedFd, u64, u64), DaemonError> {
     let cname = leaf_name_to_cstring(name)?;
-    let raw_fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            cname.as_ptr(),
-            libc::O_CREAT | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600 as libc::c_uint,
-        )
+    let mut attempts = 0u32;
+    let raw_fd = loop {
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                cname.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd >= 0 {
+            break fd;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        // On macOS/APFS, high-contention concurrent `openat(..., O_CREAT | O_NOFOLLOW)`
+        // on a brand-new lock file can transiently return `ENOENT` in XNU `vn_open_auth`
+        // even though the parent directory is still linked (`st_nlink > 0`).
+        if err.kind() == io::ErrorKind::NotFound
+            && attempts < 8
+            && fstat_fd(dir.as_raw_fd()).is_ok_and(|st| st.st_nlink > 0)
+        {
+            attempts = attempts.saturating_add(1);
+            std::thread::yield_now();
+            continue;
+        }
+        return Err(DaemonError::io("openat lock file", err));
     };
-    if raw_fd < 0 {
-        return Err(DaemonError::io("openat lock file", io::Error::last_os_error()));
-    }
     let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
     let st = fstat_fd(fd.as_raw_fd())?;
     let euid = unsafe { libc::geteuid() };
@@ -548,7 +582,7 @@ pub fn publish_unix_listener(
     // 1. Clean stale `d.sock` and any leftover `t.*` entries under `daemon.lock`.
     unlink_stale_socket_files(dir)?;
 
-    let tmp_name = format!("t.{:08x}", random_u32());
+    let tmp_name = format!("t.{:08x}", random_u32()?);
     let tmp_path = dir.path().join(&tmp_name);
     let final_path = dir.path().join(SOCKET_FILE_NAME);
     let tmp_c = leaf_name_to_cstring(&tmp_name)?;
@@ -1117,6 +1151,11 @@ fn build_env_cstrings(overrides: &[(String, String)]) -> Result<Vec<CString>, Da
     for (k, v) in overrides {
         map.insert(OsString::from(k), OsString::from(v));
     }
+    #[cfg(not(any(test, feature = "test-tls-overrides")))]
+    {
+        map.remove(OsStr::new("OUTPOST_TEST_CONNECT_ADDR"));
+        map.remove(OsStr::new("OUTPOST_TEST_CA_PEM"));
+    }
     let mut out = Vec::with_capacity(map.len());
     for (k, v) in map {
         let mut bytes = Vec::with_capacity(k.as_bytes().len() + 1 + v.as_bytes().len());
@@ -1145,9 +1184,15 @@ fn spawn_launcher_process(
     for (k, v) in &cmd.env {
         command.env(k, v);
     }
+    #[cfg(not(any(test, feature = "test-tls-overrides")))]
+    {
+        command.env_remove("OUTPOST_TEST_CONNECT_ADDR");
+        command.env_remove("OUTPOST_TEST_CA_PEM");
+    }
 
     // Async-signal-safe pre_exec: dup2 0/1/2/3 (clears CLOEXEC on targets) and
-    // close every descriptor >= 4 via close_range(4, u32::MAX, 0) with fallback.
+    // mark every descriptor >= 4 FD_CLOEXEC via close_range(..., CLOSE_RANGE_CLOEXEC)
+    // so Rust std's internal CLOEXEC exec-error pipe remains intact!
     unsafe {
         command.pre_exec(move || {
             for &(src, dst) in &[
@@ -1173,12 +1218,26 @@ fn spawn_launcher_process(
 
 #[cfg(target_os = "linux")]
 unsafe fn close_fds_from(first_fd: u32) {
-    // SYS_close_range is 436 on both x86_64 and aarch64 Linux.
-    let rc = unsafe { libc::syscall(libc::SYS_close_range, first_fd, u32::MAX, 0u32) };
+    // Mark FDs >= first_fd FD_CLOEXEC rather than closing immediately so std::process::Command's
+    // internal CLOEXEC exec-error reporting pipe stays intact until execve succeeds.
+    const CLOSE_RANGE_CLOEXEC: u32 = 1 << 2;
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            first_fd,
+            u32::MAX,
+            CLOSE_RANGE_CLOEXEC,
+        )
+    };
     if rc == 0 {
         return;
     }
-    // Async-signal-safe fallback: close up to RLIMIT_NOFILE (bounded to 65536).
+
+    if unsafe { set_cloexec_via_proc_self_fd(first_fd as i32) } {
+        return;
+    }
+
+    // Last-resort async-signal-safe fallback if /proc/self/fd is unavailable.
     let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
     let max_fd = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
         (rl.rlim_cur as u64).min(65536) as i32
@@ -1188,10 +1247,93 @@ unsafe fn close_fds_from(first_fd: u32) {
     let mut fd = first_fd as i32;
     while fd < max_fd {
         unsafe {
-            let _ = libc::close(fd);
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
         }
         fd += 1;
     }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn set_cloexec_via_proc_self_fd(first_fd: i32) -> bool {
+    let dirfd = unsafe {
+        libc::open(
+            c"/proc/self/fd".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if dirfd < 0 {
+        return false;
+    }
+    let mut buf = [0u8; 4096];
+    loop {
+        let nread = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                dirfd,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        if nread <= 0 {
+            break;
+        }
+        let limit = (nread as usize).min(buf.len());
+        let mut pos = 0usize;
+        while pos < limit {
+            let Some(reclen_bytes) = buf.get(pos + 16..pos + 18) else {
+                break;
+            };
+            let Ok(reclen_arr) = <[u8; 2]>::try_from(reclen_bytes) else {
+                break;
+            };
+            let reclen = usize::from(u16::from_ne_bytes(reclen_arr));
+            if reclen < 20 || pos.saturating_add(reclen) > limit {
+                break;
+            }
+            if let Some(name_region) = buf.get(pos + 19..pos + reclen) {
+                let name_end = name_region
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(name_region.len());
+                if let Some(name_bytes) = name_region.get(..name_end)
+                    && let Some(fd) = parse_ascii_fd(name_bytes)
+                    && fd >= first_fd
+                    && fd != dirfd
+                {
+                    unsafe {
+                        let flags = libc::fcntl(fd, libc::F_GETFD);
+                        if flags >= 0 {
+                            let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                        }
+                    }
+                }
+            }
+            pos = pos.saturating_add(reclen);
+        }
+    }
+    unsafe {
+        let _ = libc::close(dirfd);
+    }
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn parse_ascii_fd(bytes: &[u8]) -> Option<i32> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut val: i32 = 0;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        let digit = i32::from(b - b'0');
+        val = val.checked_mul(10)?.checked_add(digit)?;
+    }
+    Some(val)
 }
 
 /// Outcome of an explicit `force_stop_daemon` invocation.
@@ -1223,9 +1365,6 @@ pub fn force_stop_daemon(
     if FlockGuard::probe_lock_free(dir, DAEMON_LOCK_NAME)? {
         return Ok(ForceStopOutcome::AlreadyStopped);
     }
-
-    // Best-effort peer pidfd probe on Linux if socket accepts quickly.
-    let peer_pidfd = probe_peer_pidfd(dir);
 
     let Some(raw_info) = read_file_in_dir(dir.as_raw_fd(), DAEMON_INFO_NAME, 16 * 1024)? else {
         return Err(DaemonError::ProcessVerificationFailed {
@@ -1262,6 +1401,9 @@ pub fn force_stop_daemon(
             reason: "PID start token mismatch (PID was recycled)",
         });
     }
+
+    // Best-effort peer pidfd probe on Linux (non-blocking 200ms timeout + exact PID match).
+    let peer_pidfd = probe_peer_pidfd(dir, info.pid);
 
     send_verified_signal(info.pid, info.native_start_token, peer_pidfd.as_ref(), libc::SIGTERM)?;
     if wait_for_daemon_lock_release(dir, sigterm_timeout)? {
@@ -1303,18 +1445,107 @@ pub fn force_stop_daemon(
     })
 }
 
-fn probe_peer_pidfd(dir: &VerifiedDir) -> Option<OwnedFd> {
+fn probe_peer_pidfd(dir: &VerifiedDir, expected_pid: u32) -> Option<OwnedFd> {
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::net::UnixStream;
         let sock = dir.path().join(SOCKET_FILE_NAME);
-        let stream = UnixStream::connect(sock).ok()?;
-        let creds = verify_peer_creds(stream.as_raw_fd()).ok()?;
+        let path_bytes = sock.as_os_str().as_bytes();
+        let max_sun = std::mem::size_of::<libc::sockaddr_un>()
+            - std::mem::offset_of!(libc::sockaddr_un, sun_path)
+            - 1;
+        if path_bytes.len() > max_sun {
+            return None;
+        }
+        let raw_fd = unsafe {
+            libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                0,
+            )
+        };
+        if raw_fd < 0 {
+            return None;
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                path_bytes.as_ptr(),
+                addr.sun_path.as_mut_ptr().cast::<u8>(),
+                path_bytes.len(),
+            );
+        }
+        let addr_len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + path_bytes.len() + 1)
+            as libc::socklen_t;
+
+        let rc = unsafe {
+            libc::connect(
+                fd.as_raw_fd(),
+                (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                addr_len,
+            )
+        };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            let raw_err = err.raw_os_error();
+            if raw_err != Some(libc::EINPROGRESS) && raw_err != Some(libc::EAGAIN) {
+                return None;
+            }
+            let deadline = Duration::from_millis(200);
+            let start = Instant::now();
+            loop {
+                let elapsed = start.elapsed();
+                if elapsed >= deadline {
+                    return None;
+                }
+                let rem_ms = deadline.saturating_sub(elapsed).as_millis().min(200) as libc::c_int;
+                let mut pfd = libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let prc = unsafe { libc::poll(&mut pfd, 1, rem_ms) };
+                if prc < 0 {
+                    if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return None;
+                }
+                if prc == 0 {
+                    return None;
+                }
+                if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+                    return None;
+                }
+                break;
+            }
+            let mut so_err: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            let gsrc = unsafe {
+                libc::getsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    (&mut so_err as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            };
+            if gsrc != 0 || so_err != 0 {
+                return None;
+            }
+        }
+
+        let creds = verify_peer_creds(fd.as_raw_fd()).ok()?;
+        if creds.pid != expected_pid {
+            return None;
+        }
         creds.pidfd
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = dir;
+        let _ = (dir, expected_pid);
         None
     }
 }

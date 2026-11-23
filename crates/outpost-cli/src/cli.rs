@@ -23,7 +23,7 @@ use outpost_control::{
     ControlClient, DEFAULT_API_AUTHORITY, EnrollDeviceRequest, RegisterAccountRequest,
     RequestSigner, wall_now_ms, wall_now_secs,
 };
-use outpost_core::fence::fence_peer_text;
+use outpost_core::fence::{fence_peer_text, sanitize_peer_text};
 use outpost_core::ipc_wire::{ClientKind, HelloPayload, IPC_SCHEMA_VER, IpcOpcode};
 use outpost_core::party_state::DEFAULT_POLL_MAX_BYTES;
 use outpost_core::storage_codec::{
@@ -35,7 +35,7 @@ use outpost_core::trust::{
 use outpost_daemon::{
     ClientConfig, DAEMON_LOCK_NAME, DAEMON_LOG_NAME, DaemonClient, DaemonError, DrainMode,
     FlockGuard, ForceStopOutcome, STARTUP_LOCK_NAME, fill_random, force_stop_daemon,
-    open_or_create_private_dir, resolve_runtime_dir,
+    open_or_create_private_dir, read_file_in_dir, resolve_runtime_dir,
 };
 use serde_json::{Value, json};
 
@@ -61,11 +61,13 @@ use crate::ipc_payloads::{
 };
 use crate::mcp_bridge::build_spawn_command;
 use crate::storage::{
-    DEFAULT_RELAY_URL, PENDING_DEV_FILE, PENDING_REG_FILE, build_control_client_config,
-    load_device_record, load_peers_store, load_pending_device, load_pending_reg, lock_state,
-    open_state_dir, pubkey_fingerprint_hex, remove_state_file, resolve_active_device_id,
+    DEFAULT_RELAY_URL, PENDING_DEV_FILE, PENDING_REG_CWT_FILE, PENDING_REG_FILE,
+    build_control_client_config, list_enrolled_device_ids, load_device_record, load_peers_store,
+    load_pending_device, load_pending_reg, load_pending_reg_cwt, lock_state, open_state_dir,
+    pubkey_fingerprint_hex, remove_state_file, resolve_active_device_id,
     resolve_effective_runtime_override, resolve_effective_state_dir, save_default_device_id,
     save_device_record, save_peers_store, save_pending_device, save_pending_reg,
+    save_pending_reg_cwt,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -322,16 +324,28 @@ fn print_json(val: &Value) {
     }
 }
 
-fn random_bytes_32() -> [u8; 32] {
+fn random_bytes_32() -> Result<[u8; 32], String> {
     let mut b = [0u8; 32];
-    fill_random(&mut b);
-    b
+    fill_random(&mut b).map_err(|e| format!("CSPRNG failure: {e}"))?;
+    Ok(b)
 }
 
-fn random_safe_id() -> u64 {
+fn random_safe_id() -> Result<u64, String> {
     let mut b = [0u8; 8];
-    fill_random(&mut b);
-    (u64::from_le_bytes(b) % MAX_SAFE_ID).saturating_add(1)
+    fill_random(&mut b).map_err(|e| format!("CSPRNG failure: {e}"))?;
+    Ok((u64::from_le_bytes(b) % MAX_SAFE_ID).saturating_add(1))
+}
+
+fn sanitize_cli_meta(input: &str) -> String {
+    let cleaned = sanitize_peer_text(input);
+    let mut out = String::with_capacity(cleaned.len());
+    for ch in cleaned.chars() {
+        match ch {
+            '\n' | '\r' | '\t' | '[' | ']' | '<' | '>' | '=' => out.push(' '),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn read_all_stdin_trimmed(max_bytes: usize) -> Result<Vec<u8>, String> {
@@ -499,10 +513,11 @@ async fn cmd_account_register(opts: &GlobalOpts, args: &[String]) -> Result<(), 
     let state_dir_path = resolve_effective_state_dir(opts.state_dir.as_deref())?;
     let state_dir = open_state_dir(&state_dir_path)?;
 
-    let (pending, root_secret) = if resume {
+    let (pending, root_secret, device_cwt) = if resume {
         let lock = lock_state(&state_dir)?;
         let pending = load_pending_reg(&state_dir)?
             .ok_or_else(|| "no pending_reg.bin found to resume".to_string())?;
+        let journaled_cwt = load_pending_reg_cwt(&state_dir)?;
         drop(lock);
         let root_path = root_key_out
             .as_ref()
@@ -514,21 +529,57 @@ async fn cmd_account_register(opts: &GlobalOpts, args: &[String]) -> Result<(), 
         if derived_root_pk != pending.root_pubkey {
             return Err("root key file does not match pending_reg.bin root_pubkey".to_string());
         }
-        (pending, root_secret)
+        let now_s = wall_now_secs();
+        let cwt = match journaled_cwt {
+            Some(existing)
+                if verify_device_cwt(
+                    &existing,
+                    &pending.root_pubkey,
+                    Some(&pending.device_pubkey),
+                    now_s,
+                )
+                .is_ok() =>
+            {
+                existing
+            }
+            _ => {
+                let root_sk = SigningKey::from_bytes(&root_secret);
+                let fresh = encode_device_cwt(
+                    &root_sk,
+                    &pending.device_pubkey,
+                    now_s,
+                    now_s.saturating_add(MAX_CWT_TTL_SECS),
+                )
+                .map_err(|e| format!("failed signing device CWT: {e}"))?;
+                let lock = lock_state(&state_dir)?;
+                save_pending_reg_cwt(&state_dir, &lock, &fresh)?;
+                drop(lock);
+                fresh
+            }
+        };
+        (pending, root_secret, cwt)
     } else {
         let handle = handle.ok_or_else(|| "account register requires --handle <h>".to_string())?;
         let root_path = root_key_out
             .as_ref()
             .ok_or_else(|| "account register requires --root-key-out <path>".to_string())?;
-        let root_secret = random_bytes_32();
-        let root_pubkey = SigningKey::from_bytes(&root_secret)
-            .verifying_key()
-            .to_bytes();
-        let device_secret = random_bytes_32();
+        let root_secret = random_bytes_32()?;
+        let root_sk = SigningKey::from_bytes(&root_secret);
+        let root_pubkey = root_sk.verifying_key().to_bytes();
+        let device_secret = random_bytes_32()?;
         let device_pubkey = SigningKey::from_bytes(&device_secret)
             .verifying_key()
             .to_bytes();
-        let idempotency_key = random_bytes_32();
+        let idempotency_key = random_bytes_32()?;
+
+        let now_s = wall_now_secs();
+        let device_cwt = encode_device_cwt(
+            &root_sk,
+            &device_pubkey,
+            now_s,
+            now_s.saturating_add(MAX_CWT_TTL_SECS),
+        )
+        .map_err(|e| format!("failed signing device CWT: {e}"))?;
 
         write_root_key_file(root_path, &root_secret)?;
         eprintln!(
@@ -547,8 +598,9 @@ async fn cmd_account_register(opts: &GlobalOpts, args: &[String]) -> Result<(), 
         };
         let lock = lock_state(&state_dir)?;
         save_pending_reg(&state_dir, &lock, &rec)?;
+        save_pending_reg_cwt(&state_dir, &lock, &device_cwt)?;
         drop(lock);
-        (rec, root_secret)
+        (rec, root_secret, device_cwt)
     };
 
     let invite_secret = if invite_stdin {
@@ -560,16 +612,6 @@ async fn cmd_account_register(opts: &GlobalOpts, args: &[String]) -> Result<(), 
     } else {
         return Err("account register requires --invite-stdin (secrets never accepted on argv)".to_string());
     };
-
-    let now_s = wall_now_secs();
-    let root_sk = SigningKey::from_bytes(&root_secret);
-    let device_cwt = encode_device_cwt(
-        &root_sk,
-        &pending.device_pubkey,
-        now_s,
-        now_s.saturating_add(MAX_CWT_TTL_SECS),
-    )
-    .map_err(|e| format!("failed signing device CWT: {e}"))?;
 
     let cfg = build_control_client_config(&pending.api_authority).map_err(|e| e.to_string())?;
     let client = ControlClient::new(cfg);
@@ -606,6 +648,7 @@ async fn cmd_account_register(opts: &GlobalOpts, args: &[String]) -> Result<(), 
     save_device_record(&state_dir_path, &lock, &dev_rec)?;
     save_default_device_id(&state_dir, &lock, resp.device_id)?;
     remove_state_file(&state_dir, &lock, PENDING_REG_FILE);
+    remove_state_file(&state_dir, &lock, PENDING_REG_CWT_FILE);
     drop(lock);
 
     let sn = compute_safety_number(resp.account_id, &pending.root_pubkey);
@@ -761,7 +804,7 @@ fn cmd_device_init(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
         }
     }
 
-    let device_secret = random_bytes_32();
+    let device_secret = random_bytes_32()?;
     let device_pubkey = SigningKey::from_bytes(&device_secret)
         .verifying_key()
         .to_bytes();
@@ -859,48 +902,47 @@ async fn cmd_device_install_cwt(opts: &GlobalOpts, args: &[String]) -> Result<()
 
     let state_dir_path = resolve_effective_state_dir(opts.state_dir.as_deref())?;
     let state_dir = open_state_dir(&state_dir_path)?;
-    let lock = lock_state(&state_dir)?;
 
-    let (dev_rec, consumed_pending) = if let Some(pending) = load_pending_device(&state_dir)? {
-        (
-            DeviceRecord {
-                account_id,
-                device_id,
-                root_pubkey,
-                device_secret: pending.device_secret,
-                device_pubkey: pending.device_pubkey,
-                device_cwt: device_cwt.clone(),
-                local_relay_policy: pending.local_relay_policy,
-                api_authority: pending.api_authority,
-                default_relay_url: pending.default_relay_url,
-                device_label: pending.device_label,
-            },
-            true,
+    // Read candidate device record under StateLock, verify CWT cryptographically, then
+    // drop StateLock BEFORE running the network PoP probe so we never commit an unprobed
+    // device record or hold StateLock across network I/O.
+    let (dev_rec, consumed_pending, claims) = {
+        let lock = lock_state(&state_dir)?;
+        let (dev_rec, consumed_pending) = if let Some(pending) = load_pending_device(&state_dir)? {
+            (
+                DeviceRecord {
+                    account_id,
+                    device_id,
+                    root_pubkey,
+                    device_secret: pending.device_secret,
+                    device_pubkey: pending.device_pubkey,
+                    device_cwt: device_cwt.clone(),
+                    local_relay_policy: pending.local_relay_policy,
+                    api_authority: pending.api_authority,
+                    default_relay_url: pending.default_relay_url,
+                    device_label: pending.device_label,
+                },
+                true,
+            )
+        } else {
+            let mut existing = load_device_record(&state_dir_path, device_id)?;
+            if existing.account_id != account_id || existing.root_pubkey != root_pubkey {
+                return Err("existing device record account_id/root_pubkey mismatch".to_string());
+            }
+            existing.device_cwt = device_cwt.clone();
+            (existing, false)
+        };
+
+        let claims = verify_device_cwt(
+            &dev_rec.device_cwt,
+            &dev_rec.root_pubkey,
+            Some(&dev_rec.device_pubkey),
+            wall_now_secs(),
         )
-    } else {
-        let mut existing = load_device_record(&state_dir_path, device_id)?;
-        if existing.account_id != account_id || existing.root_pubkey != root_pubkey {
-            return Err("existing device record account_id/root_pubkey mismatch".to_string());
-        }
-        existing.device_cwt = device_cwt.clone();
-        (existing, false)
+        .map_err(|e| format!("CWT verification failed (refusing install): {e}"))?;
+        drop(lock);
+        (dev_rec, consumed_pending, claims)
     };
-
-    // Strict cryptographic verification of CWT before persisting!
-    let claims = verify_device_cwt(
-        &dev_rec.device_cwt,
-        &dev_rec.root_pubkey,
-        Some(&dev_rec.device_pubkey),
-        wall_now_secs(),
-    )
-    .map_err(|e| format!("CWT verification failed (refusing install): {e}"))?;
-
-    save_device_record(&state_dir_path, &lock, &dev_rec)?;
-    save_default_device_id(&state_dir, &lock, device_id)?;
-    if consumed_pending {
-        remove_state_file(&state_dir, &lock, PENDING_DEV_FILE);
-    }
-    drop(lock);
 
     let mut pop_verified = false;
     if !skip_probe {
@@ -916,6 +958,15 @@ async fn cmd_device_install_cwt(opts: &GlobalOpts, args: &[String]) -> Result<()
             .map_err(|e| format!("GET /v1/accounts/me PoP probe failed (pass --skip-probe for offline install): {e}"))?;
         pop_verified = true;
     }
+
+    // Commit atomically only after both CWT verification and PoP probe succeed.
+    let lock = lock_state(&state_dir)?;
+    save_device_record(&state_dir_path, &lock, &dev_rec)?;
+    save_default_device_id(&state_dir, &lock, device_id)?;
+    if consumed_pending {
+        remove_state_file(&state_dir, &lock, PENDING_DEV_FILE);
+    }
+    drop(lock);
 
     // Best-effort notify running daemon if one exists for this device_id.
     notify_daemon_reload_if_running(opts, device_id).await;
@@ -1111,6 +1162,9 @@ async fn cmd_device_renew(opts: &GlobalOpts, args: &[String]) -> Result<(), Stri
     let cfg = build_control_client_config(&api_authority).map_err(|e| e.to_string())?;
     let client = ControlClient::new(cfg);
 
+    // CRITICAL (L4-1): NEVER blindly root-sign a pubkey returned by an untrusted server!
+    // Always source `device_pubkey` from explicit `--device-pubkey-b64` or derive it from the
+    // local enrolled `d<13hex>.dev.bin` secret key, then cross-check against `/v1/accounts/me`.
     let device_pubkey: [u8; 32] = if let Some(b64) = device_pubkey_b64_opt {
         let raw = B64
             .decode(b64.trim().as_bytes())
@@ -1118,22 +1172,43 @@ async fn cmd_device_renew(opts: &GlobalOpts, args: &[String]) -> Result<(), Stri
         raw.try_into()
             .map_err(|_| "--device-pubkey-b64 must decode to 32 bytes".to_string())?
     } else {
-        // Fetch device pubkey from `/v1/accounts/me` using root signer.
-        let me = client
-            .get_me_with_signer(&root_signer)
-            .await
-            .map_err(|e| e.to_string())?;
-        let dev_info = me
-            .devices
-            .iter()
-            .find(|d| d.device_id == device_id)
-            .ok_or_else(|| format!("device_id {device_id} not found on account"))?;
-        let raw = B64
+        let state_dir_path = resolve_effective_state_dir(opts.state_dir.as_deref())?;
+        let local_dev = load_device_record(&state_dir_path, device_id).map_err(|_| {
+            format!(
+                "local enrolled record for device_id={device_id} not found; pass --device-pubkey-b64 <b64> explicitly (refusing to sign server-supplied pubkey)"
+            )
+        })?;
+        if local_dev.account_id != account_id {
+            return Err(format!(
+                "local device record account_id={} does not match --account-id={account_id}",
+                local_dev.account_id
+            ));
+        }
+        let derived = SigningKey::from_bytes(&local_dev.device_secret)
+            .verifying_key()
+            .to_bytes();
+        if derived != local_dev.device_pubkey {
+            return Err("local device record device_secret/device_pubkey mismatch".to_string());
+        }
+        derived
+    };
+
+    // Cross-check server record if reachable: refuse to sign if the server claims a different pubkey!
+    if let Ok(me) = client.get_me_with_signer(&root_signer).await
+        && let Some(dev_info) = me.devices.iter().find(|d| d.device_id == device_id)
+    {
+        let srv_raw = B64
             .decode(dev_info.pubkey_b64.as_bytes())
             .map_err(|e| format!("invalid server pubkey_b64: {e}"))?;
-        raw.try_into()
-            .map_err(|_| "server device pubkey is not 32 bytes".to_string())?
-    };
+        let srv_pk: [u8; 32] = srv_raw
+            .try_into()
+            .map_err(|_| "server device pubkey is not 32 bytes".to_string())?;
+        if srv_pk != device_pubkey {
+            return Err(format!(
+                "REFUSING CWT renewal: server pubkey for device_id={device_id} disagrees with local/expected device_pubkey!"
+            ));
+        }
+    }
 
     let now_s = wall_now_secs();
     let root_sk = SigningKey::from_bytes(&root_secret);
@@ -1333,7 +1408,7 @@ fn cmd_peer_list(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                 "account_id={} state={} handle={} sn={}",
                 p.account_id,
                 trust_state_name(p.trust_state as u8),
-                p.handle_prop,
+                sanitize_cli_meta(&p.handle_prop),
                 compute_safety_number(p.account_id, &p.root_pubkey)
             );
         }
@@ -1371,22 +1446,65 @@ async fn cmd_peer_trust(opts: &GlobalOpts, args: &[String]) -> Result<(), String
     // or control-plane `GET /v1/accounts/<account_id>`.
     let (candidate_root, candidate_handle) =
         discover_peer_candidate(opts, &state_dir_path, &dev, auth_hash, account_id).await?;
-    let expected_sn = compute_safety_number(account_id, &candidate_root);
+    if candidate_root == [0u8; 32] {
+        return Err("refusing invalid all-zero candidate root_pubkey".to_string());
+    }
+    let candidate_fp = pubkey_fingerprint_hex(&candidate_root);
+    let short_fp = candidate_fp.get(..16).unwrap_or(candidate_fp.as_str());
+    let safe_handle = sanitize_cli_meta(&candidate_handle);
 
+    let mut reader = BufReader::new(
+        tty.try_clone()
+            .map_err(|e| format!("failed cloning /dev/tty handle: {e}"))?,
+    );
+
+    // Check if `peers.bin` already has a DIFFERENT pinned root_pubkey for this account!
+    let existing_root_opt = {
+        let state_dir = open_state_dir(&state_dir_path)?;
+        let _lock = lock_state(&state_dir)?;
+        let store = load_peers_store(&state_dir)?;
+        store
+            .peers
+            .iter()
+            .find(|p| p.api_authority_hash == auth_hash && p.account_id == account_id)
+            .map(|p| p.root_pubkey)
+            .filter(|pk| *pk != [0u8; 32])
+    };
+    if let Some(old_root) = existing_root_opt
+        && old_root != candidate_root
+    {
+        let old_fp = pubkey_fingerprint_hex(&old_root);
+        let warn = format!(
+            "WARNING: ROOT KEY CHANGED for account_id={account_id}!\n\
+             Previously pinned root fingerprint: {old_fp}\n\
+             Observed new root fingerprint:      {candidate_fp}\n\
+             This could indicate a MitM attack or account compromise.\n\
+             Type 'yes-replace-key' to acknowledge and continue: "
+        );
+        tty.write_all(warn.as_bytes())
+            .map_err(|e| format!("failed writing to /dev/tty: {e}"))?;
+        tty.flush()
+            .map_err(|e| format!("failed flushing /dev/tty: {e}"))?;
+        let mut confirm = String::new();
+        reader
+            .read_line(&mut confirm)
+            .map_err(|e| format!("failed reading from /dev/tty: {e}"))?;
+        if confirm.trim() != "yes-replace-key" {
+            return Err("root key replacement aborted by operator".to_string());
+        }
+    }
+
+    // Do NOT print the full expected Safety Number above the prompt — require genuine
+    // out-of-band verification from the peer's `mp-outpost whoami --safety-number`.
     let prompt = format!(
-        "Verifying peer account_id={account_id} (server handle: {candidate_handle})\n\
-         Candidate Safety Number: {expected_sn}\n\
-         Ask peer to run `mp-outpost whoami --safety-number` and type their Safety Number to pin:\n> "
+        "Verifying peer account_id={account_id} (server handle: {safe_handle}, root fp: {short_fp}...)\n\
+         Obtain the peer's Safety Number out-of-band (`mp-outpost whoami --safety-number`) and type it below to pin:\n> "
     );
     tty.write_all(prompt.as_bytes())
         .map_err(|e| format!("failed writing to /dev/tty: {e}"))?;
     tty.flush()
         .map_err(|e| format!("failed flushing /dev/tty: {e}"))?;
 
-    let mut reader = BufReader::new(
-        tty.try_clone()
-            .map_err(|e| format!("failed cloning /dev/tty handle: {e}"))?,
-    );
     let mut line = String::new();
     reader
         .read_line(&mut line)
@@ -1395,6 +1513,7 @@ async fn cmd_peer_trust(opts: &GlobalOpts, args: &[String]) -> Result<(), String
     if !verify_safety_number(account_id, &candidate_root, line.trim()) {
         return Err("Safety Number verification FAILED; peer NOT pinned".to_string());
     }
+    let expected_sn = compute_safety_number(account_id, &candidate_root);
 
     let state_dir = open_state_dir(&state_dir_path)?;
     let lock = lock_state(&state_dir)?;
@@ -1557,7 +1676,14 @@ async fn cmd_peer_revoke(opts: &GlobalOpts, args: &[String]) -> Result<(), Strin
     save_peers_store(&state_dir, &lock, &store)?;
     drop(lock);
 
-    notify_daemon_reload_if_running(opts, device_id).await;
+    // Notify ALL enrolled local daemons so multi-device revocation takes effect immediately!
+    let mut all_devices = list_enrolled_device_ids(&state_dir_path);
+    if !all_devices.contains(&device_id) {
+        all_devices.push(device_id);
+    }
+    for did in all_devices {
+        notify_daemon_reload_if_running(opts, did).await;
+    }
     println!("Revoked and blocked peer account_id={account_id}.");
     Ok(())
 }
@@ -1602,7 +1728,10 @@ async fn cmd_friend(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                 for f in &resp.friends {
                     println!(
                         "account_id={} handle={} state={} presence={}",
-                        f.account_id, f.handle, f.state, f.presence_status
+                        f.account_id,
+                        sanitize_cli_meta(&f.handle),
+                        f.state,
+                        f.presence_status
                     );
                 }
             }
@@ -2184,7 +2313,7 @@ async fn cmd_party(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                         "device={} account={} handle={} trust={} p2p={} sn={}",
                         m.device_id,
                         m.account_id,
-                        m.server_handle,
+                        sanitize_cli_meta(&m.server_handle),
                         trust_state_name(m.trust_state),
                         m.connected_p2p,
                         m.safety_number
@@ -2222,7 +2351,7 @@ async fn cmd_party(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
             let body = text_parts.join(" ");
             let req = PartySendChatReq {
                 party_id,
-                client_msg_id: random_safe_id(),
+                client_msg_id: random_safe_id()?,
                 room_scope,
                 target_device_id,
                 body,
@@ -2294,7 +2423,7 @@ async fn cmd_party(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                 .await
                 .map_err(|e| e.to_string())?;
             let resp = decode_party_poll_resp(&raw).map_err(|e| e.to_string())?;
-            print_poll_resp(opts, &resp);
+            print_poll_resp(opts, &resp)?;
             Ok(())
         }
         "wait" => {
@@ -2343,7 +2472,7 @@ async fn cmd_party(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                 .await
                 .map_err(|e| e.to_string())?;
             let resp = decode_party_poll_resp(&raw).map_err(|e| e.to_string())?;
-            print_poll_resp(opts, &resp);
+            print_poll_resp(opts, &resp)?;
             Ok(())
         }
         "notice" => {
@@ -2553,7 +2682,7 @@ async fn cmd_board(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
             };
             let req = PartyPostBoardReq {
                 party_id,
-                client_msg_id: random_safe_id(),
+                client_msg_id: random_safe_id()?,
                 room_scope,
                 payload,
             };
@@ -2610,7 +2739,7 @@ async fn cmd_board(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                 .await
                 .map_err(|e| e.to_string())?;
             let resp = decode_party_poll_resp(&raw).map_err(|e| e.to_string())?;
-            print_poll_resp(opts, &resp);
+            print_poll_resp(opts, &resp)?;
             Ok(())
         }
         other => Err(format!("unknown board subcommand '{other}'")),
@@ -2706,12 +2835,18 @@ async fn cmd_daemon(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
             let rt_dir = open_or_create_private_dir(&rt_path).map_err(|e| e.to_string())?;
 
             if force {
-                let outcome = force_stop_daemon(
-                    &rt_dir,
-                    device_id,
-                    Duration::from_secs(2),
-                    Duration::from_secs(2),
-                )
+                let rt_path_b = rt_path.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let rt_dir = open_or_create_private_dir(&rt_path_b)?;
+                    force_stop_daemon(
+                        &rt_dir,
+                        device_id,
+                        Duration::from_secs(2),
+                        Duration::from_secs(2),
+                    )
+                })
+                .await
+                .map_err(|e| format!("force stop task failed: {e}"))?
                 .map_err(|e| e.to_string())?;
                 if opts.json {
                     print_json(&json!({
@@ -2732,17 +2867,23 @@ async fn cmd_daemon(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                 return Ok(());
             }
 
-            // Graceful stop serialized under startup.lock.
-            let _startup_lock = FlockGuard::lock_exclusive_with_deadline(
-                &rt_dir,
-                STARTUP_LOCK_NAME,
-                Duration::from_secs(5),
-            )
+            // Graceful stop serialized under startup.lock (acquired via spawn_blocking).
+            let rt_path_b = rt_path.clone();
+            let (_startup_lock, already_stopped) = tokio::task::spawn_blocking(move || {
+                let rt_dir = open_or_create_private_dir(&rt_path_b)?;
+                let lock = FlockGuard::lock_exclusive_with_deadline(
+                    &rt_dir,
+                    STARTUP_LOCK_NAME,
+                    Duration::from_secs(5),
+                )?;
+                let free = FlockGuard::probe_lock_free(&rt_dir, DAEMON_LOCK_NAME)?;
+                Ok::<(FlockGuard, bool), DaemonError>((lock, free))
+            })
+            .await
+            .map_err(|e| format!("startup lock task failed: {e}"))?
             .map_err(|e| e.to_string())?;
 
-            if FlockGuard::probe_lock_free(&rt_dir, DAEMON_LOCK_NAME)
-                .map_err(|e| e.to_string())?
-            {
+            if already_stopped {
                 if opts.json {
                     print_json(&json!({ "stopped": true, "already_stopped": true }));
                 } else {
@@ -2756,8 +2897,14 @@ async fn cmd_daemon(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
             } else {
                 DrainMode::StopDetach
             };
-            // Connect directly to d.sock without acquiring startup.lock again (we already hold it!).
-            let stop_res = send_drain_direct(&rt_path, device_id, mode).await;
+            // Connect directly to d.sock with a bounded 3s timeout so a wedged daemon cannot hang stop.
+            let stop_res = tokio::time::timeout(
+                Duration::from_secs(3),
+                send_drain_direct(&rt_path, device_id, mode),
+            )
+            .await
+            .map_err(|_| "timed out sending graceful stop to daemon (3s)".to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()));
             if let Err(err) = stop_res {
                 return Err(format!(
                     "graceful stop failed ({err}); retry with `mp-outpost daemon stop --force`"
@@ -2782,17 +2929,26 @@ async fn cmd_daemon(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
             let rt_dir = open_or_create_private_dir(&rt_path).map_err(|e| e.to_string())?;
 
             {
-                let _startup_lock = FlockGuard::lock_exclusive_with_deadline(
-                    &rt_dir,
-                    STARTUP_LOCK_NAME,
-                    Duration::from_secs(5),
-                )
+                let rt_path_b = rt_path.clone();
+                let (_startup_lock, lock_free) = tokio::task::spawn_blocking(move || {
+                    let rt_dir = open_or_create_private_dir(&rt_path_b)?;
+                    let lock = FlockGuard::lock_exclusive_with_deadline(
+                        &rt_dir,
+                        STARTUP_LOCK_NAME,
+                        Duration::from_secs(5),
+                    )?;
+                    let free = FlockGuard::probe_lock_free(&rt_dir, DAEMON_LOCK_NAME)?;
+                    Ok::<(FlockGuard, bool), DaemonError>((lock, free))
+                })
+                .await
+                .map_err(|e| format!("startup lock task failed: {e}"))?
                 .map_err(|e| e.to_string())?;
-                if !FlockGuard::probe_lock_free(&rt_dir, DAEMON_LOCK_NAME)
-                    .map_err(|e| e.to_string())?
-                {
-                    let _ = send_drain_direct(&rt_path, device_id, DrainMode::RestartKeepParty)
-                        .await;
+                if !lock_free {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        send_drain_direct(&rt_path, device_id, DrainMode::RestartKeepParty),
+                    )
+                    .await;
                     wait_daemon_lock_free(&rt_dir, Duration::from_secs(5)).await?;
                 }
             }
@@ -2825,14 +2981,18 @@ async fn cmd_daemon(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
             let device_id = resolve_active_device_id(&state_dir_path, opts.device_id)?;
             let rt_path = resolve_runtime_dir(device_id, runtime_override.as_deref())
                 .map_err(|e| e.to_string())?;
-            let log_path = rt_path.join(DAEMON_LOG_NAME);
-            match std::fs::read_to_string(&log_path) {
-                Ok(content) => {
+            let rt_dir = open_or_create_private_dir(&rt_path).map_err(|e| e.to_string())?;
+            match read_file_in_dir(rt_dir.as_raw_fd(), DAEMON_LOG_NAME, 4 * 1024 * 1024) {
+                Ok(Some(raw)) => {
+                    let content = String::from_utf8_lossy(&raw);
                     print!("{content}");
                     Ok(())
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    println!("No daemon log file yet at '{}'.", log_path.display());
+                Ok(None) => {
+                    println!(
+                        "No daemon log file yet at '{}'.",
+                        rt_path.join(DAEMON_LOG_NAME).display()
+                    );
                     Ok(())
                 }
                 Err(e) => Err(format!("failed reading daemon log: {e}")),
@@ -2950,8 +3110,11 @@ fn print_status_resp(opts: &GlobalOpts, st: &crate::ipc_payloads::StatusResp) {
     }
 }
 
-fn print_poll_resp(opts: &GlobalOpts, resp: &crate::ipc_payloads::PartyPollIpcResp) {
-    let nonce = random_safe_id();
+fn print_poll_resp(
+    opts: &GlobalOpts,
+    resp: &crate::ipc_payloads::PartyPollIpcResp,
+) -> Result<(), String> {
+    let nonce = random_safe_id()?;
     if opts.json {
         let events: Vec<Value> = resp
             .events
@@ -2969,12 +3132,12 @@ fn print_poll_resp(opts: &GlobalOpts, resp: &crate::ipc_payloads::PartyPollIpcRe
                     "untrusted_remote": true,
                     "sender_account_id": provenance.sender_account_id,
                     "sender_device_id": provenance.sender_device_id,
-                    "sender_handle": provenance.sender_handle,
+                    "sender_handle": sanitize_peer_text(&provenance.sender_handle),
                     "safety_number": provenance.safety_number,
-                    "room_scope": room_scope,
-                    "target_selector": target_selector,
+                    "room_scope": sanitize_peer_text(room_scope),
+                    "target_selector": sanitize_peer_text(target_selector),
                     "timestamp_ns": timestamp_ns,
-                    "body": body,
+                    "body": sanitize_peer_text(body),
                 }),
                 IpcPartyEventKind::BridgeEnvelope {
                     provenance,
@@ -2986,9 +3149,9 @@ fn print_poll_resp(opts: &GlobalOpts, resp: &crate::ipc_payloads::PartyPollIpcRe
                     "untrusted_remote": true,
                     "sender_account_id": provenance.sender_account_id,
                     "sender_device_id": provenance.sender_device_id,
-                    "sender_handle": provenance.sender_handle,
+                    "sender_handle": sanitize_peer_text(&provenance.sender_handle),
                     "safety_number": provenance.safety_number,
-                    "room_scope": room_scope,
+                    "room_scope": sanitize_peer_text(room_scope),
                     "payload_b64": B64.encode(payload),
                 }),
                 IpcPartyEventKind::ControlNotice {
@@ -3002,9 +3165,10 @@ fn print_poll_resp(opts: &GlobalOpts, resp: &crate::ipc_payloads::PartyPollIpcRe
                     "untrusted_remote": true,
                     "sender_account_id": provenance.sender_account_id,
                     "sender_device_id": provenance.sender_device_id,
+                    "sender_handle": sanitize_peer_text(&provenance.sender_handle),
                     "notice_kind": notice_kind,
                     "party_epoch": party_epoch,
-                    "text": text,
+                    "text": sanitize_peer_text(text),
                 }),
                 IpcPartyEventKind::MembershipChanged {
                     party_epoch,
@@ -3013,7 +3177,7 @@ fn print_poll_resp(opts: &GlobalOpts, resp: &crate::ipc_payloads::PartyPollIpcRe
                     "event_seq": ev.event_seq,
                     "kind": "membership_changed",
                     "party_epoch": party_epoch,
-                    "summary": summary,
+                    "summary": sanitize_peer_text(summary),
                 }),
             })
             .collect();
@@ -3033,16 +3197,19 @@ fn print_poll_resp(opts: &GlobalOpts, resp: &crate::ipc_payloads::PartyPollIpcRe
                 IpcPartyEventKind::Chat {
                     provenance,
                     room_scope,
+                    target_selector,
                     body,
                     ..
                 } => {
+                    let payload = format!(
+                        "scope: {room_scope}\ntarget: {target_selector}\n{body}"
+                    );
                     println!(
-                        "[seq={} scope={} from={}({})]\n{}",
+                        "[seq={} from={}({})]\n{}",
                         ev.event_seq,
-                        room_scope,
-                        provenance.sender_handle,
+                        sanitize_cli_meta(&provenance.sender_handle),
                         provenance.sender_account_id,
-                        fence_peer_text(body, nonce)
+                        fence_peer_text(&payload, nonce)
                     );
                 }
                 IpcPartyEventKind::BridgeEnvelope {
@@ -3050,14 +3217,17 @@ fn print_poll_resp(opts: &GlobalOpts, resp: &crate::ipc_payloads::PartyPollIpcRe
                     room_scope,
                     payload,
                 } => {
+                    let fenced_body = format!(
+                        "scope: {room_scope}\npayload_b64: {}",
+                        B64.encode(payload)
+                    );
                     println!(
-                        "[seq={} board={} from={}({}) bytes={}]\n{}",
+                        "[seq={} board from={}({}) bytes={}]\n{}",
                         ev.event_seq,
-                        room_scope,
-                        provenance.sender_handle,
+                        sanitize_cli_meta(&provenance.sender_handle),
                         provenance.sender_account_id,
                         payload.len(),
-                        fence_peer_text(&B64.encode(payload), nonce)
+                        fence_peer_text(&fenced_body, nonce)
                     );
                 }
                 IpcPartyEventKind::ControlNotice {
@@ -3066,15 +3236,20 @@ fn print_poll_resp(opts: &GlobalOpts, resp: &crate::ipc_payloads::PartyPollIpcRe
                     println!(
                         "[seq={} notice from={}({})]\n{}",
                         ev.event_seq,
-                        provenance.sender_handle,
+                        sanitize_cli_meta(&provenance.sender_handle),
                         provenance.sender_account_id,
                         fence_peer_text(text, nonce)
                     );
                 }
                 IpcPartyEventKind::MembershipChanged { summary, .. } => {
-                    println!("[seq={} membership] {summary}", ev.event_seq);
+                    println!(
+                        "[seq={} membership] {}",
+                        ev.event_seq,
+                        sanitize_cli_meta(summary)
+                    );
                 }
             }
         }
     }
+    Ok(())
 }

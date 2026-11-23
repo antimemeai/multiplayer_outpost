@@ -552,3 +552,326 @@ async fn oracle5_superseded_4409_reconnect_replaces_stale_conn_and_delivers_fram
     bob.close().await;
     Ok(())
 }
+
+/// Oracle 6: Simultaneous mutual dial glare resolves deterministically (smaller EndpointId
+/// initiator wins) with one surviving live connection, zero double-close, and clean
+/// bidirectional frame exchange on all 3 lanes.
+#[tokio::test]
+async fn oracle6_simultaneous_mutual_dial_glare_resolves_deterministically() -> Result<(), Box<dyn std::error::Error>> {
+    for (seed_a, seed_b) in [(0x91u8, 0x92u8), (0x93u8, 0x94u8), (0xA1u8, 0xA2u8)] {
+        let mut alice = spawn_no_relays(101, seed_a).await?;
+        let mut bob = spawn_no_relays(202, seed_b).await?;
+
+        let alice_pk = alice.local_pubkey();
+        let bob_pk = bob.local_pubkey();
+
+        alice.set_allowed_peers(HashSet::from([bob_pk]));
+        bob.set_allowed_peers(HashSet::from([alice_pk]));
+
+        let alice_desc = alice.local_endpoint_descriptor();
+        let bob_desc = bob.local_endpoint_descriptor();
+
+        let target_bob = PeerDialTarget {
+            device_id: 202,
+            device_pubkey: bob_pk,
+            remote_relay_policy: RelayPolicy::NoRelays,
+            endpoint: bob_desc,
+        };
+        let target_alice = PeerDialTarget {
+            device_id: 101,
+            device_pubkey: alice_pk,
+            remote_relay_policy: RelayPolicy::NoRelays,
+            endpoint: alice_desc,
+        };
+
+        let (res_a, res_b) = tokio::join!(
+            alice.connect_peer(target_bob),
+            bob.connect_peer(target_alice),
+        );
+        // At least the winning side must succeed; if the losing side raced with 4409 before
+        // its incoming winner registered, wait briefly for convergence and verify both are live.
+        assert!(
+            res_a.is_ok() || res_b.is_ok(),
+            "at least one dial must succeed: a={res_a:?}, b={res_b:?}"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if alice.is_peer_connected(&bob_pk) && bob.is_peer_connected(&alice_pk) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(alice.is_peer_connected(&bob_pk), "alice must hold live peer");
+        assert!(bob.is_peer_connected(&alice_pk), "bob must hold live peer");
+
+        // Give any superseded losing connection time to settle and confirm neither side drops!
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            alice.is_peer_connected(&bob_pk),
+            "alice connection must survive glare settlement"
+        );
+        assert!(
+            bob.is_peer_connected(&alice_pk),
+            "bob connection must survive glare settlement"
+        );
+
+        let msg_ab = P2pPartyFrame::ChatMessage(P2pChatMessage {
+            room_scope: "party/glare".into(),
+            target_selector: "@bob".into(),
+            sender_handle: "alice".into(),
+            timestamp_ns: 2001,
+            body: "glare-survived-a-to-b".into(),
+        });
+        let msg_ba = P2pPartyFrame::ControlNotice(P2pControlNotice {
+            kind: P2pControlNoticeKind::SyncAck,
+            party_epoch: 9,
+            text: "glare-survived-b-to-a".into(),
+        });
+
+        alice.send_frame(bob_pk, &msg_ab).await?;
+        assert_eq!(
+            wait_for_frame(&mut bob, alice_pk, P2pLane::Causal).await,
+            Some(msg_ab)
+        );
+        bob.send_frame(alice_pk, &msg_ba).await?;
+        assert_eq!(
+            wait_for_frame(&mut alice, bob_pk, P2pLane::Control).await,
+            Some(msg_ba)
+        );
+
+        alice.close().await;
+        bob.close().await;
+    }
+    Ok(())
+}
+
+/// Oracle 7: Malformed / invalid Lane 2 datagrams are dropped cleanly without closing the
+/// QUIC connection or disrupting Lane 0/1 streams.
+#[tokio::test]
+async fn oracle7_invalid_lane2_datagram_dropped_without_killing_lane0_or_lane1() -> Result<(), Box<dyn std::error::Error>> {
+    let mut alice = spawn_no_relays(101, 0xB1).await?;
+    let alice_pk = alice.local_pubkey();
+    let alice_desc = alice.local_endpoint_descriptor();
+
+    let raw_sk = SecretKey::from_bytes(&[0xB2; 32]);
+    let raw_pk = *raw_sk.public().as_bytes();
+    alice.set_allowed_peers(HashSet::from([raw_pk]));
+
+    let transport_cfg = iroh::endpoint::QuicTransportConfig::builder()
+        .datagram_receive_buffer_size(Some(65_536))
+        .datagram_send_buffer_size(65_536)
+        .build();
+    let raw_ep = Endpoint::builder(presets::Minimal)
+        .secret_key(raw_sk)
+        .alpns(vec![ALPN.to_vec()])
+        .relay_mode(RelayMode::Disabled)
+        .transport_config(transport_cfg)
+        .bind()
+        .await?;
+
+    let alice_id = PublicKey::from_bytes(&alice_pk)?;
+    let alice_addr = EndpointAddr::from_parts(alice_id, descriptor_to_transport_addrs(&alice_desc));
+    let conn = raw_ep.connect(alice_addr, ALPN).await?;
+
+    let (mut s0_send, mut s0_recv) = conn.open_bi().await?;
+    s0_send.write_all(&STREAM_INIT_MARKER.to_le_bytes()).await?;
+    let (mut s4_send, _s4_recv) = conn.open_bi().await?;
+    s4_send.write_all(&STREAM_INIT_MARKER.to_le_bytes()).await?;
+    let mut ack = [0u8; 4];
+    s0_recv.read_exact(&mut ack).await?;
+    assert_eq!(u32::from_le_bytes(ack), STREAM_INIT_MARKER);
+    assert!(wait_for_connected(&mut alice, raw_pk).await);
+
+    // Send malformed Lane 2 datagrams (garbage bytes + wrong frame kind for Lane 2).
+    conn.send_datagram(bytes::Bytes::from_static(&[0xFF, 0x00, 0xDE, 0xAD]))?;
+    conn.send_datagram(bytes::Bytes::from_static(&[0x01, 0x02]))?;
+
+    // Wait briefly and confirm QUIC connection is STILL alive!
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(conn.close_reason().is_none());
+    assert!(alice.is_peer_connected(&raw_pk));
+
+    // Send valid Lane 0 ControlNotice and Lane 1 ChatMessage over Streams 0 and 4.
+    let notice = P2pPartyFrame::ControlNotice(P2pControlNotice {
+        kind: P2pControlNoticeKind::Status,
+        party_epoch: 3,
+        text: "still-alive-after-bad-dgram".into(),
+    });
+    let enc_notice = outpost_core::p2p_wire::encode_p2p_party_frame(&notice)?;
+    let notice_len = u32::try_from(enc_notice.len())?;
+    s0_send.write_all(&notice_len.to_le_bytes()).await?;
+    s0_send.write_all(&enc_notice).await?;
+
+    let chat = P2pPartyFrame::ChatMessage(P2pChatMessage {
+        room_scope: "party/main".into(),
+        target_selector: "@all".into(),
+        sender_handle: "raw".into(),
+        timestamp_ns: 3001,
+        body: "lane1-still-works".into(),
+    });
+    let enc_chat = outpost_core::p2p_wire::encode_p2p_party_frame(&chat)?;
+    let chat_len = u32::try_from(enc_chat.len())?;
+    s4_send.write_all(&chat_len.to_le_bytes()).await?;
+    s4_send.write_all(&enc_chat).await?;
+
+    // Send valid Lane 2 EphemeralPulse datagram too.
+    let pulse = P2pPartyFrame::EphemeralPulse(P2pEphemeralPulse {
+        activity_state: P2pActivityState::Working,
+        timestamp_ns: 3002,
+        status: "valid-pulse".into(),
+    });
+    let enc_pulse = outpost_core::p2p_wire::encode_p2p_party_frame(&pulse)?;
+    conn.send_datagram(bytes::Bytes::from(enc_pulse))?;
+
+    assert_eq!(
+        wait_for_frame(&mut alice, raw_pk, P2pLane::Control).await,
+        Some(notice)
+    );
+    assert_eq!(
+        wait_for_frame(&mut alice, raw_pk, P2pLane::Causal).await,
+        Some(chat)
+    );
+    assert_eq!(
+        wait_for_frame(&mut alice, raw_pk, P2pLane::Ephemeral).await,
+        Some(pulse)
+    );
+
+    raw_ep.close().await;
+    alice.close().await;
+    Ok(())
+}
+
+/// Oracle 8: `set_allowed_peers_with_close_code(..., CLOSE_UNAUTHORIZED)` closes removed
+/// peers with exact code `4401`, and `split()` enables concurrent send + revoke + close
+/// without deadlock.
+#[tokio::test]
+async fn oracle8_allowlist_close_code_4401_and_split_concurrent_send_revoke() -> Result<(), Box<dyn std::error::Error>> {
+    // Part A: `set_allowed_peers_with_close_code(..., 4401)`
+    {
+        let mut alice = spawn_no_relays(101, 0xC1).await?;
+        let mut bob = spawn_no_relays(202, 0xC2).await?;
+        let alice_pk = alice.local_pubkey();
+        let bob_pk = bob.local_pubkey();
+
+        alice.set_allowed_peers(HashSet::from([bob_pk]));
+        bob.set_allowed_peers(HashSet::from([alice_pk]));
+        alice
+            .connect_peer(PeerDialTarget {
+                device_id: 202,
+                device_pubkey: bob_pk,
+                remote_relay_policy: RelayPolicy::NoRelays,
+                endpoint: bob.local_endpoint_descriptor(),
+            })
+            .await?;
+
+        assert!(wait_for_connected(&mut alice, bob_pk).await);
+        assert!(wait_for_connected(&mut bob, alice_pk).await);
+
+        // Suspend allowlist with 4401 (CLOSE_UNAUTHORIZED) instead of 4403!
+        alice.set_allowed_peers_with_close_code(HashSet::new(), CLOSE_UNAUTHORIZED);
+
+        assert_eq!(
+            wait_for_disconnect(&mut alice, bob_pk).await,
+            Some(CLOSE_UNAUTHORIZED)
+        );
+        assert_eq!(
+            wait_for_disconnect(&mut bob, alice_pk).await,
+            Some(CLOSE_UNAUTHORIZED)
+        );
+
+        alice.close().await;
+        bob.close().await;
+    }
+
+    // Part B: `split()` concurrent send + revoke + wait_online + watch_addr + close without deadlock
+    {
+        let alice = spawn_no_relays(101, 0xC3).await?;
+        let mut bob = spawn_no_relays(202, 0xC4).await?;
+
+        let (alice_handle, mut alice_events) = alice.split();
+        let alice_pk = alice_handle.local_pubkey();
+        let bob_pk = bob.local_pubkey();
+
+        // `wait_online` is an immediate no-op under NoRelays and `watch_addr` returns a live watcher.
+        alice_handle.wait_online(Duration::from_millis(50)).await;
+        let _addr_watcher = alice_handle.watch_addr();
+
+        alice_handle.set_allowed_peers(HashSet::from([bob_pk]));
+        bob.set_allowed_peers(HashSet::from([alice_pk]));
+
+        let event_task = tokio::spawn(async move {
+            let mut connected = false;
+            let mut disconnected_code = None;
+            while let Some(ev) = alice_events.recv_event().await {
+                match ev {
+                    P2pTransportEvent::PeerConnected { peer_pubkey } if peer_pubkey == bob_pk => {
+                        connected = true;
+                    }
+                    P2pTransportEvent::PeerDisconnected {
+                        peer_pubkey,
+                        reason_code,
+                    } if peer_pubkey == bob_pk => {
+                        disconnected_code = Some(reason_code);
+                    }
+                    _ => {}
+                }
+            }
+            (connected, disconnected_code)
+        });
+
+        alice_handle
+            .connect_peer(PeerDialTarget {
+                device_id: 202,
+                device_pubkey: bob_pk,
+                remote_relay_policy: RelayPolicy::NoRelays,
+                endpoint: bob.local_endpoint_descriptor(),
+            })
+            .await?;
+        assert!(wait_for_connected(&mut bob, alice_pk).await);
+
+        // Concurrent sends from two Arc<PartyP2pHandle> clones while event_task drains events.
+        let h1 = std::sync::Arc::clone(&alice_handle);
+        let h2 = std::sync::Arc::clone(&alice_handle);
+        let send1 = tokio::spawn(async move {
+            let msg = P2pPartyFrame::ChatMessage(P2pChatMessage {
+                room_scope: "party/split".into(),
+                target_selector: "@bob".into(),
+                sender_handle: "alice".into(),
+                timestamp_ns: 4001,
+                body: "concurrent-send-1".into(),
+            });
+            h1.send_frame(bob_pk, &msg).await
+        });
+        let send2 = tokio::spawn(async move {
+            let ctrl = P2pPartyFrame::ControlNotice(P2pControlNotice {
+                kind: P2pControlNoticeKind::SyncAck,
+                party_epoch: 1,
+                text: "concurrent-send-2".into(),
+            });
+            h2.send_frame(bob_pk, &ctrl).await
+        });
+        send1.await??;
+        send2.await??;
+
+        assert!(wait_for_frame(&mut bob, alice_pk, P2pLane::Control).await.is_some());
+        assert!(wait_for_frame(&mut bob, alice_pk, P2pLane::Causal).await.is_some());
+
+        // Revoke concurrently while event_task is running.
+        alice_handle.revoke_peer(bob_pk, CLOSE_PEER_REVOKED);
+        assert_eq!(
+            wait_for_disconnect(&mut bob, alice_pk).await,
+            Some(CLOSE_PEER_REVOKED)
+        );
+
+        // Closing the handle wakes `alice_events.recv_event()` -> `None` even while `alice_handle` is still in scope.
+        alice_handle.close().await;
+        let (connected, disconnected_code) =
+            tokio::time::timeout(Duration::from_secs(3), event_task).await??;
+        assert!(connected);
+        assert_eq!(disconnected_code, Some(CLOSE_PEER_REVOKED));
+
+        bob.close().await;
+    }
+    Ok(())
+}
