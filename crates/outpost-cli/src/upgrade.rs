@@ -52,6 +52,42 @@ const MAX_TAR_ENTRIES: usize = 16;
 const MAX_VERSION_LEN: usize = 64;
 const MAX_FILENAME_LEN: usize = 128;
 
+pub const SELF_UPGRADE_DISABLE_ENV: &str = "OUTPOST_NO_SELF_UPGRADE";
+
+fn env_flag_truthy(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn self_upgrade_disabled_reason(env_val: Option<&str>) -> Option<String> {
+    if cfg!(feature = "packaged") {
+        return Some(
+            "in-place self-upgrade is disabled in this package-manager build (--features packaged); \
+             upgrade via your package manager (e.g. `brew upgrade mp-outpost`, `yay -Syu mp-outpost-bin`, \
+             `pacman -Syu`, or `nix profile upgrade`), or run `mp-outpost upgrade --check` to check for updates read-only."
+                .to_string(),
+        );
+    }
+    if env_val.is_some_and(env_flag_truthy) {
+        return Some(format!(
+            "in-place self-upgrade is disabled by {SELF_UPGRADE_DISABLE_ENV}; \
+             upgrade via your package manager (e.g. `brew upgrade mp-outpost`, `yay -Syu mp-outpost-bin`, \
+             `pacman -Syu`, or `nix profile upgrade`), or run `mp-outpost upgrade --check` to check for updates read-only."
+        ));
+    }
+    None
+}
+
+fn enforce_self_upgrade_policy(check_only: bool, env_val: Option<&str>) -> Result<bool, String> {
+    let disabled = self_upgrade_disabled_reason(env_val);
+    if !check_only && let Some(reason) = disabled {
+        return Err(reason);
+    }
+    Ok(disabled.is_some())
+}
+
 #[derive(Debug, Clone)]
 struct UpgradeArgs {
     check: bool,
@@ -884,6 +920,8 @@ async fn send_graceful_drain(sock_path: &Path, device_id: u64) -> Result<(), ()>
 /// Runs `mp-outpost upgrade [--check] [--yes|-y] [--version <vX.Y.Z|latest>] [--base-url <url>] [--install-path <path>]`.
 pub async fn run_upgrade(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     let parsed = parse_upgrade_args(args)?;
+    let env_guard = std::env::var(SELF_UPGRADE_DISABLE_ENV).ok();
+    let self_upgrade_disabled = enforce_self_upgrade_policy(parsed.check, env_guard.as_deref())?;
     let target = current_target_slug()?;
 
     let base_url = match parsed.base_url {
@@ -914,6 +952,7 @@ pub async fn run_upgrade(opts: &GlobalOpts, args: &[String]) -> Result<(), Strin
                 "current_version": format!("v{PKG_VERSION}"),
                 "latest_version": latest_version,
                 "update_available": update_available,
+                "self_upgrade_disabled": self_upgrade_disabled,
                 "target": target,
                 "asset": asset.filename,
                 "sha256": asset.sha256,
@@ -1206,6 +1245,48 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn self_upgrade_guard_enforces_packaged_and_env_while_allowing_check() -> Result<(), String> {
+        // Read-only `--check` MUST remain allowed even when OUTPOST_NO_SELF_UPGRADE=1 or --features packaged
+        assert!(enforce_self_upgrade_policy(true, Some("1"))?);
+        assert!(enforce_self_upgrade_policy(true, Some("true"))?);
+        assert!(enforce_self_upgrade_policy(true, Some("YES"))?);
+
+        // Mutating self-upgrade MUST be refused when env is truthy
+        let err_env = enforce_self_upgrade_policy(false, Some("1"))
+            .err()
+            .unwrap_or_default();
+        assert!(
+            err_env.contains("brew upgrade mp-outpost") && err_env.contains("upgrade --check"),
+            "unexpected guard error: {err_env}"
+        );
+        assert!(enforce_self_upgrade_policy(false, Some("true")).is_err());
+        assert!(enforce_self_upgrade_policy(false, Some("yes")).is_err());
+        assert!(enforce_self_upgrade_policy(false, Some("on")).is_err());
+
+        #[cfg(feature = "packaged")]
+        {
+            assert!(enforce_self_upgrade_policy(true, None)?);
+            let err_pkg = enforce_self_upgrade_policy(false, None)
+                .err()
+                .unwrap_or_default();
+            assert!(
+                err_pkg.contains("packaged") && err_pkg.contains("brew upgrade mp-outpost"),
+                "unexpected packaged error: {err_pkg}"
+            );
+        }
+
+        #[cfg(not(feature = "packaged"))]
+        {
+            assert!(!enforce_self_upgrade_policy(false, None)?);
+            assert!(!enforce_self_upgrade_policy(false, Some("0"))?);
+            assert!(!enforce_self_upgrade_policy(false, Some("false"))?);
+            assert!(!enforce_self_upgrade_policy(false, Some(""))?);
+        }
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn file_url_upgrade_check_tamper_and_atomic_install() -> Result<(), String> {
         let target = current_target_slug()?;
@@ -1279,7 +1360,30 @@ mod tests {
         )
         .await?;
 
+        // 2. Under `--features packaged`, mutating `--yes` MUST be refused while `--check` succeeded above.
+        #[cfg(feature = "packaged")]
+        {
+            let err = run_upgrade(
+                &opts,
+                &[
+                    "--yes".to_string(),
+                    "--base-url".to_string(),
+                    base_url,
+                ],
+            )
+            .await
+            .err()
+            .unwrap_or_default();
+            assert!(
+                err.contains("packaged") && err.contains("brew upgrade mp-outpost"),
+                "expected packaged guard error, got: {err}"
+            );
+            return Ok(());
+        }
+
         // 2. Full atomic install into a temp `--install-path` succeeds with 0755 and passes smoke test.
+        #[cfg(not(feature = "packaged"))]
+        {
         let install_dir = tempfile::tempdir().map_err(|e| format!("install dir: {e}"))?;
         let install_path = install_dir.path().join("mp-outpost");
         fs::write(&install_path, b"old-binary").map_err(|e| format!("seed old: {e}"))?;
@@ -1330,5 +1434,6 @@ mod tests {
         );
 
         Ok(())
+        }
     }
 }
