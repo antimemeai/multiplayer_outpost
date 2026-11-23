@@ -39,4 +39,7 @@ pub use runtime_dir::{
     validate_path_hygiene, validate_sun_path_budget, validate_sun_path_budget_with_limit,
 };
 pub use server::{DaemonConfig, DaemonExitReason, DaemonHandler, DaemonServer, LifecycleState};
-pub use state_io::{STATE_LOCK_NAME, StateLock, atomic_write_in_dir, read_file_in_dir};
+pub use state_io::{
+    STATE_LOCK_NAME, StateLock, atomic_write_in_dir, atomic_write_in_dir_no_replace,
+    open_dir_nofollow, read_file_in_dir, read_regular_file_bounded_nofollow,
+};

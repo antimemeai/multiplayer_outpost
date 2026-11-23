@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use mp_protocol::MAX_SAFE_ID;
 use outpost_core::fence::SecretMatchKind;
+use outpost_core::ipc_wire::IPC_SCHEMA_VER;
 use outpost_mcp::{
     BackendError, BoardEnvelopeEvent, BoardPostReq, BoardReadResp, BoxFuture, CancellationToken,
     DEFAULT_WAIT_TIMEOUT_MS, MAX_LINE_BYTES, MAX_WAIT_TIMEOUT_MS, McpOutpostBackend,
@@ -928,6 +929,10 @@ async fn oracle_4_daemon_disconnect_retry_delivery_unknown_and_schema_mismatch()
     );
     assert_eq!(ptr(&r6, "/result/structuredContent/daemon_schema"), 99);
     assert_eq!(
+        ptr(&r6, "/result/structuredContent/local_schema"),
+        IPC_SCHEMA_VER
+    );
+    assert_eq!(
         backend.status_calls.load(Ordering::SeqCst),
         3,
         "SchemaMismatchRestartMcp MUST NOT retry (total status calls = 2 prior + 1)"
@@ -1494,6 +1499,51 @@ async fn oracle_8_identity_portability_secret_refusal_kind_codes() {
             "secret refusal for {expected_kind} must never echo payload"
         );
     }
+
+    let _ = h.close_and_wait().await;
+}
+
+/// Test 9 (Gate #2 Lane 1): `IPC_SCHEMA_VER == 2` refuses delegating sends to a stale v0.1 daemon
+/// (schema 1) without retrying.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oracle_9_gate2_schema_v2_refuses_stale_v01_daemon() {
+    assert_eq!(IPC_SCHEMA_VER, 2);
+    let backend = MockBackend::new();
+    backend
+        .lock_state()
+        .send_outcomes
+        .push_back(Err(BackendError::SchemaMismatchRestartMcp {
+            daemon_schema: 1,
+        }));
+
+    let mut h = PipeHarness::spawn(Arc::clone(&backend), McpServerConfig::default());
+    h.send_json(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18" }
+    }));
+    let _ = h.read_json_line();
+
+    h.send_json(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "party_send",
+            "arguments": { "party_id": 42, "body": "hello" }
+        }
+    }));
+    let reply = h.read_json_line();
+    assert_eq!(ptr(&reply, "/id"), 2);
+    assert_eq!(ptr(&reply, "/result/isError"), true);
+    assert_eq!(
+        ptr(&reply, "/result/structuredContent/error"),
+        "daemon_schema_mismatch_restart_mcp"
+    );
+    assert_eq!(ptr(&reply, "/result/structuredContent/daemon_schema"), 1);
+    assert_eq!(ptr(&reply, "/result/structuredContent/local_schema"), 2);
+    assert_eq!(backend.send_calls.load(Ordering::SeqCst), 1);
 
     let _ = h.close_and_wait().await;
 }

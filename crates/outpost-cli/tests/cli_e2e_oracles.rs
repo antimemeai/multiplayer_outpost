@@ -525,7 +525,7 @@ fn oracle_4_mcp_setup_and_recovery_key_argv_rejection() -> Result<(), String> {
         ));
     }
 
-    // 3. Passing a recovery key (`mprk1_...`) anywhere on argv MUST be refused!
+    // 3. Passing secrets anywhere on argv MUST be refused BEFORE `mcp` / CLI dispatch and NEVER echoed!
     let fake_rk = mp_protocol::encode_recovery_key(&[0x55u8; 32]);
     let rk_argv = run_bin(
         &state_dir,
@@ -536,6 +536,168 @@ fn oracle_4_mcp_setup_and_recovery_key_argv_rejection() -> Result<(), String> {
     )?;
     if rk_argv.status_ok {
         return Err("CLI MUST refuse mprk1_ recovery key on argv!".to_string());
+    }
+
+    // --passphrase=secret refused BEFORE mcp dispatch without echoing secret
+    let pass_argv = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &["mcp", "--passphrase=do-not-echo-this-9876"],
+        None,
+        &[],
+    )?;
+    if pass_argv.status_ok || pass_argv.stderr.contains("do-not-echo-this-9876") {
+        return Err(format!(
+            "CLI MUST refuse --passphrase=... without echoing secret: ok={} stderr={}",
+            pass_argv.status_ok, pass_argv.stderr
+        ));
+    }
+
+    // .mpkey PEM on argv refused
+    let pem_argv = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &["whoami", "-----BEGIN MULTIPLAYER RECOVERY KEY-----\nTVBLRVkxAA=="],
+        None,
+        &[],
+    )?;
+    if pem_argv.status_ok {
+        return Err("CLI MUST refuse .mpkey PEM contents on argv!".to_string());
+    }
+
+    // Space-split unprefixed 55-char recovery key across multiple argv tokens refused
+    let unprefixed = fake_rk.strip_prefix("mprk1_").unwrap_or(&fake_rk);
+    let mut split_args: Vec<&str> = vec!["account", "recover", "--device-label", "test"];
+    split_args.extend(unprefixed.split('-'));
+    let split_argv = run_bin(&state_dir, &runtime_dir, &split_args, None, &[])?;
+    if split_argv.status_ok {
+        return Err("CLI MUST refuse space-split unprefixed recovery key on argv!".to_string());
+    }
+
+    // Unknown secret-like flag `--token=secret` MUST NOT echo secret value
+    let tok_argv = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &["whoami", "--token=never-echo-token-777"],
+        None,
+        &[],
+    )?;
+    if tok_argv.status_ok || tok_argv.stderr.contains("never-echo-token-777") {
+        return Err(format!(
+            "unknown --token=... MUST be redacted in stderr: {}",
+            tok_argv.stderr
+        ));
+    }
+
+    // 4. `mcp setup --write` refuses `--client all`, preserves existing JSON keys + writes `.bak`,
+    //    and idempotently upserts Codex TOML!
+    let refuse_all = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &["mcp", "setup", "--client", "all", "--write"],
+        None,
+        &[],
+    )?;
+    if refuse_all.status_ok {
+        return Err("mcp setup --client all --write MUST be refused!".to_string());
+    }
+
+    let claude_cfg = root_tmp.path().join("claude_mcp.json");
+    let orig_claude = r#"{"custom":true,"mcpServers":{"existing":{"command":"foo","args":[]}}}"#;
+    std::fs::write(&claude_cfg, orig_claude).map_err(|e| format!("write claude cfg: {e}"))?;
+    let claude_cfg_str = claude_cfg.to_string_lossy().into_owned();
+    let write_claude = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &[
+            "--json",
+            "mcp",
+            "setup",
+            "--client",
+            "claude",
+            "--write",
+            "--config",
+            &claude_cfg_str,
+        ],
+        None,
+        &[],
+    )?;
+    if !write_claude.status_ok {
+        return Err(format!("mcp setup --write claude failed: {}", write_claude.stderr));
+    }
+    let bak_claude = root_tmp.path().join("claude_mcp.json.bak");
+    if std::fs::read_to_string(&bak_claude).map_err(|e| format!("read bak: {e}"))? != orig_claude {
+        return Err("claude .bak did not preserve exact original config!".to_string());
+    }
+    let merged_claude: Value = serde_json::from_str(
+        &std::fs::read_to_string(&claude_cfg).map_err(|e| format!("read merged: {e}"))?,
+    )
+    .map_err(|e| format!("parse merged json: {e}"))?;
+    if merged_claude.get("custom").and_then(Value::as_bool) != Some(true)
+        || merged_claude.pointer("/mcpServers/existing/command").and_then(Value::as_str)
+            != Some("foo")
+        || merged_claude
+            .pointer("/mcpServers/multiplayer/args/0")
+            .and_then(Value::as_str)
+            != Some("mcp")
+    {
+        return Err(format!("merged claude json missing expected keys: {merged_claude}"));
+    }
+
+    let codex_cfg = root_tmp.path().join("codex_config.toml");
+    let orig_codex = "[profile]\nname = \"dev\"\n\n[mcp_servers.multiplayer]\ncommand = \"/old/mp-outpost\"\nargs = [\"mcp\"]\n";
+    std::fs::write(&codex_cfg, orig_codex).map_err(|e| format!("write codex cfg: {e}"))?;
+    let codex_cfg_str = codex_cfg.to_string_lossy().into_owned();
+    let write_codex1 = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &[
+            "--json",
+            "mcp",
+            "setup",
+            "--client",
+            "codex",
+            "--write",
+            "--config",
+            &codex_cfg_str,
+        ],
+        None,
+        &[],
+    )?;
+    if !write_codex1.status_ok {
+        return Err(format!("mcp setup --write codex failed: {}", write_codex1.stderr));
+    }
+    let first_toml =
+        std::fs::read_to_string(&codex_cfg).map_err(|e| format!("read codex1: {e}"))?;
+    if !first_toml.contains("[profile]")
+        || !first_toml.contains("[mcp_servers.multiplayer]")
+        || first_toml.contains("/old/mp-outpost")
+    {
+        return Err(format!("unexpected codex toml: {first_toml}"));
+    }
+    let write_codex2 = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &[
+            "--json",
+            "mcp",
+            "setup",
+            "--client",
+            "codex",
+            "--write",
+            "--config",
+            &codex_cfg_str,
+        ],
+        None,
+        &[],
+    )?;
+    if !write_codex2.status_ok {
+        return Err(format!("mcp setup --write codex2 failed: {}", write_codex2.stderr));
+    }
+    let second_toml =
+        std::fs::read_to_string(&codex_cfg).map_err(|e| format!("read codex2: {e}"))?;
+    if first_toml != second_toml {
+        return Err("codex TOML upsert was not idempotent!".to_string());
     }
 
     Ok(())
@@ -1594,6 +1756,8 @@ struct MockPortabilityState {
     links: HashMap<String, MockLinkEntry>,
     web_approved: bool,
     web_browser_fp: String,
+    poll_429_remaining: u32,
+    inspect_429_remaining: u32,
 }
 
 struct MockPortabilityAccount {
@@ -1894,6 +2058,27 @@ async fn handle_portability_req<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             }
         }
         ("POST", "/v1/device-links/inspect") => {
+            let send_429 = {
+                let mut st = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if st.inspect_429_remaining > 0 {
+                    st.inspect_429_remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if send_429 {
+                let body = r#"{"error":"rate_limited"}"#;
+                let resp = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+                return;
+            }
             let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
                 return;
             };
@@ -1991,6 +2176,27 @@ async fn handle_portability_req<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             }
         }
         ("POST", "/v1/device-links/poll") => {
+            let send_429 = {
+                let mut st = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if st.poll_429_remaining > 0 {
+                    st.poll_429_remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if send_429 {
+                let body = r#"{"error":"rate_limited"}"#;
+                let resp = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+                return;
+            }
             let Ok(body) = serde_json::from_slice::<Value>(&req.body) else {
                 return;
             };
@@ -2122,7 +2328,9 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
         accounts: HashMap::new(),
         links: HashMap::new(),
         web_approved: false,
-        web_browser_fp: "a1b2c3d4-e5f60718".to_string(),
+        web_browser_fp: "a1b2c3d4".to_string(),
+        poll_429_remaining: 1,
+        inspect_429_remaining: 1,
     }));
     let (server_addr, cert_pem, server_task) =
         spawn_mock_portability_server(Arc::clone(&mock_state)).await?;
@@ -2138,11 +2346,15 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
 
     let root_key_path = root_tmp.path().join("root.key");
     let root_key_str = root_key_path.to_string_lossy().into_owned();
+    let rk_out_path = root_tmp.path().join("recovery.key");
+    let rk_out_str = rk_out_path.to_string_lossy().into_owned();
+    let rk_out2_path = root_tmp.path().join("recovery2.key");
+    let rk_out2_str = rk_out2_path.to_string_lossy().into_owned();
     let mpkey_path = root_tmp.path().join("backup.mpkey");
     let mpkey_str = mpkey_path.to_string_lossy().into_owned();
 
     let result: Result<(), String> = async {
-        // 1. `account register` -> returns valid `mprk1_...` Recovery Key!
+        // 1. `account register --json` MUST NEVER leak `mprk1_` on stdout; writes canonical `0600` `mprk1_` to files!
         let reg_out = run_bin(
             &primary_st,
             &primary_rt,
@@ -2156,6 +2368,8 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
                 "primary-box",
                 "--root-key-out",
                 &root_key_str,
+                "--recovery-key-out",
+                &rk_out_str,
                 "--invite-stdin",
             ],
             Some(b"mpinv1_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG\n"),
@@ -2164,8 +2378,17 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
         if !reg_out.status_ok {
             return Err(format!("account register failed: {}", reg_out.stderr));
         }
+        if reg_out.stdout.contains("mprk1_") {
+            return Err(format!(
+                "account register --json MUST NOT leak mprk1_ to stdout: {}",
+                reg_out.stdout
+            ));
+        }
         let reg_json: Value =
             serde_json::from_str(&reg_out.stdout).map_err(|e| format!("reg json: {e}"))?;
+        if reg_json.get("recovery_key").is_some() {
+            return Err(format!("account register --json must not include recovery_key field: {reg_json}"));
+        }
         let account_id = reg_json
             .get("account_id")
             .and_then(Value::as_u64)
@@ -2175,33 +2398,85 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
             .and_then(Value::as_str)
             .ok_or("missing safety_number")?
             .to_string();
-        let reg_rk = reg_json
-            .get("recovery_key")
-            .and_then(Value::as_str)
-            .ok_or("missing recovery_key")?
+
+        // Both root.key and recovery.key are mode 0600 canonical mprk1_ files with identical seed!
+        for key_path in [&root_key_path, &rk_out_path] {
+            let meta = std::fs::metadata(key_path).map_err(|e| format!("key stat: {e}"))?;
+            if (meta.permissions().mode() & 0o777) != 0o600 {
+                return Err(format!("{} must have mode 0600!", key_path.display()));
+            }
+        }
+        let reg_rk = std::fs::read_to_string(&rk_out_path)
+            .map_err(|e| format!("read rk_out: {e}"))?
+            .trim()
             .to_string();
-        if !reg_rk.starts_with("mprk1_") {
-            return Err(format!("invalid recovery_key format: {reg_rk}"));
+        let root_rk = std::fs::read_to_string(&root_key_path)
+            .map_err(|e| format!("read root_key: {e}"))?
+            .trim()
+            .to_string();
+        if !reg_rk.starts_with("mprk1_") || reg_rk != root_rk {
+            return Err(format!(
+                "expected identical canonical mprk1_ in root & recovery files: rk={reg_rk} root={root_rk}"
+            ));
         }
         let decoded_seed = mp_protocol::decode_recovery_key(&reg_rk)
             .map_err(|e| format!("decode registered recovery_key: {e}"))?;
 
-        // 2. `account recovery-key --root-key-file` matches!
-        let rk_out = run_bin(
+        // 2. `account recovery-key` refuses headless stdout without `--recovery-key-out`,
+        //    and writes exact `0600` `mprk1_` file with `--recovery-key-out`!
+        let rk_headless = run_bin(
             &primary_st,
             &primary_rt,
             &["account", "recovery-key", "--root-key-file", &root_key_str],
             None,
             &env_vars,
         )?;
-        if !rk_out.status_ok || rk_out.stdout.trim() != reg_rk {
+        if rk_headless.status_ok || rk_headless.stdout.contains("mprk1_") {
             return Err(format!(
-                "account recovery-key mismatch: ok={} stdout={}",
-                rk_out.status_ok, rk_out.stdout
+                "headless account recovery-key without --recovery-key-out MUST be refused: ok={} out={}",
+                rk_headless.status_ok, rk_headless.stdout
             ));
         }
+        let rk_json_headless = run_bin(
+            &primary_st,
+            &primary_rt,
+            &["--json", "account", "recovery-key", "--root-key-file", &root_key_str],
+            None,
+            &env_vars,
+        )?;
+        if rk_json_headless.status_ok || rk_json_headless.stdout.contains("mprk1_") {
+            return Err("account recovery-key --json without --recovery-key-out MUST be refused!".to_string());
+        }
+        let rk_file_out = run_bin(
+            &primary_st,
+            &primary_rt,
+            &[
+                "--json",
+                "account",
+                "recovery-key",
+                "--root-key-file",
+                &root_key_str,
+                "--recovery-key-out",
+                &rk_out2_str,
+            ],
+            None,
+            &env_vars,
+        )?;
+        if !rk_file_out.status_ok || rk_file_out.stdout.contains("mprk1_") {
+            return Err(format!(
+                "account recovery-key --recovery-key-out failed or leaked key: stderr={} out={}",
+                rk_file_out.stderr, rk_file_out.stdout
+            ));
+        }
+        let rk2_text = std::fs::read_to_string(&rk_out2_path)
+            .map_err(|e| format!("read rk2: {e}"))?
+            .trim()
+            .to_string();
+        if rk2_text != reg_rk {
+            return Err("account recovery-key --recovery-key-out mismatch!".to_string());
+        }
 
-        // 3. `account export-mpkey` -> mode 0600 -> `account recover --mpkey ... --passphrase-stdin`!
+        // 3. `account export-mpkey` -> mode 0600 -> refuses overwrite without --force -> succeeds with --force!
         let pass = "correct-horse-battery-staple\n";
         let export_out = run_bin(
             &primary_st,
@@ -2230,6 +2505,52 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
             std::fs::metadata(&mpkey_path).map_err(|e| format!("mpkey stat: {e}"))?;
         if (mpkey_meta.permissions().mode() & 0o777) != 0o600 {
             return Err("exported .mpkey does not have mode 0600!".to_string());
+        }
+
+        // Second export without --force MUST fail closed!
+        let export_noclobber = run_bin(
+            &primary_st,
+            &primary_rt,
+            &[
+                "account",
+                "export-mpkey",
+                "--root-key-file",
+                &root_key_str,
+                "--out",
+                &mpkey_str,
+                "--passphrase-stdin",
+            ],
+            Some(pass.as_bytes()),
+            &env_vars,
+        )?;
+        if export_noclobber.status_ok {
+            return Err("account export-mpkey MUST refuse to overwrite existing .mpkey without --force!".to_string());
+        }
+
+        // With --force it succeeds cleanly!
+        let export_force = run_bin(
+            &primary_st,
+            &primary_rt,
+            &[
+                "--json",
+                "account",
+                "export-mpkey",
+                "--root-key-file",
+                &root_key_str,
+                "--out",
+                &mpkey_str,
+                "--account-id",
+                &account_id.to_string(),
+                "--handle",
+                "antimeme",
+                "--passphrase-stdin",
+                "--force",
+            ],
+            Some(pass.as_bytes()),
+            &env_vars,
+        )?;
+        if !export_force.status_ok {
+            return Err(format!("account export-mpkey --force failed: {}", export_force.stderr));
         }
 
         let rec_out = run_bin(
@@ -2262,9 +2583,8 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
         }
         let _ = decoded_seed;
 
-        // 4. Full concurrent Device Link flow:
-        //    Primary `device link create` -> New device `device link join` (background)
-        //    -> Primary `device link approve --yes-fingerprint <local_fp>` -> New device finishes!
+        // 4. Full concurrent Device Link flow WITH simulated HTTP 429 + Retry-After: 1 on BOTH
+        //    `device link join` poll AND `device link approve --wait` inspect!
         let create_out = run_bin(
             &primary_st,
             &primary_rt,
@@ -2346,7 +2666,7 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
         .await
         .map_err(|e| format!("join stderr task: {e}"))??;
 
-        // Primary refuses wrong fingerprint!
+        // Primary refuses wrong fingerprint (passing --wait so inspect survives 429 retry)!
         let bad_approve = run_bin(
             &primary_st,
             &primary_rt,
@@ -2357,6 +2677,7 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
                 &link_code,
                 "--root-key-file",
                 &root_key_str,
+                "--wait",
                 "--yes-fingerprint",
                 "ffffffff-ffffffff-ffffffff-ffffffff",
             ],
@@ -2367,7 +2688,7 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
             return Err("device link approve MUST reject bogus server fingerprint!".to_string());
         }
 
-        // Primary approves using the exact locally computed fingerprint!
+        // Primary approves using the exact locally computed fingerprint (with --wait)!
         let approve_out = run_bin(
             &primary_st,
             &primary_rt,
@@ -2379,6 +2700,7 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
                 &link_code,
                 "--root-key-file",
                 &root_key_str,
+                "--wait",
                 "--yes-fingerprint",
                 &join_fp,
             ],
@@ -2389,7 +2711,7 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
             return Err(format!("device link approve failed: {}", approve_out.stderr));
         }
 
-        // Wait for `device link join` to collect the verified CWT and save its device record!
+        // Wait for `device link join` to survive the 429 Retry-After, collect the verified CWT, and save!
         let join_output = tokio::task::spawn_blocking(move || join_child.wait_with_output())
             .await
             .map_err(|e| format!("wait join task: {e}"))?
@@ -2425,8 +2747,9 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
             ));
         }
 
-        // 5. `web approve` rejects mismatched fingerprint and succeeds with exact match!
-        let bad_web = run_bin(
+        // 5. `web approve`:
+        //    (a) headless `--yes-browser-fingerprint` WITHOUT `--root-key-file` MUST be refused!
+        let headless_no_root = run_bin(
             &primary_st,
             &primary_rt,
             &[
@@ -2434,7 +2757,47 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
                 "approve",
                 "ABCD-EFGH",
                 "--yes-browser-fingerprint",
-                "00000000-00000000",
+                "a1b2c3d4",
+            ],
+            None,
+            &env_vars,
+        )?;
+        if headless_no_root.status_ok {
+            return Err("headless web approve --yes-browser-fingerprint without --root-key-file MUST be refused!".to_string());
+        }
+
+        //    (b) malformed fingerprint MUST be refused!
+        let bad_fmt_web = run_bin(
+            &primary_st,
+            &primary_rt,
+            &[
+                "web",
+                "approve",
+                "ABCD-EFGH",
+                "--root-key-file",
+                &root_key_str,
+                "--yes-browser-fingerprint",
+                "not-8hex!",
+            ],
+            None,
+            &env_vars,
+        )?;
+        if bad_fmt_web.status_ok {
+            return Err("web approve MUST reject non-8-hex browser fingerprint!".to_string());
+        }
+
+        //    (c) mismatched valid 8-hex fingerprint MUST be refused!
+        let bad_web = run_bin(
+            &primary_st,
+            &primary_rt,
+            &[
+                "web",
+                "approve",
+                "ABCD-EFGH",
+                "--root-key-file",
+                &root_key_str,
+                "--yes-browser-fingerprint",
+                "00000000",
             ],
             None,
             &env_vars,
@@ -2442,6 +2805,8 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
         if bad_web.status_ok {
             return Err("web approve MUST reject mismatched browser fingerprint!".to_string());
         }
+
+        //    (d) exact 8-hex fingerprint WITH `--root-key-file` succeeds!
         let ok_web = run_bin(
             &primary_st,
             &primary_rt,
@@ -2450,8 +2815,10 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
                 "web",
                 "approve",
                 "ABCD-EFGH",
+                "--root-key-file",
+                &root_key_str,
                 "--yes-browser-fingerprint",
-                "a1b2c3d4-e5f60718",
+                "a1b2c3d4",
             ],
             None,
             &env_vars,
@@ -2465,7 +2832,8 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
             return Err(format!("expected approved=true: {web_json}"));
         }
 
-        // 6. `doctor --json` non-destructive health check against local TLS 1.3 mock server!
+        // 6. `doctor --json` non-destructive health check against local TLS 1.3 mock server,
+        //    plus independent relay probe when `--api-authority` is invalid!
         let doc_out = run_bin(
             &primary_st,
             &primary_rt,
@@ -2491,9 +2859,286 @@ async fn oracle_5_identity_portability_device_link_web_approve_and_doctor() -> R
             return Err(format!("unexpected doctor report: {doc_json}"));
         }
 
+        let doc_indep = run_bin(
+            &primary_st,
+            &primary_rt,
+            &[
+                "--json",
+                "doctor",
+                "--api-authority",
+                "bad authority with spaces",
+                "--relay-url",
+                "https://api.multiplayer.tech",
+            ],
+            None,
+            &env_vars,
+        )?;
+        if !doc_indep.status_ok {
+            return Err(format!("doctor independent probe failed: {}", doc_indep.stderr));
+        }
+        let doc_indep_json: Value =
+            serde_json::from_str(&doc_indep.stdout).map_err(|e| format!("doctor indep json: {e}"))?;
+        if doc_indep_json.pointer("/control_plane/ok").and_then(Value::as_bool) != Some(false)
+            || doc_indep_json.pointer("/relay/ok").and_then(Value::as_bool) != Some(true)
+        {
+            return Err(format!(
+                "invalid api_authority must NOT suppress relay ping probe: {doc_indep_json}"
+            ));
+        }
+
         Ok(())
     }
     .await;
+
+    server_task.abort();
+    result
+}
+
+// ===========================================================================
+// Oracle 6 (v0.3.0 Native Self-Upgrade over Real TLS 1.3 Mock Release Server)
+// ===========================================================================
+
+fn current_target_slug_test() -> Result<&'static str, String> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Ok("darwin-arm64")
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        Ok("linux-x86_64")
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        Ok("linux-arm64")
+    }
+    #[cfg(not(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
+    )))]
+    {
+        Err("unsupported platform for upgrade E2E test".to_string())
+    }
+}
+
+fn hex_lower_32(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(64);
+    for &b in bytes {
+        if let (Some(&hi), Some(&lo)) = (
+            HEX.get(usize::from(b >> 4)),
+            HEX.get(usize::from(b & 0x0f)),
+        ) {
+            s.push(char::from(hi));
+            s.push(char::from(lo));
+        }
+    }
+    s
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oracle_6_tls13_self_upgrade_and_sha256_tamper_rejection() -> Result<(), String> {
+    let target = current_target_slug_test()?;
+    let root_tmp = make_short_tempdir("mpo6")?;
+    let state_dir = make_private_subdir(root_tmp.path(), "st")?;
+    let runtime_dir = make_private_subdir(root_tmp.path(), "rt")?;
+    let pkg_stage = make_private_subdir(root_tmp.path(), "pkg")?;
+
+    let version = "v9.9.9";
+    let stem = format!("mp-outpost-{version}-{target}");
+    let pkg_sub = pkg_stage.join(&stem);
+    std::fs::create_dir(&pkg_sub).map_err(|e| format!("mkdir pkg_sub: {e}"))?;
+
+    let stub_bin = pkg_sub.join("mp-outpost");
+    std::fs::write(&stub_bin, "#!/bin/sh\necho \"mp-outpost 9.9.9 (tls-e2e)\"\n")
+        .map_err(|e| format!("write stub: {e}"))?;
+    std::fs::set_permissions(&stub_bin, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("chmod stub: {e}"))?;
+
+    let tarball_name = format!("{stem}.tar.gz");
+    let tarball_path = root_tmp.path().join(&tarball_name);
+    let tar_status = Command::new("tar")
+        .arg("-C")
+        .arg(&pkg_stage)
+        .arg("-czf")
+        .arg(&tarball_path)
+        .arg(&stem)
+        .status()
+        .map_err(|e| format!("tar create: {e}"))?;
+    if !tar_status.success() {
+        return Err("tar create failed".to_string());
+    }
+
+    let tb_bytes = std::fs::read(&tarball_path).map_err(|e| format!("read tarball: {e}"))?;
+    let tb_sha = hex_lower_32(&mp_protocol::sha256(&tb_bytes));
+    let tb_size = tb_bytes.len() as u64;
+
+    let sums_bytes = format!("{tb_sha}  {tarball_name}\n").into_bytes();
+    let manifest_bytes = json!({
+        "version": version,
+        "commit": "deadbeefcafe",
+        "assets": [{
+            "target": target,
+            "filename": tarball_name,
+            "sha256": tb_sha,
+            "size_bytes": tb_size,
+        }]
+    })
+    .to_string()
+    .into_bytes();
+
+    let files = Arc::new(Mutex::new(HashMap::<String, Vec<u8>>::from([
+        ("/release-manifest.json".to_string(), manifest_bytes),
+        ("/SHA256SUMS.txt".to_string(), sums_bytes),
+        (format!("/{tarball_name}"), tb_bytes.clone()),
+    ])));
+
+    let (acceptor, cert_pem) = generate_mock_tls()?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("bind release mock: {e}"))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("release mock addr: {e}"))?;
+
+    let files_srv = Arc::clone(&files);
+    let server_task = tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor_c = acceptor.clone();
+            let files_c = Arc::clone(&files_srv);
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor_c.accept(tcp).await else {
+                    return;
+                };
+                let Ok(req) = read_http_req(&mut tls).await else {
+                    return;
+                };
+                let payload = {
+                    let map = files_c
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    map.get(&req.path).cloned()
+                };
+                if let Some(body) = payload {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = tls.write_all(head.as_bytes()).await;
+                    let _ = tls.write_all(&body).await;
+                    let _ = tls.flush().await;
+                } else {
+                    let _ = tls
+                        .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    let _ = tls.flush().await;
+                }
+            });
+        }
+    });
+
+    let ca_path = root_tmp.path().join("release_ca.pem");
+    std::fs::write(&ca_path, cert_pem).map_err(|e| format!("write ca: {e}"))?;
+    let addr_str = addr.to_string();
+    let ca_str = ca_path.to_string_lossy().into_owned();
+    let env_vars = [
+        ("OUTPOST_TEST_CONNECT_ADDR", addr_str.as_str()),
+        ("OUTPOST_TEST_CA_PEM", ca_str.as_str()),
+    ];
+    let base_url = format!("https://{TEST_AUTHORITY}");
+
+    let install_dir = make_private_subdir(root_tmp.path(), "bin")?;
+    let install_path = install_dir.join("mp-outpost");
+    std::fs::write(&install_path, b"old-bin").map_err(|e| format!("seed old bin: {e}"))?;
+    let install_str = install_path.to_string_lossy().into_owned();
+
+    let result: Result<(), String> = (|| {
+        // 1. `mp-outpost --json upgrade --check` over real TLS 1.3!
+        let chk = run_bin(
+            &state_dir,
+            &runtime_dir,
+            &["--json", "upgrade", "--check", "--base-url", &base_url],
+            None,
+            &env_vars,
+        )?;
+        if !chk.status_ok {
+            return Err(format!("upgrade --check failed: {}", chk.stderr));
+        }
+        let chk_json: Value =
+            serde_json::from_str(&chk.stdout).map_err(|e| format!("chk json: {e}"))?;
+        if chk_json.get("update_available").and_then(Value::as_bool) != Some(true)
+            || chk_json.get("latest_version").and_then(Value::as_str) != Some("v9.9.9")
+        {
+            return Err(format!("unexpected upgrade --check output: {chk_json}"));
+        }
+
+        // 2. Full `mp-outpost --json upgrade --yes` atomic 0755 install!
+        let upg = run_bin(
+            &state_dir,
+            &runtime_dir,
+            &[
+                "--json",
+                "upgrade",
+                "--yes",
+                "--base-url",
+                &base_url,
+                "--install-path",
+                &install_str,
+            ],
+            None,
+            &env_vars,
+        )?;
+        if !upg.status_ok {
+            return Err(format!("upgrade --yes failed: {}", upg.stderr));
+        }
+        let meta = std::fs::metadata(&install_path).map_err(|e| format!("meta: {e}"))?;
+        if (meta.permissions().mode() & 0o777) != 0o755 {
+            return Err("upgraded binary must have mode 0755!".to_string());
+        }
+        let ver_out = Command::new(&install_path)
+            .arg("--version")
+            .output()
+            .map_err(|e| format!("run upgraded bin: {e}"))?;
+        if !ver_out.status.success()
+            || !String::from_utf8_lossy(&ver_out.stdout).starts_with("mp-outpost 9.9.9")
+        {
+            return Err("upgraded binary did not pass --version check!".to_string());
+        }
+
+        // 3. Tamper tarball on server -> MUST reject with SHA-256 mismatch and leave binary intact!
+        let mut tampered = tb_bytes.clone();
+        if let Some(last) = tampered.last_mut() {
+            *last ^= 0xff;
+        }
+        {
+            let mut map = files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.insert(format!("/{tarball_name}"), tampered);
+        }
+        let bad = run_bin(
+            &state_dir,
+            &runtime_dir,
+            &[
+                "upgrade",
+                "--yes",
+                "--base-url",
+                &base_url,
+                "--install-path",
+                &install_str,
+            ],
+            None,
+            &env_vars,
+        )?;
+        if bad.status_ok || !bad.stderr.contains("SHA-256 mismatch") {
+            return Err(format!(
+                "tampered tarball MUST be rejected with SHA-256 mismatch: ok={} stderr={}",
+                bad.status_ok, bad.stderr
+            ));
+        }
+
+        Ok(())
+    })();
 
     server_task.abort();
     result

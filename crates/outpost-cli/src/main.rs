@@ -17,10 +17,12 @@ mod ipc_payloads;
 mod mcp_bridge;
 mod mpkey;
 mod storage;
+mod upgrade;
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use outpost_control::sanitize_server_error;
 use outpost_core::ipc_wire::ReadyReply;
 use outpost_daemon::{
     DaemonConfig, DaemonServer, daemonize_in_child, install_daemon_process_hygiene,
@@ -32,19 +34,30 @@ use crate::app_daemon::{AppDaemon, AppDaemonHandler};
 use crate::build_info::{build_digest, build_order};
 use crate::cli::{
     DaemonSubcommandArgs, GlobalOpts, parse_daemon_subcommand_if_present,
-    parse_mcp_subcommand_if_present, run_cli_command,
+    parse_mcp_subcommand_if_present, reject_secrets_in_argv, run_cli_command,
 };
 use crate::mcp_bridge::DaemonMcpBridge;
 use crate::storage::{resolve_effective_runtime_override, resolve_effective_state_dir};
 
+fn print_sanitized_err(prefix: &str, err: &str) {
+    let safe = sanitize_server_error(err);
+    eprintln!("{prefix}: {safe}");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // CRITICAL (G2-L3-3): Reject secrets anywhere on argv BEFORE `__daemon`, `mcp`, or CLI dispatch!
+    if let Err(err) = reject_secrets_in_argv(&args) {
+        print_sanitized_err("error", &err);
+        std::process::exit(2);
+    }
 
     // CRITICAL: Inspect argv for `__daemon` BEFORE creating any Tokio runtime or threads!
     match parse_daemon_subcommand_if_present(&args) {
         Ok(Some(daemon_args)) => run_daemon_entrypoint(daemon_args),
         Err(err) => {
-            eprintln!("error: {err}");
+            print_sanitized_err("error", &err);
             std::process::exit(2);
         }
         Ok(None) => {}
@@ -54,7 +67,7 @@ fn main() {
     match parse_mcp_subcommand_if_present(&args) {
         Ok(Some(opts)) => run_mcp_entrypoint(opts),
         Err(err) => {
-            eprintln!("error: {err}");
+            print_sanitized_err("error", &err);
             std::process::exit(2);
         }
         Ok(None) => {}
@@ -67,13 +80,13 @@ fn main() {
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("error: failed to build Tokio runtime: {e}");
+            print_sanitized_err("error", &format!("failed to build Tokio runtime: {e}"));
             std::process::exit(1);
         }
     };
 
     if let Err(err) = rt.block_on(run_cli_command(&args)) {
-        eprintln!("error: {err}");
+        print_sanitized_err("error", &err);
         std::process::exit(1);
     }
 }

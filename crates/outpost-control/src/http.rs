@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::clock::wall_now_ms;
 use crate::tls::{
     DEFAULT_API_AUTHORITY, canonicalize_authority, connect_tls13, default_tls13_client_config,
+    parse_authority,
 };
 use crate::ws::{Mp1WsClient, Mp1WsTarget, WsConnectError};
 
@@ -38,6 +39,18 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MAX_CLOCK_OFFSET_MS: i64 = 600_000;
 /// Outbound RFC 9421 signature lifetime (`expires = created + 60`).
 pub const SIGNATURE_LIFETIME_SECS: i64 = 60;
+/// Minimum clamped `retry_after_ms` (`100 ms`).
+pub const MIN_RETRY_AFTER_MS: u64 = 100;
+/// Maximum clamped `retry_after_ms` (`60_000 ms`).
+pub const MAX_RETRY_AFTER_MS: u64 = 60_000;
+/// Maximum HTTPS redirects followed by [`ControlClient::fetch_https_bytes`].
+pub const MAX_FETCH_REDIRECTS: usize = 3;
+/// Overall deadline for [`ControlClient::fetch_https_bytes`] (`60s`).
+pub const MAX_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+const MAX_ERROR_MESSAGE_CHARS: usize = 256;
+const MAX_FETCH_URL_BYTES: usize = 8 * 1024;
+const FETCH_READ_BUF_BYTES: usize = 64 * 1024;
 
 /// Errors returned by [`ControlClient`] REST calls.
 #[derive(Debug)]
@@ -57,6 +70,7 @@ pub enum ControlError {
     ResponseHeadersTooLarge,
     ResponseTooLarge,
     InvalidJsonResponse(String),
+    Protocol(String),
     Api {
         status: u16,
         error: String,
@@ -86,8 +100,9 @@ impl fmt::Display for ControlError {
                 write!(f, "HTTP redirect {status} refused (zero redirects policy)")
             }
             Self::ResponseHeadersTooLarge => write!(f, "response headers exceed 8 KiB limit"),
-            Self::ResponseTooLarge => write!(f, "response body exceeds 16 KiB limit"),
+            Self::ResponseTooLarge => write!(f, "response body exceeds maximum allowed size"),
             Self::InvalidJsonResponse(msg) => write!(f, "invalid JSON response: {msg}"),
+            Self::Protocol(msg) => write!(f, "control-plane protocol violation: {msg}"),
             Self::Api { status, error, .. } => write!(f, "API error HTTP {status}: {error}"),
         }
     }
@@ -384,6 +399,7 @@ impl Drop for AbortOnDrop {
 pub struct RawHttpResponse {
     pub status: u16,
     pub body: Bytes,
+    pub retry_after_ms: Option<u64>,
 }
 
 impl ControlClient {
@@ -1031,7 +1047,12 @@ impl ControlClient {
                 None,
             )
             .await?;
-        Self::decode_json_response(resp, &[200])
+        let decoded: RecoverLookupResponse = Self::decode_json_response(resp, &[200])?;
+        validate_account_id(decoded.account_id, "recover_lookup")?;
+        for dev in &decoded.devices {
+            validate_device_id(dev.device_id, "recover_lookup")?;
+        }
+        Ok(decoded)
     }
 
     /// `POST /v1/web-sessions/inspect` (using the client's device signer).
@@ -1114,7 +1135,9 @@ impl ControlClient {
                 None,
             )
             .await?;
-        Self::decode_json_response(resp, &[201])
+        let decoded: DeviceLinkCreateResponse = Self::decode_json_response(resp, &[201])?;
+        validate_link_code(&decoded.link_code)?;
+        Ok(decoded)
     }
 
     /// `POST /v1/device-links/claim` (`link.<sha256(device_pubkey)[..16]>` PoP).
@@ -1188,7 +1211,10 @@ impl ControlClient {
                 None,
             )
             .await?;
-        Self::decode_json_response(resp, &[200])
+        let decoded: DeviceLinkApproveResponse = Self::decode_json_response(resp, &[200])?;
+        validate_account_id(decoded.account_id, "device_link_approve")?;
+        validate_device_id(decoded.device_id, "device_link_approve")?;
+        Ok(decoded)
     }
 
     /// `POST /v1/device-links/poll` (`link.<sha256(device_pubkey)[..16]>` PoP).
@@ -1220,12 +1246,45 @@ impl ControlClient {
         let status = resp.status;
         let decoded: DeviceLinkPollResponse = Self::decode_json_response(resp, &[200, 202])?;
         match (&decoded, status) {
-            (DeviceLinkPollResponse::Pending { .. }, 202)
-            | (DeviceLinkPollResponse::Approved { .. }, 200) => Ok(decoded),
+            (DeviceLinkPollResponse::Pending { .. }, 202) => Ok(decoded),
+            (
+                DeviceLinkPollResponse::Approved {
+                    account_id,
+                    device_id,
+                    ..
+                },
+                200,
+            ) => {
+                validate_account_id(*account_id, "device_link_poll")?;
+                validate_device_id(*device_id, "device_link_poll")?;
+                Ok(decoded)
+            }
             _ => Err(ControlError::InvalidJsonResponse(format!(
                 "unexpected HTTP {status} for device_link_poll response status"
             ))),
         }
+    }
+
+    /// Downloads bounded bytes over TLS 1.3 + HTTP/1.1 with strict host-allowlisted
+    /// HTTPS-only redirect following (at most 3 redirects, 60-second overall deadline).
+    ///
+    /// Inherits this client's TLS 1.3-only `ClientConfig` (including any test CA roots)
+    /// and optional `connect_addr` override.
+    pub async fn fetch_https_bytes(
+        &self,
+        url: &str,
+        max_bytes: usize,
+        allowed_hosts: &[&str],
+    ) -> Result<Vec<u8>, ControlError> {
+        fetch_https_bytes_with_transport(
+            url,
+            max_bytes,
+            allowed_hosts,
+            &self.config.tls_config,
+            self.config.connect_addr,
+            MAX_FETCH_TIMEOUT,
+        )
+        .await
     }
 
     /// Probes `<relay_url>/ping` over TLS 1.3 + HTTP/1.1 using this client's TLS config and
@@ -1262,6 +1321,288 @@ impl ControlClient {
             })
         }
     }
+}
+
+/// Downloads bounded bytes over TLS 1.3 + HTTP/1.1 using the default `webpki-roots`
+/// trust store, with strict host-allowlisted HTTPS-only redirect following (at most 3
+/// redirects, 60-second overall deadline).
+pub async fn fetch_https_bytes(
+    url: &str,
+    max_bytes: usize,
+    allowed_hosts: &[&str],
+) -> Result<Vec<u8>, ControlError> {
+    let tls_config = default_tls13_client_config()?;
+    fetch_https_bytes_with_transport(
+        url,
+        max_bytes,
+        allowed_hosts,
+        &tls_config,
+        None,
+        MAX_FETCH_TIMEOUT,
+    )
+    .await
+}
+
+struct ParsedFetchUrl {
+    canonical_authority: String,
+    host_lower: String,
+    request_target: String,
+}
+
+fn parse_fetch_https_url(url: &str) -> Result<ParsedFetchUrl, ControlError> {
+    if url.len() > MAX_FETCH_URL_BYTES {
+        return Err(ControlError::InvalidRequest(
+            "HTTPS URL exceeds maximum length".to_owned(),
+        ));
+    }
+    let Some(rest) = url.strip_prefix("https://") else {
+        return Err(ControlError::InvalidRequest(
+            "URL must start with https://".to_owned(),
+        ));
+    };
+    if rest.is_empty()
+        || !rest.bytes().all(|b| (0x21..=0x7e).contains(&b))
+        || rest.contains('#')
+        || rest.contains('\\')
+    {
+        return Err(ControlError::InvalidRequest(
+            "HTTPS URL contains forbidden characters, whitespace, or fragment".to_owned(),
+        ));
+    }
+
+    let split_pos = rest
+        .bytes()
+        .position(|b| b == b'/' || b == b'?')
+        .unwrap_or(rest.len());
+    let raw_authority = rest.get(..split_pos).unwrap_or("");
+    let tail = rest.get(split_pos..).unwrap_or("");
+
+    let (canonical_authority, host_lower, _port) = parse_authority(raw_authority)?;
+    let request_target = if tail.is_empty() {
+        "/".to_owned()
+    } else if tail.starts_with('?') {
+        format!("/{tail}")
+    } else {
+        tail.to_owned()
+    };
+
+    Ok(ParsedFetchUrl {
+        canonical_authority,
+        host_lower,
+        request_target,
+    })
+}
+
+fn host_is_allowed(canonical_authority: &str, host_lower: &str, allowed_hosts: &[&str]) -> bool {
+    for &entry in allowed_hosts {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.contains(':') {
+            if let Ok((allowed_canonical, _, _)) = parse_authority(trimmed)
+                && canonical_authority == allowed_canonical
+            {
+                return true;
+            }
+        } else if let Ok((_, allowed_host, _)) = parse_authority(trimmed)
+            && host_lower == allowed_host
+        {
+            return true;
+        }
+    }
+    false
+}
+
+async fn fetch_https_bytes_with_transport(
+    url: &str,
+    max_bytes: usize,
+    allowed_hosts: &[&str],
+    tls_config: &Arc<rustls::ClientConfig>,
+    connect_addr: Option<SocketAddr>,
+    total_timeout: Duration,
+) -> Result<Vec<u8>, ControlError> {
+    let mut current = parse_fetch_https_url(url)?;
+    if !host_is_allowed(
+        &current.canonical_authority,
+        &current.host_lower,
+        allowed_hosts,
+    ) {
+        return Err(ControlError::InvalidRequest(format!(
+            "host '{}' is not in the allowed host list",
+            current.host_lower
+        )));
+    }
+
+    let deadline = Instant::now() + total_timeout;
+    let mut redirects_followed: usize = 0;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ControlError::Timeout);
+        }
+
+        let hop_result = tokio::time::timeout(remaining, async {
+            let tls = connect_tls13(
+                &current.canonical_authority,
+                connect_addr,
+                tls_config,
+                remaining,
+            )
+            .await?;
+
+            let io = TokioIo::new(tls);
+            let mut h1 = hyper::client::conn::http1::Builder::new();
+            h1.max_buf_size(FETCH_READ_BUF_BYTES);
+            let (mut sender, conn) = h1.handshake(io).await.map_err(ControlError::Http)?;
+
+            let _conn_guard = AbortOnDrop(tokio::spawn(async move {
+                let _ = conn.await;
+            }));
+
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(&current.request_target)
+                .header(http::header::HOST, &current.canonical_authority)
+                .header(http::header::USER_AGENT, "mp-outpost")
+                .header(http::header::CONNECTION, "close")
+                .body(Full::new(Bytes::new()))
+                .map_err(|e| ControlError::InvalidRequest(e.to_string()))?;
+
+            let resp = sender.send_request(req).await.map_err(ControlError::Http)?;
+            let status = resp.status();
+
+            check_response_headers_size(resp.headers())?;
+
+            let status_code = status.as_u16();
+            if matches!(status_code, 301 | 302 | 303 | 307 | 308) {
+                if redirects_followed >= MAX_FETCH_REDIRECTS {
+                    return Err(ControlError::UnexpectedRedirect {
+                        status: status_code,
+                    });
+                }
+                let location = resp
+                    .headers()
+                    .get(http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .ok_or(ControlError::UnexpectedRedirect {
+                        status: status_code,
+                    })?;
+                let next = parse_fetch_https_url(location).map_err(|_| {
+                    ControlError::UnexpectedRedirect {
+                        status: status_code,
+                    }
+                })?;
+                if !host_is_allowed(&next.canonical_authority, &next.host_lower, allowed_hosts) {
+                    return Err(ControlError::UnexpectedRedirect {
+                        status: status_code,
+                    });
+                }
+                return Ok(FetchHopOutcome::Redirect(next));
+            }
+
+            if status.is_redirection() {
+                return Err(ControlError::UnexpectedRedirect {
+                    status: status_code,
+                });
+            }
+
+            let retry_after_ms = parse_retry_after_header_ms(resp.headers());
+
+            if status != StatusCode::OK {
+                let mut incoming = resp.into_body();
+                let mut err_buf = BytesMut::new();
+                while let Some(frame_res) = incoming.frame().await {
+                    let frame = frame_res.map_err(ControlError::Http)?;
+                    if let Some(data) = frame.data_ref() {
+                        let space = MAX_RESPONSE_BODY_BYTES.saturating_sub(err_buf.len());
+                        if space == 0 {
+                            break;
+                        }
+                        let take = data.len().min(space);
+                        if let Some(slice) = data.get(..take) {
+                            err_buf.extend_from_slice(slice);
+                        }
+                    }
+                }
+                return Err(parse_api_error(RawHttpResponse {
+                    status: status_code,
+                    body: err_buf.freeze(),
+                    retry_after_ms,
+                }));
+            }
+
+            let mut initial_cap: usize = 0;
+            if let Some(cl_val) = resp.headers().get(http::header::CONTENT_LENGTH) {
+                let parsed = cl_val
+                    .to_str()
+                    .ok()
+                    .and_then(|s| s.trim().parse::<usize>().ok());
+                match parsed {
+                    Some(n) if n <= max_bytes => {
+                        initial_cap = n.min(FETCH_READ_BUF_BYTES);
+                    }
+                    _ => return Err(ControlError::ResponseTooLarge),
+                }
+            }
+
+            let mut incoming = resp.into_body();
+            let mut out = Vec::with_capacity(initial_cap);
+            while let Some(frame_res) = incoming.frame().await {
+                let frame = frame_res.map_err(ControlError::Http)?;
+                if let Some(data) = frame.data_ref() {
+                    if out.len().saturating_add(data.len()) > max_bytes {
+                        return Err(ControlError::ResponseTooLarge);
+                    }
+                    out.extend_from_slice(data);
+                }
+            }
+
+            Ok(FetchHopOutcome::Body(out))
+        })
+        .await
+        .map_err(|_| ControlError::Timeout)??;
+
+        match hop_result {
+            FetchHopOutcome::Redirect(next) => {
+                redirects_followed = redirects_followed.saturating_add(1);
+                current = next;
+            }
+            FetchHopOutcome::Body(bytes) => return Ok(bytes),
+        }
+    }
+}
+
+enum FetchHopOutcome {
+    Redirect(ParsedFetchUrl),
+    Body(Vec<u8>),
+}
+
+fn check_response_headers_size(headers: &http::HeaderMap) -> Result<(), ControlError> {
+    let mut header_bytes: usize = 0;
+    for (name, value) in headers {
+        header_bytes = header_bytes
+            .saturating_add(name.as_str().len())
+            .saturating_add(value.as_bytes().len())
+            .saturating_add(4);
+        if header_bytes > MAX_RESPONSE_HEADERS_BYTES {
+            return Err(ControlError::ResponseHeadersTooLarge);
+        }
+    }
+    Ok(())
+}
+
+fn parse_retry_after_header_ms(headers: &http::HeaderMap) -> Option<u64> {
+    let val = headers.get(http::header::RETRY_AFTER)?;
+    let s = val.to_str().ok()?.trim();
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let secs = s.parse::<u64>().ok()?;
+    let ms = secs.saturating_mul(1_000);
+    Some(ms.clamp(MIN_RETRY_AFTER_MS, MAX_RETRY_AFTER_MS))
 }
 
 /// Performs an unsigned TLS 1.3-only HTTP/1.1 `GET` probe against an `https://` URL
@@ -1404,16 +1745,8 @@ async fn send_http1_raw(
             });
         }
 
-        let mut header_bytes: usize = 0;
-        for (name, value) in resp.headers() {
-            header_bytes = header_bytes
-                .saturating_add(name.as_str().len())
-                .saturating_add(value.as_bytes().len())
-                .saturating_add(4);
-            if header_bytes > MAX_RESPONSE_HEADERS_BYTES {
-                return Err(ControlError::ResponseHeadersTooLarge);
-            }
-        }
+        check_response_headers_size(resp.headers())?;
+        let retry_after_ms = parse_retry_after_header_ms(resp.headers());
 
         if let Some(cl_val) = resp.headers().get(http::header::CONTENT_LENGTH) {
             let parsed = cl_val
@@ -1443,6 +1776,7 @@ async fn send_http1_raw(
         Ok(RawHttpResponse {
             status: status.as_u16(),
             body: buf.freeze(),
+            retry_after_ms,
         })
     })
     .await
@@ -1492,17 +1826,175 @@ fn encode_json<T: Serialize>(value: &T) -> Result<Bytes, ControlError> {
         .map_err(|e| ControlError::InvalidRequest(e.to_string()))
 }
 
+/// Validates a server-returned device-link code strictly (`XXXX-XXXX`, 9 ASCII bytes
+/// where each `X` is ASCII alphanumeric).
+pub fn validate_link_code(code: &str) -> Result<(), ControlError> {
+    let bytes = code.as_bytes();
+    if bytes.len() != 9 {
+        return Err(ControlError::Protocol(
+            "malformed link_code: expected 9-character XXXX-XXXX code".to_owned(),
+        ));
+    }
+    for (idx, &b) in bytes.iter().enumerate() {
+        let ok = if idx == 4 {
+            b == b'-'
+        } else {
+            b.is_ascii_alphanumeric()
+        };
+        if !ok {
+            return Err(ControlError::Protocol(
+                "malformed link_code: expected ASCII alphanumeric XXXX-XXXX code".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_account_id(id: u64, context: &'static str) -> Result<(), ControlError> {
+    AccountId::new(id).map_err(|_| {
+        ControlError::Protocol(format!("invalid account_id ({id}) in {context} response"))
+    })?;
+    Ok(())
+}
+
+fn validate_device_id(id: u64, context: &'static str) -> Result<(), ControlError> {
+    DeviceId::new(id).map_err(|_| {
+        ControlError::Protocol(format!("invalid device_id ({id}) in {context} response"))
+    })?;
+    Ok(())
+}
+
+fn is_forbidden_error_scalar(ch: char) -> bool {
+    let cp = ch as u32;
+    cp < 0x20
+        || cp == 0x7F
+        || (0x80..=0x9F).contains(&cp)
+        || cp == 0x061C
+        || (0x200B..=0x200F).contains(&cp)
+        || (0x202A..=0x202E).contains(&cp)
+        || cp == 0x2060
+        || (0x2066..=0x2069).contains(&cp)
+        || cp == 0xFEFF
+        || (0xE0000..=0xE007F).contains(&cp)
+}
+
+/// Sanitizes an untrusted server-supplied error string before storing or printing it:
+/// - strips ANSI CSI/OSC/DCS/SOS/PM/APC escape sequences
+/// - strips C0 (`< 0x20`), DEL (`0x7F`), C1 (`0x80..=0x9F`), BiDi overrides/isolates,
+///   zero-width/ignorable scalars, and Unicode Tag characters (`U+E0000..=U+E007F`)
+/// - collapses ASCII whitespace runs to single ASCII spaces and trims ends
+/// - caps output length at 256 Unicode scalar values.
+pub fn sanitize_server_error(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(MAX_ERROR_MESSAGE_CHARS));
+    let mut chars = raw.chars().peekable();
+    let mut pending_space = false;
+    let mut char_count: usize = 0;
+
+    while let Some(ch) = chars.next() {
+        // Strip 7-bit ANSI escape sequences (ESC CSI / OSC / DCS / SOS / PM / APC).
+        if ch == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    let _ = chars.next();
+                    for c in chars.by_ref() {
+                        let b = c as u32;
+                        if (0x40..=0x7E).contains(&b) {
+                            break;
+                        }
+                        if !(0x20..=0x3F).contains(&b) {
+                            break;
+                        }
+                    }
+                }
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    let _ = chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' || c == '\u{009C}' {
+                            break;
+                        }
+                        if c == '\x1b' && chars.peek() == Some(&'\\') {
+                            let _ = chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        // Strip 8-bit CSI (`U+009B`) and OSC (`U+009D`) sequences.
+        if ch == '\u{009B}' {
+            for c in chars.by_ref() {
+                let b = c as u32;
+                if (0x40..=0x7E).contains(&b) || !(0x20..=0x3F).contains(&b) {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '\u{009D}' {
+            while let Some(c) = chars.next() {
+                if c == '\x07' || c == '\u{009C}' {
+                    break;
+                }
+                if c == '\x1b' && chars.peek() == Some(&'\\') {
+                    let _ = chars.next();
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if ch.is_ascii_whitespace() {
+            if char_count > 0 {
+                pending_space = true;
+            }
+            continue;
+        }
+
+        if is_forbidden_error_scalar(ch) {
+            continue;
+        }
+
+        if pending_space {
+            if char_count >= MAX_ERROR_MESSAGE_CHARS {
+                break;
+            }
+            out.push(' ');
+            char_count += 1;
+            pending_space = false;
+        }
+
+        if char_count >= MAX_ERROR_MESSAGE_CHARS {
+            break;
+        }
+        out.push(ch);
+        char_count += 1;
+    }
+
+    out
+}
+
 fn parse_api_error(resp: RawHttpResponse) -> ControlError {
     let raw_body = String::from_utf8_lossy(&resp.body).into_owned();
     let parsed = serde_json::from_slice::<ApiErrorBody>(&resp.body).ok();
+    let error = parsed
+        .as_ref()
+        .and_then(|p| p.error.as_deref())
+        .map(sanitize_server_error)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("http_{}", resp.status));
+    let retry_after_ms = parsed
+        .as_ref()
+        .and_then(|p| p.retry_after_ms)
+        .or(resp.retry_after_ms)
+        .map(|ms| ms.clamp(MIN_RETRY_AFTER_MS, MAX_RETRY_AFTER_MS));
     ControlError::Api {
         status: resp.status,
-        error: parsed
-            .as_ref()
-            .and_then(|p| p.error.clone())
-            .unwrap_or_else(|| format!("http_{}", resp.status)),
+        error,
         server_now_ms: parsed.as_ref().and_then(|p| p.server_now_ms),
-        retry_after_ms: parsed.as_ref().and_then(|p| p.retry_after_ms),
+        retry_after_ms,
         raw_body,
     }
 }
@@ -1949,11 +2441,21 @@ struct DeviceLinkClaimWire<'a> {
     device_label: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct DeviceLinkClaimResponse {
     pub poll_token: String,
     pub device_fingerprint: String,
     pub expires_at_ms: u64,
+}
+
+impl fmt::Debug for DeviceLinkClaimResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceLinkClaimResponse")
+            .field("poll_token", &"[REDACTED]")
+            .field("device_fingerprint", &self.device_fingerprint)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
 }
 
 #[derive(Serialize)]
@@ -2015,7 +2517,7 @@ struct DeviceLinkPollWire<'a> {
     device_pubkey_b64: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DeviceLinkPollResponse {
     Pending {
@@ -2030,4 +2532,33 @@ pub enum DeviceLinkPollResponse {
         cwt_expires_ms: u64,
         safety_number: String,
     },
+}
+
+impl fmt::Debug for DeviceLinkPollResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending { expires_at_ms } => f
+                .debug_struct("Pending")
+                .field("expires_at_ms", expires_at_ms)
+                .finish(),
+            Self::Approved {
+                account_id,
+                handle,
+                device_id,
+                root_pubkey_b64,
+                device_cwt_b64: _,
+                cwt_expires_ms,
+                safety_number,
+            } => f
+                .debug_struct("Approved")
+                .field("account_id", account_id)
+                .field("handle", handle)
+                .field("device_id", device_id)
+                .field("root_pubkey_b64", root_pubkey_b64)
+                .field("device_cwt_b64", &"[REDACTED]")
+                .field("cwt_expires_ms", cwt_expires_ms)
+                .field("safety_number", safety_number)
+                .finish(),
+        }
+    }
 }

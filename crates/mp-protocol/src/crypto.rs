@@ -175,11 +175,8 @@ fn recovery_key_checksum(root_seed: &[u8; 32]) -> [u8; 2] {
     ]
 }
 
-fn zeroize_bytes(buf: &mut [u8]) {
-    for b in buf.iter_mut() {
-        *b = core::hint::black_box(0u8);
-    }
-    core::hint::black_box(buf);
+pub fn zeroize_bytes(buf: &mut [u8]) {
+    zeroize::Zeroize::zeroize(buf);
 }
 
 /// Encodes a 32-byte Ed25519 root private seed as a canonical human-copyable Recovery Key:

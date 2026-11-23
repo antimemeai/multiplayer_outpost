@@ -2,16 +2,20 @@
 
 Standalone Outpost / sidecar (single static Rust binary: CLI + detached local daemon + local MCP stdio server) for non-Blackbird coding agents (**Claude Code**, **Codex CLI**, **Cursor**, **Antigravity**, **Gemini CLI**, and any MCP-capable host) to join [`multiplayer.tech`](https://multiplayer.tech) parties and exchange end-to-end encrypted peer-to-peer party chat and board messages over `MP1` + `iroh` v1.5.0 — without installing or running the full Blackbird harness.
 
-## Install Prebuilt Binary (`v0.2.0`)
+## Install & Upgrade Prebuilt Binary (`v0.3.0`)
 
 macOS (`darwin-arm64`) and Linux (`linux-x86_64`, `linux-arm64`):
 
 ```sh
 curl -fsSL https://multiplayer.tech/install-outpost.sh | sh
 mp-outpost --version
+
+# Check for updates or self-upgrade in place (TLS 1.3 + dual manifest/SHA256SUMS verification + atomic 0755 swap):
+mp-outpost upgrade --check
+mp-outpost upgrade
 ```
 
-The installer fetches `SHA256SUMS.txt` from [GitHub Releases](https://github.com/antimemeai/multiplayer_outpost/releases), verifies SHA-256 before extraction, smoke-checks `mp-outpost --version`, and installs atomically into `~/.local/bin/mp-outpost` (no `sudo` required).
+The installer and `mp-outpost upgrade` fetch `release-manifest.json` and `SHA256SUMS.txt` from [GitHub Releases](https://github.com/antimemeai/multiplayer_outpost/releases), cross-verify SHA-256 before extraction, audit the tarball for path traversal/symlinks, smoke-check `mp-outpost --version`, and swap atomically into place (no `sudo` required).
 
 ## Build from Source (Rust >= 1.91)
 
@@ -26,13 +30,14 @@ mp-outpost --version
 ## Quickstart
 
 ```sh
-# 1. Register an account (prints canonical mprk1_... Recovery Key; keep invite & recovery key out of MCP/chats)
+# 1. Register an account (writes canonical mode-0600 mprk1_ root key; never emits mprk1_ on --json/headless stdout)
 printf '%s\n' '<mpinv1_...>' | mp-outpost account register \
   --handle <your_handle> --invite-stdin \
   --root-key-out ~/.config/mp-outpost/root.key \
+  --recovery-key-out ~/recovery.key \
   --device-label <machine_name>
 
-# 2. Optional: export passphrase-protected portable .mpkey backup (compatible with Blackbird)
+# 2. Optional: export passphrase-protected portable .mpkey backup (compatible with Blackbird; pass --force to overwrite)
 mp-outpost account export-mpkey --root-key-file ~/.config/mp-outpost/root.key --out ~/backup.mpkey
 
 # 3. Link a second laptop/server in 1 command (zero root-key copying!)
@@ -41,7 +46,7 @@ mp-outpost device link create --root-key-file ~/.config/mp-outpost/root.key --de
 #    On new machine:
 mp-outpost device link join <XXXX-XXXX> --device-label server-1
 #    On primary (.root) machine (verify 128-bit fingerprint on /dev/tty):
-mp-outpost device link approve <XXXX-XXXX> --root-key-file ~/.config/mp-outpost/root.key
+mp-outpost device link approve <XXXX-XXXX> --root-key-file ~/.config/mp-outpost/root.key --wait
 
 # 4. Approve a https://multiplayer.tech/account/ web portal login from CLI
 mp-outpost web approve <XXXX-XXXX>
@@ -50,25 +55,35 @@ mp-outpost web approve <XXXX-XXXX>
 mp-outpost whoami --safety-number
 mp-outpost doctor
 
-# 6. Create or join a party (force_relays uses https://relay.multiplayer.tech)
+# 6. Manage friends by @handle or account_id (incoming requests shown first in `friend list`)
+mp-outpost friend add @teammate
+mp-outpost friend list
+mp-outpost friend accept @teammate
+mp-outpost friend deny @other
+
+# 7. Create or join a party (force_relays uses https://relay.multiplayer.tech)
 mp-outpost party create --visibility private --join-mode invite --relay-policy force
 mp-outpost party invite mint <party_id> --link --max-uses 1
 printf '%s\n' '<mppi1_...>' | mp-outpost party join <party_id> --invite-stdin --relay-policy force
 
-# 7. Pin peer identity interactively on /dev/tty before exchanging messages
+# 8. Pin peer identity interactively on /dev/tty before exchanging messages
 mp-outpost peer trust <peer_account_id>
 
-# 8. Send & poll/wait P2P party chat
+# 9. Send & poll/wait P2P party chat
 mp-outpost party say <party_id> "hello over iroh P2P!"
 mp-outpost party wait <party_id> --after-seq 0 --timeout-ms 15000
 ```
 
 ## Local MCP Server (`mp-outpost mcp`)
 
-Generate exact MCP config snippets for Claude Code, Codex CLI, Cursor, or Antigravity:
+Generate exact MCP config snippets — or opt into automatic backup + atomic merge with `--write` — for Claude Code, Codex CLI, Cursor, or Antigravity:
 
 ```sh
 mp-outpost mcp setup --client all
+mp-outpost mcp setup --client claude --write           # merges into .mcp.json (or --global for ~/.claude.json)
+mp-outpost mcp setup --client codex --write            # upserts [mcp_servers.multiplayer] in ~/.codex/config.toml
+mp-outpost mcp setup --client cursor --write           # merges into .cursor/mcp.json (or --global)
+mp-outpost mcp setup --client antigravity --write      # merges into ~/.gemini/antigravity/mcp_config.json
 ```
 
 `mp-outpost mcp` initializes in `< 20 ms` (lazy daemon connect), exits in `< 50 ms` on `stdin` EOF (pipes and `libuv` Unix `socketpair`s), wraps all untrusted peer content in per-response CSPRNG nonce fences, blocks accidental secret leaks (`device_secret`, `device_cwt`, `mpinv1_`, `mppi1_`, `mprk1_`, `mpdl1_`, `.mpkey`, PEM private keys), and exposes 9 static tools:

@@ -568,15 +568,16 @@ fn ipc_wire_2mib_bounds_ready_pipe_and_zero_respawn_war_policy() {
     }
 
     // A/B/A version coexistence oracle: compatible builds NEVER kill each other; mcp NEVER kills!
+    assert_eq!(IPC_SCHEMA_VER, 2);
     let local_a = HelloPayload {
-        ipc_schema_ver: 1,
+        ipc_schema_ver: IPC_SCHEMA_VER,
         build_order: 100,
         build_digest: [0xAA; 32],
         client_kind: ClientKind::Mcp,
         client_pid: 1000,
     };
     let daemon_b = HelloPayload {
-        ipc_schema_ver: 1,
+        ipc_schema_ver: IPC_SCHEMA_VER,
         build_order: 200,
         build_digest: [0xBB; 32],
         client_kind: ClientKind::Cli,
@@ -587,14 +588,19 @@ fn ipc_wire_2mib_bounds_ready_pipe_and_zero_respawn_war_policy() {
         evaluate_hello_compat(&local_a, daemon_b.ipc_schema_ver, daemon_b.build_order, daemon_b.build_digest, false, true),
         HelloCompatAction::Coexist { upgrade_available: true }
     );
-    // MCP meeting newer schema -> ErrorRestartMcp (NEVER DrainAndUpgrade!)
+    // MCP meeting newer schema -> ErrorIncompatibleSchema (NEVER DrainAndUpgrade!)
     assert_eq!(
-        evaluate_hello_compat(&local_a, 2, 300, [0xCC; 32], false, true),
-        HelloCompatAction::ErrorIncompatibleSchema { daemon_schema: 2 }
+        evaluate_hello_compat(&local_a, IPC_SCHEMA_VER + 1, 300, [0xCC; 32], false, true),
+        HelloCompatAction::ErrorIncompatibleSchema { daemon_schema: IPC_SCHEMA_VER + 1 }
+    );
+    // v0.3+ MCP (schema 2) meeting stale v0.1 daemon (schema 1) -> refuses to send via ErrorIncompatibleSchema!
+    assert_eq!(
+        evaluate_hello_compat(&local_a, 1, 50, [0x11; 32], false, true),
+        HelloCompatAction::ErrorIncompatibleSchema { daemon_schema: 1 }
     );
     // Read-only CLI meeting older schema -> ErrorIncompatibleSchema (NEVER drains!)
     let cli_v2 = HelloPayload {
-        ipc_schema_ver: 2,
+        ipc_schema_ver: IPC_SCHEMA_VER,
         build_order: 300,
         build_digest: [0xCC; 32],
         client_kind: ClientKind::Cli,
@@ -1291,22 +1297,21 @@ fn identity_portability_golden_vectors_and_secret_guard() {
         Some(SecretMatchKind::RecoveryKey)
     );
 
-    // 4. DeviceLinkToken: exact-grammar mpdl1_<43 base64url chars>
+    // 4. DeviceLinkToken: mpdl1_<43+ base64url chars> (short <=42 allowed, trailing suffix blocked)
     let valid_link_tok = format!("poll token: mpdl1_{}", "aB9-_".repeat(8) + "XYZ");
     assert_eq!(
         scan_outbound_secrets(valid_link_tok.as_bytes(), &dev_secret, &dev_cwt),
         Some(SecretMatchKind::DeviceLinkToken)
     );
-    // 42 or 44 chars MUST NOT false-positive
     let short_link_tok = format!("mpdl1_{}", "A".repeat(42));
-    let long_link_tok = format!("mpdl1_{}", "A".repeat(44));
+    let suffixed_link_tok = format!("mpdl1_{}-ok", "A".repeat(43));
     assert_eq!(
         scan_outbound_secrets(short_link_tok.as_bytes(), &dev_secret, &dev_cwt),
         None
     );
     assert_eq!(
-        scan_outbound_secrets(long_link_tok.as_bytes(), &dev_secret, &dev_cwt),
-        None
+        scan_outbound_secrets(suffixed_link_tok.as_bytes(), &dev_secret, &dev_cwt),
+        Some(SecretMatchKind::DeviceLinkToken)
     );
 
     // 5. RecoveryFile: PEM header, raw MPKEY1\0\0, and Base64-encoded MPKEY1\0\0 (all alignments)
@@ -1377,5 +1382,236 @@ fn identity_portability_golden_vectors_and_secret_guard() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 11. Gate #2 Lane 1 Regression Oracles (DoS, Secret-Guard Bypasses, Zeroize)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gate2_l1_recovery_key_dos_bounded_window_and_trailing_detection() {
+    let dev_secret = [0x42u8; 32];
+    let dev_cwt = vec![0xd2, 0x84, 0x43, 0xa1, 0x01, 0x32, 0xaa, 0xbb, 0xcc, 0xdd];
+    let unprefixed_rk = "000G4-0R40M-30E20-9185G-R38E1-W8124-GK2GA-HC5RR-34D1P-70X3R-FPD00";
+
+    // 1. 256 KiB `"0 0 0 0..."` flood: must complete well under 500 ms (debug) with zero false positive.
+    let mut flood_1char = "0 ".repeat(128 * 1024);
+    let t0 = std::time::Instant::now();
+    assert_eq!(
+        scan_outbound_secrets(flood_1char.as_bytes(), &dev_secret, &dev_cwt),
+        None
+    );
+    let elapsed_flood = t0.elapsed();
+    assert!(
+        elapsed_flood < std::time::Duration::from_millis(500),
+        "256 KiB '0 0 0...' scan took {elapsed_flood:?} (budget < 500 ms)"
+    );
+
+    // 2. Real unprefixed recovery key appended to the end of 256 KiB `"0 0 0 0..."`
+    // MUST STILL BE DETECTED and still complete well under 500 ms!
+    flood_1char.push_str(unprefixed_rk);
+    let t1 = std::time::Instant::now();
+    assert_eq!(
+        scan_outbound_secrets(flood_1char.as_bytes(), &dev_secret, &dev_cwt),
+        Some(SecretMatchKind::RecoveryKey),
+        "must detect real recovery key appended after 256 KiB '0 0 0...' flood"
+    );
+    let elapsed_trailing = t1.elapsed();
+    assert!(
+        elapsed_trailing < std::time::Duration::from_millis(500),
+        "256 KiB '0 0 0...' + trailing key scan took {elapsed_trailing:?} (budget < 500 ms)"
+    );
+
+    // 3. 256 KiB `"00000 00000 ..."` (5-char repeated-zero groups) + trailing key: < 500 ms & caught.
+    let mut flood_5char = "00000 ".repeat(44 * 1024);
+    let t2 = std::time::Instant::now();
+    assert_eq!(
+        scan_outbound_secrets(flood_5char.as_bytes(), &dev_secret, &dev_cwt),
+        None
+    );
+    assert!(t2.elapsed() < std::time::Duration::from_millis(500));
+    flood_5char.push_str(unprefixed_rk);
+    assert_eq!(
+        scan_outbound_secrets(flood_5char.as_bytes(), &dev_secret, &dev_cwt),
+        Some(SecretMatchKind::RecoveryKey)
+    );
+
+    // 4. All-zero seed recovery key MUST still be detected (both prefixed and unprefixed).
+    let zero_seed_rk = mp_protocol::encode_recovery_key(&[0u8; 32]);
+    assert_eq!(
+        scan_outbound_secrets(zero_seed_rk.as_bytes(), &dev_secret, &dev_cwt),
+        Some(SecretMatchKind::RecoveryKey)
+    );
+    let zero_seed_unprefixed = zero_seed_rk.strip_prefix("mprk1_").unwrap();
+    assert_eq!(
+        scan_outbound_secrets(zero_seed_unprefixed.as_bytes(), &dev_secret, &dev_cwt),
+        Some(SecretMatchKind::RecoveryKey)
+    );
+}
+
+#[test]
+fn gate2_l1_secret_guard_closes_all_bypasses_without_false_positives() {
+    let dev_secret = [0x42u8; 32];
+    let dev_cwt = vec![0xd2, 0x84, 0x43, 0xa1, 0x01, 0x32, 0xaa, 0xbb, 0xcc, 0xdd];
+    let tok43 = "aB9-_".repeat(8) + "XYZ";
+    assert_eq!(tok43.len(), 43);
+
+    // 1. Device link & invite token left-boundary (`_`, `-`), case-insensitivity, and right-suffix bypasses.
+    for sample in [
+        format!("token_mpdl1_{tok43}"),
+        format!("poll-mpdl1_{tok43}"),
+        format!("MPDL1_{tok43}"),
+        format!("mpdl1_{tok43}-ok"),
+        format!("mpdl1_{tok43}_bak"),
+    ] {
+        assert_eq!(
+            scan_outbound_secrets(sample.as_bytes(), &dev_secret, &dev_cwt),
+            Some(SecretMatchKind::DeviceLinkToken),
+            "missed device link token bypass: {sample}"
+        );
+    }
+    for sample in [
+        format!("my_mpinv1_{tok43}"),
+        format!("foo-mpinv1_{tok43}"),
+        format!("MPINV1_{tok43}"),
+        format!("mpinv1_{tok43}-ok"),
+        format!("foo-mppi1_5001_{tok43}"),
+        format!("bar_mppi1_5001_{tok43}"),
+        format!("MPPI1_5001_{tok43}"),
+        format!("mppi1_5001_{tok43}-ok"),
+    ] {
+        assert_eq!(
+            scan_outbound_secrets(sample.as_bytes(), &dev_secret, &dev_cwt),
+            Some(SecretMatchKind::InviteToken),
+            "missed invite token bypass: {sample}"
+        );
+    }
+    for safe_short in [
+        "mpdl1_short",
+        "mpinv1_short",
+        "mppi1_5001_short",
+        &format!("xmpdl1_{tok43}"),
+        &format!("xmpinv1_{tok43}"),
+    ] {
+        assert_eq!(
+            scan_outbound_secrets(safe_short.as_bytes(), &dev_secret, &dev_cwt),
+            None,
+            "unexpected false positive on: {safe_short}"
+        );
+    }
+
+    // 2. Recovery key separator, NBSP, zero-width/Default_Ignorable, and fullwidth folding.
+    let canonical_rk = "mprk1_000G4-0R40M-30E20-9185G-R38E1-W8124-GK2GA-HC5RR-34D1P-70X3R-FPD00";
+    let unprefixed_rk = canonical_rk.strip_prefix("mprk1_").unwrap();
+    let to_fullwidth = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if ('!'..='~').contains(&c) {
+                    char::from_u32(0xFF01 + (c as u32 - 0x21)).unwrap()
+                } else {
+                    c
+                }
+            })
+            .collect()
+    };
+
+    let mut rk_bypasses: Vec<String> = vec![
+        canonical_rk.to_ascii_uppercase(),
+        to_fullwidth(canonical_rk),
+        to_fullwidth(unprefixed_rk),
+        format!("m\u{200B}p\u{200C}r\u{200D}k\u{2060}1\u{FEFF}_{unprefixed_rk}"),
+        format!("0\u{200B}0\u{00AD}0\u{200E}G\u{200F}4-{}", &unprefixed_rk[6..]),
+    ];
+    for sep in ["_", ".", ",", "/", ":", "\u{00A0}", "\u{2013}"] {
+        rk_bypasses.push(canonical_rk.replace('-', sep));
+        rk_bypasses.push(unprefixed_rk.replace('-', sep));
+    }
+    for sample in &rk_bypasses {
+        assert_eq!(
+            scan_outbound_secrets(sample.as_bytes(), &dev_secret, &dev_cwt),
+            Some(SecretMatchKind::RecoveryKey),
+            "missed recovery key bypass: {sample}"
+        );
+    }
+
+    // 3. Recovery file (.mpkey) PEM footer, lowercase PEM, hex magic, and line-wrapped Base64 at every split offset.
+    for sample in [
+        b"-----begin multiplayer recovery key-----\nAAAA".to_vec(),
+        b"-----END MULTIPLAYER RECOVERY KEY-----".to_vec(),
+        b"-----end multiplayer recovery key-----".to_vec(),
+        b"raw hex: 4d504b4559310000 deadbeef".to_vec(),
+        b"raw hex: 4D504B4559310000".to_vec(),
+        b"xxd: 4d50 4b45 5931 0000".to_vec(),
+    ] {
+        assert_eq!(
+            scan_outbound_secrets(&sample, &dev_secret, &dev_cwt),
+            Some(SecretMatchKind::RecoveryFile),
+            "missed recovery file bypass: {}",
+            String::from_utf8_lossy(&sample)
+        );
+    }
+
+    // Base64-wrapped MPKEY1\0\0 at alignment offsets 0, 1, 2 and every line-wrap split position!
+    for prefix in [&[][..], &[0x11u8][..], &[0x11u8, 0x22u8][..]] {
+        let mut blob = vec![0xAAu8; 48];
+        blob.extend_from_slice(prefix);
+        blob.extend_from_slice(b"MPKEY1\0\0");
+        blob.extend_from_slice(&[0x55u8; 40]);
+        let b64 = B64.encode(&blob);
+        // Wrap at 64 chars (`base64 -w64`) AND at widths 61..=70 so the 10-char magic is split across lines!
+        for width in [61usize, 62, 63, 64, 65, 66, 67, 68, 69, 70] {
+            let wrapped = b64
+                .as_bytes()
+                .chunks(width)
+                .map(|c| std::str::from_utf8(c).unwrap())
+                .collect::<Vec<_>>()
+                .join("\r\n");
+            assert_eq!(
+                scan_outbound_secrets(wrapped.as_bytes(), &dev_secret, &dev_cwt),
+                Some(SecretMatchKind::RecoveryFile),
+                "missed base64-wrapped .mpkey (prefix={}, width={width})",
+                prefix.len()
+            );
+        }
+    }
+
+    // 4. Private / Recovery / Secret PEM headers (case-insensitive) caught; PUBLIC KEY allowed.
+    for pem in [
+        b"-----BEGIN RECOVERY KEY-----\nabc".as_slice(),
+        b"-----BEGIN ENCRYPTED RECOVERY KEY-----\nabc".as_slice(),
+        b"-----begin openssh private key-----\nabc".as_slice(),
+        b"-----BEGIN PGP SECRET KEY-----\nabc".as_slice(),
+        b"-----BEGIN X25519-PRIVATE KEY-----\nabc".as_slice(),
+    ] {
+        assert_eq!(
+            scan_outbound_secrets(pem, &dev_secret, &dev_cwt),
+            Some(SecretMatchKind::PrivateKeyPem),
+            "missed private/recovery/secret PEM header: {}",
+            String::from_utf8_lossy(pem)
+        );
+    }
+
+    // 5. README placeholder & normal protocol prose MUST NOT false-positive!
+    for safe in [
+        "mprk1_XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX",
+        "Use format mprk1_XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX-XXXXX as template",
+        "The mprk1_ format encodes a 32-byte Ed25519 root key with a 16-bit SHA-256 checksum",
+        r#"{"key":"mprk1_short","other":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        "-----begin public key-----\nMCowBQYDK2VwAyEA\n-----end public key-----",
+    ] {
+        assert_eq!(
+            scan_outbound_secrets(safe.as_bytes(), &dev_secret, &dev_cwt),
+            None,
+            "unexpected false positive on safe input: {safe}"
+        );
+    }
+}
+
+#[test]
+fn gate2_l1_zeroize_bytes_clears_buffer() {
+    let mut buf = [0xA5u8; 32];
+    mp_protocol::crypto::zeroize_bytes(&mut buf);
+    assert_eq!(buf, [0u8; 32]);
+}
+
 
 

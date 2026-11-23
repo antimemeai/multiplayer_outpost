@@ -31,12 +31,14 @@ use mp_protocol::{
 };
 use outpost_control::{
     ApprovePartyRequest, ChurnStatus, ControlClient, ControlClientConfig, ControlError,
-    CreatePartyRequest, DeviceLinkApproveRequest, DeviceLinkInspectResponse,
-    DeviceLinkPollResponse, EndpointUpdateCoalescer, EnrollDeviceRequest, EvictionChurnDetector,
-    JoinPartyRequest, JoinPartyResponse, MAX_CLOCK_OFFSET_MS, MAX_RESPONSE_BODY_BYTES,
+    CreatePartyRequest, DeviceLinkApproveRequest, DeviceLinkClaimResponse,
+    DeviceLinkInspectResponse, DeviceLinkPollResponse, EndpointUpdateCoalescer,
+    EnrollDeviceRequest, EvictionChurnDetector, JoinPartyRequest, JoinPartyResponse,
+    MAX_CLOCK_OFFSET_MS, MAX_RESPONSE_BODY_BYTES, MAX_RETRY_AFTER_MS, MIN_RETRY_AFTER_MS,
     MP1_PING_TEXT, MP1_PONG_TEXT, MintPartyInviteRequest, Mp1WsEvent, Mp1WsTarget,
     RegisterAccountRequest, RequestSigner, WsConnectError, WsError,
-    build_tls13_client_config_with_roots, wall_now_ms, wall_now_secs,
+    build_tls13_client_config_with_roots, sanitize_server_error, validate_link_code, wall_now_ms,
+    wall_now_secs,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -2302,4 +2304,543 @@ async fn oracle_identity_portability_and_web_portal_endpoints() {
         .expect("probe_relay_ping must succeed over TLS 1.3");
     assert!(rtt < Duration::from_secs(5));
     relay_srv.await.expect("relay srv");
+}
+
+// ===========================================================================
+// Oracle 8: Gate #2 Lane 2 — Retry-After Header, ANSI/OSC Error Sanitization,
+//           Response Validation, Redacted Debug, & Hardened fetch_https_bytes
+// ===========================================================================
+
+fn generate_test_pki_for_hosts(hosts: &[&str]) -> TestPki {
+    let sans: Vec<String> = hosts.iter().map(|&h| h.to_owned()).collect();
+    let certified = rcgen::generate_simple_self_signed(sans).expect("rcgen multi-san cert");
+    let cert_der = certified.cert.der().clone();
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        certified.key_pair.serialize_der(),
+    ));
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert_der.clone()).expect("add test root cert");
+    let client_tls13 =
+        build_tls13_client_config_with_roots(roots).expect("build TLS 1.3 client config");
+
+    TestPki {
+        cert_der,
+        key_der,
+        client_tls13,
+    }
+}
+
+#[tokio::test]
+async fn oracle_retry_after_header_error_sanitization_and_response_validation() {
+    let pki = generate_test_pki();
+    let tls13_acceptor = make_server_acceptor(&pki, &[&rustls::version::TLS13]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let root_secret = [81u8; 32];
+    let root_signing = SigningKey::from_bytes(&root_secret);
+    let root_pubkey = root_signing.verifying_key().to_bytes();
+    let dev_secret = [82u8; 32];
+    let dev_pubkey = SigningKey::from_bytes(&dev_secret)
+        .verifying_key()
+        .to_bytes();
+    let cwt = make_cwt(root_secret, dev_pubkey);
+    let acct_id = AccountId::new(1001).expect("acct");
+    let root_signer = RequestSigner::root(acct_id, root_secret);
+
+    // Verify redacted Debug on DeviceLinkClaimResponse & DeviceLinkPollResponse.
+    let secret_poll_token = "mpdl1_SUPER_SECRET_POLL_TOKEN_1234567890abcdef";
+    let claim_resp = DeviceLinkClaimResponse {
+        poll_token: secret_poll_token.to_owned(),
+        device_fingerprint: "ad1a8375-03ecc659-ad64922d-16cf6eb6".to_owned(),
+        expires_at_ms: 1_795_454_100_000,
+    };
+    let claim_dbg = format!("{claim_resp:?}");
+    assert!(claim_dbg.contains("[REDACTED]"));
+    assert!(!claim_dbg.contains(secret_poll_token));
+
+    let secret_cwt_b64 = "SUPER_SECRET_CWT_PAYLOAD_BASE64_VALUE";
+    let poll_resp = DeviceLinkPollResponse::Approved {
+        account_id: 1001,
+        handle: "alice".to_owned(),
+        device_id: 2004,
+        root_pubkey_b64: B64_STD.encode(root_pubkey),
+        device_cwt_b64: secret_cwt_b64.to_owned(),
+        cwt_expires_ms: 1_900_000_000_000,
+        safety_number: "SP44-BGDF-SWJH-YXTV-ZWXT-MNGX-P342-B0TV".to_owned(),
+    };
+    let poll_dbg = format!("{poll_resp:?}");
+    assert!(poll_dbg.contains("[REDACTED]"));
+    assert!(!poll_dbg.contains(secret_cwt_b64));
+
+    // Direct unit checks on validate_link_code & sanitize_server_error.
+    assert!(validate_link_code("W4K9-M2P7").is_ok());
+    assert!(validate_link_code("abcd-1234").is_ok());
+    for bad in ["", "W4K9M2P7", "W4K9_M2P7", "W4K9-M2P", "W4K9-M2P77", "W4K9-M2P!"] {
+        assert!(
+            matches!(validate_link_code(bad), Err(ControlError::Protocol(_))),
+            "expected Protocol error for link_code {bad:?}"
+        );
+    }
+    let dirty = format!(
+        "  bad\t\n\x1b]52;c;evil\x07\x1b[31m  err\u{202E}\u{200B}\u{FEFF}\u{E0041}\u{0085}\x7f  {}",
+        "x".repeat(300)
+    );
+    let clean = sanitize_server_error(&dirty);
+    assert!(!clean.contains('\x1b'));
+    assert!(!clean.contains('\x07'));
+    assert!(!clean.contains("52;c;evil"));
+    assert!(!clean.contains('\u{202E}'));
+    assert!(!clean.contains('\u{200B}'));
+    assert!(!clean.contains('\u{FEFF}'));
+    assert!(!clean.contains('\u{E0041}'));
+    assert!(!clean.contains('\u{0085}'));
+    assert!(!clean.contains('\x7f'));
+    assert!(clean.starts_with("bad err xxx"));
+    assert_eq!(clean.chars().count(), 256);
+
+    let srv = tokio::spawn(async move {
+        // 1. HTTP 429 with Retry-After: 3 header (no JSON retry_after_ms)
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 1");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 1");
+            let _req = read_http_request(&mut tls).await;
+            let body = r#"{"error":"rate_limited"}"#;
+            let resp = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write 1");
+            tls.shutdown().await.expect("shutdown 1");
+        }
+
+        // 2. HTTP 429 with JSON retry_after_ms=2500 overriding Retry-After: 9 header
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 2");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 2");
+            let _req = read_http_request(&mut tls).await;
+            let body = r#"{"error":"rate_limited","retry_after_ms":2500}"#;
+            let resp = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 9\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write 2");
+            tls.shutdown().await.expect("shutdown 2");
+        }
+
+        // 3. HTTP 429 with Retry-After: 0 (clamped up to 100ms) and ANSI/OSC escape in error
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 3");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 3");
+            let _req = read_http_request(&mut tls).await;
+            let body = "{\"error\":\"denied\\u001b]52;c;evil\\u0007\\u001b[31m_now\"}";
+            let resp = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write 3");
+            tls.shutdown().await.expect("shutdown 3");
+        }
+
+        // 4. HTTP 429 with Retry-After: 999 (clamped down to 60_000ms)
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 4");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 4");
+            let _req = read_http_request(&mut tls).await;
+            let body = r#"{"error":"slow_down"}"#;
+            let resp = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 999\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write 4");
+            tls.shutdown().await.expect("shutdown 4");
+        }
+
+        // 5. Malformed link_code returned by device_link_create -> ControlError::Protocol
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 5");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 5");
+            let _req = read_http_request(&mut tls).await;
+            let body = r#"{"link_code":"EVIL;rm -rf /","expires_at_ms":1795454100000}"#;
+            let resp = format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write 5");
+            tls.shutdown().await.expect("shutdown 5");
+        }
+
+        // 6. Invalid account_id=0 in recover_lookup -> ControlError::Protocol
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 6");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 6");
+            let _req = read_http_request(&mut tls).await;
+            let body = format!(
+                r#"{{"account_id":0,"handle":"alice","root_pubkey_b64":"{}","safety_number":"SN","devices":[]}}"#,
+                B64_STD.encode(root_pubkey)
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write 6");
+            tls.shutdown().await.expect("shutdown 6");
+        }
+
+        // 7. Out-of-53-bit device_id in device_link_approve -> ControlError::Protocol
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 7");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 7");
+            let _req = read_http_request(&mut tls).await;
+            let body = r#"{"approved":true,"account_id":1001,"device_id":9007199254740992,"device_label":"laptop","device_fingerprint":"fp","cwt_expires_ms":1900000000000}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write 7");
+            tls.shutdown().await.expect("shutdown 7");
+        }
+
+        // 8. Invalid account_id=0 in device_link_poll Approved -> ControlError::Protocol
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 8");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 8");
+            let _req = read_http_request(&mut tls).await;
+            let body = format!(
+                r#"{{"status":"approved","account_id":0,"handle":"alice","device_id":2004,"root_pubkey_b64":"{}","device_cwt_b64":"{}","cwt_expires_ms":1900000000000,"safety_number":"SN"}}"#,
+                B64_STD.encode(root_pubkey),
+                B64_STD.encode(&cwt)
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write 8");
+            tls.shutdown().await.expect("shutdown 8");
+        }
+    });
+
+    let client = ControlClient::new(make_client_config(&pki, addr));
+
+    // 1. 429 Retry-After: 3 -> Some(3000)
+    let err1 = client.health().await.expect_err("429 #1");
+    match err1 {
+        ControlError::Api {
+            status: 429,
+            error,
+            retry_after_ms,
+            ..
+        } => {
+            assert_eq!(error, "rate_limited");
+            assert_eq!(retry_after_ms, Some(3_000));
+        }
+        other => panic!("expected Api 429 with retry_after_ms=3000, got {other:?}"),
+    }
+
+    // 2. JSON retry_after_ms takes precedence over header
+    let err2 = client.health().await.expect_err("429 #2");
+    match err2 {
+        ControlError::Api {
+            status: 429,
+            retry_after_ms,
+            ..
+        } => assert_eq!(retry_after_ms, Some(2_500)),
+        other => panic!("expected Api 429 with retry_after_ms=2500, got {other:?}"),
+    }
+
+    // 3. ANSI/OSC escape sanitized & Retry-After: 0 clamped to MIN_RETRY_AFTER_MS (100)
+    let err3 = client.health().await.expect_err("429 #3");
+    let display3 = err3.to_string();
+    assert!(!display3.contains('\x1b'));
+    assert!(!display3.contains('\x07'));
+    assert!(!display3.contains("52;c;evil"));
+    match err3 {
+        ControlError::Api {
+            status: 429,
+            error,
+            retry_after_ms,
+            ..
+        } => {
+            assert_eq!(error, "denied_now");
+            assert_eq!(retry_after_ms, Some(MIN_RETRY_AFTER_MS));
+        }
+        other => panic!("expected sanitized Api 429, got {other:?}"),
+    }
+
+    // 4. Retry-After: 999 clamped to MAX_RETRY_AFTER_MS (60_000)
+    let err4 = client.health().await.expect_err("429 #4");
+    match err4 {
+        ControlError::Api {
+            status: 429,
+            retry_after_ms,
+            ..
+        } => assert_eq!(retry_after_ms, Some(MAX_RETRY_AFTER_MS)),
+        other => panic!("expected Api 429 with retry_after_ms=60000, got {other:?}"),
+    }
+
+    // 5. Malformed link_code rejected with ControlError::Protocol
+    assert!(matches!(
+        client.device_link_create(&root_signer, None).await,
+        Err(ControlError::Protocol(_))
+    ));
+
+    // 6. Invalid account_id=0 in recover_lookup rejected
+    assert!(matches!(
+        client.recover_lookup(root_secret).await,
+        Err(ControlError::Protocol(_))
+    ));
+
+    // 7. Invalid >53-bit device_id in device_link_approve rejected
+    assert!(matches!(
+        client
+            .device_link_approve(
+                &root_signer,
+                &DeviceLinkApproveRequest {
+                    link_code: "W4K9-M2P7".to_owned(),
+                    device_pubkey: dev_pubkey,
+                    device_cwt: make_cwt(root_secret, dev_pubkey),
+                    device_label: None,
+                },
+            )
+            .await,
+        Err(ControlError::Protocol(_))
+    ));
+
+    // 8. Invalid account_id=0 in device_link_poll Approved rejected
+    assert!(matches!(
+        client
+            .device_link_poll(
+                dev_secret,
+                "W4K9-M2P7",
+                "mpdl1_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .await,
+        Err(ControlError::Protocol(_))
+    ));
+
+    srv.await.expect("server task");
+}
+
+#[tokio::test]
+async fn oracle_fetch_https_bytes_redirects_allowlist_downgrade_and_max_bytes() {
+    let pki = generate_test_pki_for_hosts(&["releases.multiplayer.tech", "objects.multiplayer.tech"]);
+    let tls13_acceptor = make_server_acceptor(&pki, &[&rustls::version::TLS13]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let srv = tokio::spawn(async move {
+        // Flow 1 (2 requests): 302 redirect from releases.multiplayer.tech -> objects.multiplayer.tech (200 OK)
+        {
+            let (tcp, _) = listener.accept().await.expect("accept f1-hop1");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls f1-hop1");
+            let req = read_http_request(&mut tls).await;
+            assert_eq!(req.method, "GET");
+            assert_eq!(req.path, "/releases/download/v0.3.0/mp-outpost.tar.gz");
+            assert_eq!(
+                req.headers.get("host").map(String::as_str),
+                Some("releases.multiplayer.tech")
+            );
+            let resp = "HTTP/1.1 302 Found\r\nLocation: https://objects.multiplayer.tech/blobs/bin?sig=abc123\r\nContent-Length: 0\r\n\r\n";
+            tls.write_all(resp.as_bytes()).await.expect("write f1-hop1");
+            tls.shutdown().await.expect("shutdown f1-hop1");
+
+            let (tcp, _) = listener.accept().await.expect("accept f1-hop2");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls f1-hop2");
+            let req = read_http_request(&mut tls).await;
+            assert_eq!(req.method, "GET");
+            assert_eq!(req.path, "/blobs/bin");
+            assert_eq!(req.query, "?sig=abc123");
+            assert_eq!(
+                req.headers.get("host").map(String::as_str),
+                Some("objects.multiplayer.tech")
+            );
+            let payload = b"RELEASE_TARBALL_BYTES_V030";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                payload.len()
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write f1-hop2 hdr");
+            tls.write_all(payload).await.expect("write f1-hop2 body");
+            tls.shutdown().await.expect("shutdown f1-hop2");
+        }
+
+        // Flow 2: 302 redirect to disallowed host -> must be rejected immediately!
+        {
+            let (tcp, _) = listener.accept().await.expect("accept f2");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls f2");
+            let _req = read_http_request(&mut tls).await;
+            let resp = "HTTP/1.1 302 Found\r\nLocation: https://evil.example/payload\r\nContent-Length: 0\r\n\r\n";
+            let _ = tls.write_all(resp.as_bytes()).await;
+            let _ = tls.shutdown().await;
+        }
+
+        // Flow 3: 302 HTTP downgrade redirect -> must be rejected immediately!
+        {
+            let (tcp, _) = listener.accept().await.expect("accept f3");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls f3");
+            let _req = read_http_request(&mut tls).await;
+            let resp = "HTTP/1.1 302 Found\r\nLocation: http://objects.multiplayer.tech/blobs/bin\r\nContent-Length: 0\r\n\r\n";
+            let _ = tls.write_all(resp.as_bytes()).await;
+            let _ = tls.shutdown().await;
+        }
+
+        // Flow 4: Exceeding max_bytes via Content-Length pre-check
+        {
+            let (tcp, _) = listener.accept().await.expect("accept f4");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls f4");
+            let _req = read_http_request(&mut tls).await;
+            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
+            let _ = tls.write_all(resp.as_bytes()).await;
+            let _ = tls.shutdown().await;
+        }
+
+        // Flow 5: Exceeding max_bytes via chunked streaming body
+        {
+            let (tcp, _) = listener.accept().await.expect("accept f5");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls f5");
+            let _req = read_http_request(&mut tls).await;
+            let resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n12345678\r\n9\r\n123456789\r\n0\r\n\r\n";
+            let _ = tls.write_all(resp.as_bytes()).await;
+            let _ = tls.shutdown().await;
+        }
+
+        // Flow 6: 4 redirects (> max 3 redirects) -> must fail on the 4th redirect
+        for hop in 0..4u8 {
+            let (tcp, _) = listener.accept().await.expect("accept f6");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls f6");
+            let _req = read_http_request(&mut tls).await;
+            let resp = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: https://objects.multiplayer.tech/hop/{}\r\nContent-Length: 0\r\n\r\n",
+                hop + 1
+            );
+            let _ = tls.write_all(resp.as_bytes()).await;
+            let _ = tls.shutdown().await;
+        }
+
+        // Flow 7: Non-200 response -> ControlError::Api with sanitized error + Retry-After
+        {
+            let (tcp, _) = listener.accept().await.expect("accept f7");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls f7");
+            let _req = read_http_request(&mut tls).await;
+            let body = "{\"error\":\"not_found\\u001b]52;c;bad\\u0007\"}";
+            let resp = format!(
+                "HTTP/1.1 404 Not Found\r\nRetry-After: 5\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = tls.write_all(resp.as_bytes()).await;
+            let _ = tls.shutdown().await;
+        }
+    });
+
+    let client = ControlClient::new(
+        ControlClientConfig::new("releases.multiplayer.tech")
+            .expect("cfg")
+            .with_tls_config(Arc::clone(&pki.client_tls13))
+            .with_connect_addr(addr)
+            .with_request_timeout(Duration::from_secs(5)),
+    );
+    let allowed = &["releases.multiplayer.tech", "objects.multiplayer.tech"];
+
+    // Local URL validation rejections (no network calls)
+    for bad_url in [
+        "http://releases.multiplayer.tech/x",
+        "https://user@releases.multiplayer.tech/x",
+        "https://releases.multiplayer.tech/x#frag",
+        "https://releases.multiplayer.tech/x y",
+        "https://releases.multiplayer.tech/x\r\n",
+        "https://evil.example/x",
+    ] {
+        let err = client
+            .fetch_https_bytes(bad_url, 1024, allowed)
+            .await
+            .expect_err("bad URL must be rejected locally");
+        assert!(
+            matches!(
+                err,
+                ControlError::InvalidRequest(_) | ControlError::InvalidAuthority(_)
+            ),
+            "expected local rejection for {bad_url:?}, got {err:?}"
+        );
+    }
+
+    // Flow 1: Allowlisted HTTPS redirect succeeds
+    let bytes = client
+        .fetch_https_bytes(
+            "https://releases.multiplayer.tech/releases/download/v0.3.0/mp-outpost.tar.gz",
+            1024,
+            allowed,
+        )
+        .await
+        .expect("allowlisted redirect must succeed");
+    assert_eq!(bytes, b"RELEASE_TARBALL_BYTES_V030");
+
+    // Flow 2: Disallowed redirect host rejected
+    assert!(matches!(
+        client
+            .fetch_https_bytes("https://releases.multiplayer.tech/bad-host", 1024, allowed)
+            .await,
+        Err(ControlError::UnexpectedRedirect { status: 302 })
+    ));
+
+    // Flow 3: HTTP downgrade redirect rejected
+    assert!(matches!(
+        client
+            .fetch_https_bytes("https://releases.multiplayer.tech/downgrade", 1024, allowed)
+            .await,
+        Err(ControlError::UnexpectedRedirect { status: 302 })
+    ));
+
+    // Flow 4: max_bytes enforced on Content-Length pre-check
+    assert!(matches!(
+        client
+            .fetch_https_bytes("https://releases.multiplayer.tech/big-cl", 64, allowed)
+            .await,
+        Err(ControlError::ResponseTooLarge)
+    ));
+
+    // Flow 5: max_bytes enforced on chunked streaming accumulation (8 + 9 = 17 > 16)
+    assert!(matches!(
+        client
+            .fetch_https_bytes("https://releases.multiplayer.tech/big-chunked", 16, allowed)
+            .await,
+        Err(ControlError::ResponseTooLarge)
+    ));
+
+    // Flow 6: > 3 redirects rejected
+    assert!(matches!(
+        client
+            .fetch_https_bytes("https://releases.multiplayer.tech/loop", 1024, allowed)
+            .await,
+        Err(ControlError::UnexpectedRedirect { status: 307 })
+    ));
+
+    // Flow 7: Non-200 returns ControlError::Api with sanitized error & Retry-After
+    let err7 = client
+        .fetch_https_bytes("https://releases.multiplayer.tech/missing", 1024, allowed)
+        .await
+        .expect_err("404 must return ControlError::Api");
+    match err7 {
+        ControlError::Api {
+            status: 404,
+            error,
+            retry_after_ms,
+            ..
+        } => {
+            assert_eq!(error, "not_found");
+            assert_eq!(retry_after_ms, Some(5_000));
+        }
+        other => panic!("expected Api 404, got {other:?}"),
+    }
+
+    srv.await.expect("server task");
 }

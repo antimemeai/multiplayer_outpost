@@ -14,22 +14,24 @@
 //!   with unknown keys and duplicate keys strictly rejected.
 
 use core::fmt;
-use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-use std::os::unix::ffi::OsStrExt as _;
+use std::os::fd::AsRawFd as _;
 use std::path::Path;
 
 use aes_gcm::aead::{Aead as _, KeyInit as _, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::{Algorithm, Argon2, Block, Params, Version};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use icu_normalizer::ComposingNormalizerBorrowed;
-use outpost_daemon::{atomic_write_in_dir, fill_random};
+use mp_protocol::AccountId;
+use outpost_daemon::{
+    DaemonError, atomic_write_in_dir, atomic_write_in_dir_no_replace, fill_random,
+    open_dir_nofollow,
+};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
-use zeroize::Zeroize as _;
+use zeroize::{Zeroize as _, Zeroizing};
 
 pub const PEM_BEGIN: &str = "-----BEGIN MULTIPLAYER RECOVERY KEY-----";
 pub const PEM_END: &str = "-----END MULTIPLAYER RECOVERY KEY-----";
@@ -58,12 +60,23 @@ const HEADER_LEN: usize = 8 + SALT_LEN + 4 + 4 + 4; // 36
 const AAD_LEN: usize = 9 + SALT_LEN + 4 + 4 + 4; // 37
 const PEM_LINE_WIDTH: usize = 64;
 
-/// Decrypted `.mpkey` payload. Automatically zeroizes `root_seed` on drop.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Decrypted `.mpkey` payload. Automatically zeroizes `root_seed` on drop and redacts
+/// `root_seed` in `Debug` output.
+#[derive(Clone, PartialEq, Eq)]
 pub struct MpkeyPayload {
     pub account_id: Option<u64>,
     pub handle: Option<String>,
     pub root_seed: [u8; 32],
+}
+
+impl fmt::Debug for MpkeyPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MpkeyPayload")
+            .field("account_id", &self.account_id)
+            .field("handle", &self.handle)
+            .field("root_seed", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl Drop for MpkeyPayload {
@@ -84,13 +97,7 @@ struct MpkeyPlaintextRead {
     v: u64,
     account_id: Option<u64>,
     handle: Option<String>,
-    root_seed_b64: String,
-}
-
-impl Drop for MpkeyPlaintextRead {
-    fn drop(&mut self) {
-        self.root_seed_b64.zeroize();
-    }
+    root_seed_b64: Zeroizing<String>,
 }
 
 impl<'de> Deserialize<'de> for MpkeyPlaintextRead {
@@ -114,7 +121,7 @@ impl<'de> Deserialize<'de> for MpkeyPlaintextRead {
                 let mut v: Option<u64> = None;
                 let mut account_id: Option<Option<u64>> = None;
                 let mut handle: Option<Option<String>> = None;
-                let mut root_seed_b64: Option<String> = None;
+                let mut root_seed_b64: Option<Zeroizing<String>> = None;
 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -140,7 +147,8 @@ impl<'de> Deserialize<'de> for MpkeyPlaintextRead {
                             if root_seed_b64.is_some() {
                                 return Err(de::Error::duplicate_field("root_seed_b64"));
                             }
-                            root_seed_b64 = Some(map.next_value()?);
+                            let raw: String = map.next_value()?;
+                            root_seed_b64 = Some(Zeroizing::new(raw));
                         }
                         _ => {
                             return Err(de::Error::unknown_field(
@@ -197,22 +205,22 @@ fn derive_key_argon2id(
     m_kib: u32,
     t_cost: u32,
     p_lanes: u32,
-) -> Result<[u8; 32], String> {
+) -> Result<Zeroizing<[u8; 32]>, String> {
     let normalizer = ComposingNormalizerBorrowed::new_nfc();
-    let mut normalized = normalizer.normalize(passphrase).into_owned();
+    let normalized = Zeroizing::new(normalizer.normalize(passphrase).into_owned());
 
     let params = Params::new(m_kib, t_cost, p_lanes, Some(32))
         .map_err(|e| format!("invalid Argon2id parameters: {e}"))?;
+    let block_count = params.block_count();
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
-    let mut key = [0u8; 32];
-    let kdf_res = argon2.hash_password_into(normalized.as_bytes(), salt, &mut key);
-    normalized.zeroize();
-
-    if let Err(e) = kdf_res {
-        key.zeroize();
-        return Err(format!("Argon2id key derivation failed: {e}"));
-    }
+    // Allocate the Argon2id memory matrix inside `Zeroizing<Vec<Block>>` so the entire
+    // KDF working memory is explicitly zeroized on return and on every error path.
+    let mut memory = Zeroizing::new(vec![Block::new(); block_count]);
+    let mut key = Zeroizing::new([0u8; 32]);
+    argon2
+        .hash_password_into_with_memory(normalized.as_bytes(), salt, &mut *key, &mut *memory)
+        .map_err(|e| format!("Argon2id key derivation failed: {e}"))?;
     Ok(key)
 }
 
@@ -328,18 +336,20 @@ pub fn encrypt_mpkey_deterministic(
     salt: [u8; SALT_LEN],
     nonce: [u8; NONCE_LEN],
 ) -> Result<String, String> {
-    let mut root_seed_b64 = B64.encode(root_seed);
+    let root_seed_b64 = Zeroizing::new(B64.encode(root_seed));
     let plaintext_wire = MpkeyPlaintextWrite {
         v: 1,
         account_id,
         handle,
-        root_seed_b64: &root_seed_b64,
+        root_seed_b64: root_seed_b64.as_str(),
     };
-    let mut plaintext = serde_json::to_vec(&plaintext_wire)
-        .map_err(|e| format!("failed serializing .mpkey plaintext: {e}"))?;
-    root_seed_b64.zeroize();
+    let plaintext = Zeroizing::new(
+        serde_json::to_vec(&plaintext_wire)
+            .map_err(|e| format!("failed serializing .mpkey plaintext: {e}"))?,
+    );
+    drop(root_seed_b64);
 
-    let mut key = derive_key_argon2id(
+    let key = derive_key_argon2id(
         passphrase,
         &salt,
         WRITER_M_KIB,
@@ -348,26 +358,21 @@ pub fn encrypt_mpkey_deterministic(
     )?;
 
     let aad = build_aad(&salt, WRITER_M_KIB, WRITER_T_COST, WRITER_P_LANES);
-    let cipher_res = Aes256Gcm::new_from_slice(&key);
-    key.zeroize();
-    let cipher = match cipher_res {
-        Ok(c) => c,
-        Err(_) => {
-            plaintext.zeroize();
-            return Err("failed initializing AES-256-GCM".to_string());
-        }
-    };
+    let cipher = Aes256Gcm::new_from_slice(key.as_slice())
+        .map_err(|_| "failed initializing AES-256-GCM".to_string())?;
+    drop(key);
 
     let nonce_ref = Nonce::from_slice(&nonce);
-    let ct_res = cipher.encrypt(
-        nonce_ref,
-        Payload {
-            msg: plaintext.as_slice(),
-            aad: &aad,
-        },
-    );
-    plaintext.zeroize();
-    let ct_and_tag = ct_res.map_err(|_| "AES-256-GCM encryption failed".to_string())?;
+    let ct_and_tag = cipher
+        .encrypt(
+            nonce_ref,
+            Payload {
+                msg: plaintext.as_slice(),
+                aad: &aad,
+            },
+        )
+        .map_err(|_| "AES-256-GCM encryption failed".to_string())?;
+    drop(plaintext);
 
     let total_len = HEADER_LEN + NONCE_LEN + ct_and_tag.len();
     if !(MIN_BINARY_BYTES..=MAX_BINARY_BYTES).contains(&total_len) {
@@ -456,27 +461,29 @@ pub fn decrypt_mpkey(pem: &str, passphrase: &str) -> Result<MpkeyPayload, String
         return Err("truncated .mpkey AEAD authentication tag".to_string());
     }
 
-    let mut key = derive_key_argon2id(passphrase, &salt, m_kib, t_cost, p_lanes)?;
+    let key = derive_key_argon2id(passphrase, &salt, m_kib, t_cost, p_lanes)?;
     let aad = build_aad(&salt, m_kib, t_cost, p_lanes);
-    let cipher_res = Aes256Gcm::new_from_slice(&key);
-    key.zeroize();
-    let cipher = cipher_res.map_err(|_| "failed initializing AES-256-GCM".to_string())?;
+    let cipher = Aes256Gcm::new_from_slice(key.as_slice())
+        .map_err(|_| "failed initializing AES-256-GCM".to_string())?;
+    drop(key);
 
     let nonce_ref = Nonce::from_slice(nonce_slice);
-    let mut plaintext = cipher
-        .decrypt(
-            nonce_ref,
-            Payload {
-                msg: ct_and_tag,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| "failed to decrypt .mpkey (wrong passphrase or tampered file)".to_string())?;
+    let plaintext = Zeroizing::new(
+        cipher
+            .decrypt(
+                nonce_ref,
+                Payload {
+                    msg: ct_and_tag,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| {
+                "failed to decrypt .mpkey (wrong passphrase or tampered file)".to_string()
+            })?,
+    );
 
     // Strictly AFTER AEAD verification succeeds: parse strict UTF-8 JSON object.
-    let parse_res = parse_verified_plaintext(&plaintext);
-    plaintext.zeroize();
-    parse_res
+    parse_verified_plaintext(plaintext.as_slice())
 }
 
 fn parse_verified_plaintext(plaintext: &[u8]) -> Result<MpkeyPayload, String> {
@@ -488,39 +495,47 @@ fn parse_verified_plaintext(plaintext: &[u8]) -> Result<MpkeyPayload, String> {
     if parsed.v != 1 {
         return Err(format!("unsupported .mpkey plaintext version {}", parsed.v));
     }
+    if let Some(aid) = parsed.account_id {
+        AccountId::new(aid)
+            .map_err(|_| format!("invalid .mpkey account_id {aid} (out of safe range)"))?;
+    }
     if parsed.root_seed_b64.len() != 44 {
         return Err("invalid root_seed_b64 length (expected 44 canonical Base64 chars)".to_string());
     }
-    let mut decoded = B64
-        .decode(parsed.root_seed_b64.as_bytes())
-        .map_err(|e| format!("invalid root_seed_b64: {e}"))?;
+    let decoded = Zeroizing::new(
+        B64.decode(parsed.root_seed_b64.as_bytes())
+            .map_err(|e| format!("invalid root_seed_b64: {e}"))?,
+    );
     if decoded.len() != 32 {
-        decoded.zeroize();
         return Err("root_seed_b64 did not decode to exactly 32 bytes".to_string());
     }
-    let mut canonical_check = B64.encode(&decoded);
-    let is_canonical = canonical_check == parsed.root_seed_b64;
-    canonical_check.zeroize();
-    if !is_canonical {
-        decoded.zeroize();
+    let canonical_check = Zeroizing::new(B64.encode(decoded.as_slice()));
+    if canonical_check.as_str() != parsed.root_seed_b64.as_str() {
         return Err("root_seed_b64 is not canonical Base64".to_string());
     }
 
     let mut root_seed = [0u8; 32];
-    root_seed.copy_from_slice(&decoded);
-    decoded.zeroize();
+    root_seed.copy_from_slice(decoded.as_slice());
 
     Ok(MpkeyPayload {
         account_id: parsed.account_id,
-        handle: parsed.handle.clone(),
+        handle: parsed.handle,
         root_seed,
     })
 }
 
 /// Atomically writes a `.mpkey` PEM file with strict `0600` permissions in the target
-/// directory (`openat(O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW|O_CLOEXEC, 0o600)` -> `write_all` ->
-/// `fsync` -> `renameat` -> `fsync(dirfd)`).
-pub fn write_mpkey_atomic_0600(path: &Path, pem: &str) -> Result<(), String> {
+/// directory.
+///
+/// - Opens the parent directory via `open_dir_nofollow` (rejecting symlinked parent dirs).
+/// - When `force == false`, uses `atomic_write_in_dir_no_replace` (`linkat` without
+///   clobbering existing files or symlinks) and returns an actionable error on `AlreadyExists`.
+/// - When `force == true`, atomically replaces the target via `atomic_write_in_dir`.
+pub fn write_mpkey_atomic_0600_with_force(
+    path: &Path,
+    pem: &str,
+    force: bool,
+) -> Result<(), String> {
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -529,24 +544,34 @@ pub fn write_mpkey_atomic_0600(path: &Path, pem: &str) -> Result<(), String> {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let parent_c = CString::new(parent.as_os_str().as_bytes())
-        .map_err(|_| "output directory path contains interior NUL byte".to_string())?;
-    let raw_fd = unsafe {
-        libc::open(
-            parent_c.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    if raw_fd < 0 {
-        return Err(format!(
-            "failed to open output directory '{}': {}",
-            parent.display(),
-            io::Error::last_os_error()
-        ));
+    let dir_fd = open_dir_nofollow(parent)
+        .map_err(|e| format!("failed to open output directory '{}': {e}", parent.display()))?;
+    if force {
+        atomic_write_in_dir(dir_fd.as_raw_fd(), file_name, pem.as_bytes())
+            .map_err(|e| format!("failed writing .mpkey file '{}': {e}", path.display()))
+    } else {
+        match atomic_write_in_dir_no_replace(dir_fd.as_raw_fd(), file_name, pem.as_bytes(), 0o600) {
+            Ok(()) => Ok(()),
+            Err(DaemonError::Io { source, .. })
+                if source.kind() == io::ErrorKind::AlreadyExists =>
+            {
+                Err(format!(
+                    "refusing to overwrite existing .mpkey file '{}' (pass --force to replace)",
+                    path.display()
+                ))
+            }
+            Err(e) => Err(format!(
+                "failed writing .mpkey file '{}': {e}",
+                path.display()
+            )),
+        }
     }
-    let dir_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-    atomic_write_in_dir(dir_fd.as_raw_fd(), file_name, pem.as_bytes())
-        .map_err(|e| format!("failed writing .mpkey file '{}': {e}", path.display()))
+}
+
+/// Atomically writes a `.mpkey` PEM file with strict `0600` permissions without clobbering
+/// an existing file (fail-closed no-replace default).
+pub fn write_mpkey_atomic_0600(path: &Path, pem: &str) -> Result<(), String> {
+    write_mpkey_atomic_0600_with_force(path, pem, false)
 }
 
 #[cfg(test)]
@@ -572,7 +597,7 @@ mod tests {
         plaintext: &[u8],
         passphrase: &str,
     ) -> Result<String, String> {
-        let mut key = derive_key_argon2id(
+        let key = derive_key_argon2id(
             passphrase,
             &GOLDEN_SALT,
             WRITER_M_KIB,
@@ -580,8 +605,9 @@ mod tests {
             WRITER_P_LANES,
         )?;
         let aad = build_aad(&GOLDEN_SALT, WRITER_M_KIB, WRITER_T_COST, WRITER_P_LANES);
-        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "aes init".to_string())?;
-        key.zeroize();
+        let cipher =
+            Aes256Gcm::new_from_slice(key.as_slice()).map_err(|_| "aes init".to_string())?;
+        drop(key);
         let ct = cipher
             .encrypt(
                 Nonce::from_slice(&GOLDEN_NONCE),
@@ -799,22 +825,102 @@ mod tests {
         let pem_seed = build_custom_plaintext_container(bad_seed.as_bytes(), GOLDEN_PASSPHRASE)?;
         assert!(decrypt_mpkey(&pem_seed, GOLDEN_PASSPHRASE).is_err());
 
+        // Out-of-range account_id: 0
+        let zero_aid = format!(
+            r#"{{"v":1,"account_id":0,"handle":"a","root_seed_b64":"{seed_b64}"}}"#
+        );
+        let pem_zero = build_custom_plaintext_container(zero_aid.as_bytes(), GOLDEN_PASSPHRASE)?;
+        let err_zero = decrypt_mpkey(&pem_zero, GOLDEN_PASSPHRASE)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            err_zero.contains("account_id"),
+            "expected account_id rejection for 0, got: {err_zero}"
+        );
+
+        // Out-of-range account_id: MAX_SAFE_ID + 1 (9007199254740992)
+        let over_aid = format!(
+            r#"{{"v":1,"account_id":9007199254740992,"handle":"a","root_seed_b64":"{seed_b64}"}}"#
+        );
+        let pem_over = build_custom_plaintext_container(over_aid.as_bytes(), GOLDEN_PASSPHRASE)?;
+        let err_over = decrypt_mpkey(&pem_over, GOLDEN_PASSPHRASE)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            err_over.contains("account_id"),
+            "expected account_id rejection for > MAX_SAFE_ID, got: {err_over}"
+        );
+
         Ok(())
     }
 
     #[test]
-    fn atomic_write_sets_0600_permissions() -> Result<(), String> {
+    fn debug_impl_redacts_root_seed() {
+        let distinct_seed = [0xdeu8; 32];
+        let payload = MpkeyPayload {
+            account_id: Some(42),
+            handle: Some("alice".to_string()),
+            root_seed: distinct_seed,
+        };
+        let rendered = format!("{payload:?}");
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "Debug output must show [REDACTED]: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&crate::build_info::encode_hex(&distinct_seed)),
+            "Debug output must not leak hex seed: {rendered}"
+        );
+        assert!(
+            !rendered.contains("222, 222"),
+            "Debug output must not leak decimal seed bytes: {rendered}"
+        );
+        assert!(
+            !rendered.contains("0xde"),
+            "Debug output must not leak hex byte literals: {rendered}"
+        );
+    }
+
+    #[test]
+    fn atomic_write_sets_0600_and_enforces_no_replace_unless_forced() -> Result<(), String> {
         let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let out_path = dir.path().join("backup.mpkey");
-        let pem = encrypt_mpkey(&GOLDEN_SEED, GOLDEN_PASSPHRASE, Some(7), Some("bob"))?;
-        write_mpkey_atomic_0600(&out_path, &pem)?;
+        let pem1 = encrypt_mpkey(&GOLDEN_SEED, GOLDEN_PASSPHRASE, Some(7), Some("bob"))?;
+        write_mpkey_atomic_0600(&out_path, &pem1)?;
 
         let meta = std::fs::metadata(&out_path).map_err(|e| format!("metadata: {e}"))?;
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         let read_back = std::fs::read_to_string(&out_path).map_err(|e| format!("read: {e}"))?;
-        assert_eq!(read_back, pem);
+        assert_eq!(read_back, pem1);
         let dec = decrypt_mpkey(&read_back, GOLDEN_PASSPHRASE)?;
         assert_eq!(dec.root_seed, GOLDEN_SEED);
+
+        // Second write without --force MUST fail closed without modifying the existing file.
+        let pem2 = encrypt_mpkey(&GOLDEN_SEED, GOLDEN_PASSPHRASE, Some(8), Some("carol"))?;
+        let err = write_mpkey_atomic_0600(&out_path, &pem2)
+            .err()
+            .unwrap_or_default();
+        assert!(
+            err.contains("pass --force to replace"),
+            "expected actionable no-overwrite error, got: {err}"
+        );
+        let still_pem1 = std::fs::read_to_string(&out_path).map_err(|e| format!("read: {e}"))?;
+        assert_eq!(still_pem1, pem1);
+
+        // Write with force=true atomically replaces with 0600 permissions.
+        write_mpkey_atomic_0600_with_force(&out_path, &pem2, true)?;
+        let meta2 = std::fs::metadata(&out_path).map_err(|e| format!("metadata2: {e}"))?;
+        assert_eq!(meta2.permissions().mode() & 0o777, 0o600);
+        let now_pem2 = std::fs::read_to_string(&out_path).map_err(|e| format!("read2: {e}"))?;
+        assert_eq!(now_pem2, pem2);
+
+        // Symlinked parent directory must be rejected.
+        let real_sub = dir.path().join("real_sub");
+        std::fs::create_dir(&real_sub).map_err(|e| format!("mkdir: {e}"))?;
+        let sym_sub = dir.path().join("sym_sub");
+        std::os::unix::fs::symlink(&real_sub, &sym_sub).map_err(|e| format!("symlink: {e}"))?;
+        assert!(write_mpkey_atomic_0600(&sym_sub.join("out.mpkey"), &pem1).is_err());
+
         Ok(())
     }
 }

@@ -11,20 +11,20 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
 publish = false
 
 [workspace.dependencies]
-aes-gcm = "0.10"
-argon2 = "0.5"
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+argon2 = { version = "0.5", features = ["zeroize"] }
 base64 = "0.22"
 blake3 = "1.8"
 bytes = "1.12"
 ciborium = "0.2"
-ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "zeroize"] }
 hyper = { version = "1.12", default-features = false, features = ["client", "http1"] }
 icu_normalizer = "2.4"
 iroh = { version = "1.5.0", default-features = false, features = ["tls-ring"] }

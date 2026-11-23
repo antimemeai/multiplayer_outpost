@@ -8,16 +8,17 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use mp_protocol::MAX_SAFE_ID;
 use outpost_control::sleep_aware_now_ms;
+use outpost_core::fence::{SecretMatchKind, scan_outbound_secrets};
 use outpost_core::ipc_wire::{ClientKind, HelloPayload, IPC_SCHEMA_VER, IpcFrame, IpcOpcode};
 use outpost_daemon::{
     ClientConfig, DaemonClient, DaemonError, SpawnCommand, decode_error_payload,
-    encode_cancel_payload, read_ipc_frame, write_ipc_frame,
+    encode_cancel_payload, fill_random, read_ipc_frame, write_ipc_frame,
 };
 use outpost_mcp::{
     BackendError, BoardPostReq, BoardReadResp, BoxFuture, CancellationToken, McpOutpostBackend,
@@ -515,6 +516,40 @@ fn build_mcp_client_config(
     Ok(cfg)
 }
 
+/// Defense-in-depth bridge-side secret scan (static secret formats: `mprk1_`, `mpdl1_`,
+/// `.mpkey`, PEM private keys, `mpinv1_`, `mppi1_`, etc.) BEFORE any outbound message crosses IPC.
+///
+/// Uses a process-local random sentinel for `own_device_secret` (the stateless MCP bridge does
+/// not hold the device secret; the daemon still performs the full per-device secret & CWT scan)
+/// so static secret patterns are always scanned without false positives on all-zero payloads.
+fn check_mcp_outbound_secrets(fields: &[&[u8]]) -> Result<(), BackendError> {
+    static DUMMY_SECRET: OnceLock<[u8; 32]> = OnceLock::new();
+    let sentinel = DUMMY_SECRET.get_or_init(|| {
+        let mut buf = [0u8; 32];
+        if fill_random(&mut buf).is_err() {
+            // Non-zero high-entropy fallback constant if CSPRNG is ever unavailable.
+            buf = [
+                0x9e, 0x37, 0x79, 0xb9, 0x7f, 0x4a, 0x7c, 0x15, 0xf3, 0x9c, 0xc0, 0x60, 0x5c, 0xed,
+                0xc8, 0x34, 0x10, 0x82, 0x27, 0x6b, 0xf3, 0xa2, 0x72, 0x51, 0xf8, 0x6c, 0x6a, 0x11,
+                0xd0, 0xc1, 0x8e, 0x95,
+            ];
+        }
+        buf
+    });
+
+    for field in fields {
+        if let Some(kind) = scan_outbound_secrets(field, sentinel, &[])
+            && !matches!(
+                kind,
+                SecretMatchKind::OwnDeviceSecret | SecretMatchKind::OwnDeviceCwt
+            )
+        {
+            return Err(BackendError::SecretRefused(kind));
+        }
+    }
+    Ok(())
+}
+
 fn map_ipc_error(code: u16, message: String) -> BackendError {
     if let Some(secret_kind) = error_code_to_secret_kind(code) {
         return BackendError::SecretRefused(secret_kind);
@@ -677,10 +712,12 @@ impl McpOutpostBackend for DaemonMcpBridge {
     fn party_send(&self, req: PartySendReq) -> BoxFuture<'_, Result<Value, BackendError>> {
         Box::pin(async move {
             let party_id = req.party_id;
+            let room_scope = req.room_scope.unwrap_or_else(|| "party/main".to_string());
+            check_mcp_outbound_secrets(&[room_scope.as_bytes(), req.body.as_bytes()])?;
             let wire_req = PartySendChatReq {
                 party_id,
                 client_msg_id: req.client_msg_id,
-                room_scope: req.room_scope.unwrap_or_else(|| "party/main".to_string()),
+                room_scope,
                 target_device_id: req.target_device_id,
                 body: req.body,
             };
@@ -708,6 +745,7 @@ impl McpOutpostBackend for DaemonMcpBridge {
     fn board_post(&self, req: BoardPostReq) -> BoxFuture<'_, Result<Value, BackendError>> {
         Box::pin(async move {
             let party_id = req.party_id;
+            check_mcp_outbound_secrets(&[req.room_scope.as_bytes(), &req.payload])?;
             let wire_req = PartyPostBoardReq {
                 party_id,
                 client_msg_id: req.client_msg_id,
@@ -876,5 +914,84 @@ impl McpOutpostBackend for DaemonMcpBridge {
                 .collect();
             Ok(json!({ "friends": friends }))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use outpost_core::fence::SecretMatchKind;
+
+    #[tokio::test]
+    async fn bridge_refuses_static_secrets_before_connecting_to_daemon() {
+        // Point at a nonexistent state_dir so any IPC/daemon attempt would fail with
+        // ToolError(device_not_enrolled) rather than SecretRefused.
+        let bridge = DaemonMcpBridge::new(
+            PathBuf::from("/nonexistent/outpost-mcp-bridge-test-state"),
+            None,
+            None,
+        );
+
+        let rk = mp_protocol::encode_recovery_key(&[0x42u8; 32]);
+        let res_chat_body = bridge
+            .party_send(PartySendReq {
+                party_id: 1,
+                body: format!("oops here is {rk}"),
+                room_scope: Some("party/main".to_string()),
+                target_device_id: None,
+                client_msg_id: 1,
+            })
+            .await;
+        assert_eq!(
+            res_chat_body,
+            Err(BackendError::SecretRefused(SecretMatchKind::RecoveryKey))
+        );
+
+        let res_chat_scope = bridge
+            .party_send(PartySendReq {
+                party_id: 1,
+                body: "hello".to_string(),
+                room_scope: Some(
+                    "-----BEGIN MULTIPLAYER RECOVERY KEY-----\nAAAA\n-----END MULTIPLAYER RECOVERY KEY-----"
+                        .to_string(),
+                ),
+                target_device_id: None,
+                client_msg_id: 2,
+            })
+            .await;
+        assert_eq!(
+            res_chat_scope,
+            Err(BackendError::SecretRefused(SecretMatchKind::RecoveryFile))
+        );
+
+        let res_pem = bridge
+            .party_send(PartySendReq {
+                party_id: 1,
+                body: "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"
+                    .to_string(),
+                room_scope: Some("party/main".to_string()),
+                target_device_id: None,
+                client_msg_id: 4,
+            })
+            .await;
+        assert_eq!(
+            res_pem,
+            Err(BackendError::SecretRefused(SecretMatchKind::PrivateKeyPem))
+        );
+
+        let res_board = bridge
+            .board_post(BoardPostReq {
+                party_id: 1,
+                room_scope: "board/main".to_string(),
+                payload: b"mpdl1_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".to_vec(),
+                client_msg_id: 3,
+            })
+            .await;
+        assert_eq!(
+            res_board,
+            Err(BackendError::SecretRefused(
+                SecretMatchKind::DeviceLinkToken
+            ))
+        );
     }
 }

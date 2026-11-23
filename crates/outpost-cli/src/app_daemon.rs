@@ -52,6 +52,7 @@ use outpost_p2p::{
 };
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
 
 use crate::build_info::{build_digest, build_order};
 use crate::ipc_payloads::{
@@ -2194,6 +2195,14 @@ impl AppDaemon {
         .map_err(|e| ipc_err(ERR_INTERNAL, false, e.to_string()))
     }
 
+    async fn snapshot_secret_guard_material(&self) -> (Zeroizing<[u8; 32]>, Zeroizing<Vec<u8>>) {
+        let st = self.inner.lock().await;
+        (
+            Zeroizing::new(st.device.device_secret),
+            Zeroizing::new(st.device.device_cwt.clone()),
+        )
+    }
+
     async fn op_party_send_chat(&self, conn_id: u64, payload: &[u8]) -> Result<Vec<u8>, IpcErr> {
         let req = decode_party_send_chat_req(payload)
             .map_err(|e| ipc_err(ERR_INVALID_PARAMS, false, e.to_string()))?;
@@ -2201,20 +2210,20 @@ impl AppDaemon {
         let party_id = req.party_id;
         let client_msg_id = req.client_msg_id;
 
-        let (p2p, target_pks, plan, frame) = {
-            let st = self.inner.lock().await;
-
-            // 1. Secret disclosure guard on BOTH room_scope AND body (NEVER echo offending secret!).
+        // 1. Secret disclosure guard on BOTH room_scope AND body OUTSIDE `self.inner` mutex
+        //    so scanning never stalls concurrent IPC/P2P/WS tasks (NEVER echo offending secret!).
+        {
+            let (device_secret, device_cwt) = self.snapshot_secret_guard_material().await;
             if let Some(kind) = scan_outbound_secrets(
                 req.room_scope.as_bytes(),
-                &st.device.device_secret,
-                &st.device.device_cwt,
+                &device_secret,
+                device_cwt.as_slice(),
             )
             .or_else(|| {
                 scan_outbound_secrets(
                     req.body.as_bytes(),
-                    &st.device.device_secret,
-                    &st.device.device_cwt,
+                    &device_secret,
+                    device_cwt.as_slice(),
                 )
             }) {
                 return Err(ipc_err(
@@ -2223,6 +2232,10 @@ impl AppDaemon {
                     "outbound message refused by secret-disclosure guard",
                 ));
             }
+        }
+
+        let (p2p, target_pks, plan, frame) = {
+            let st = self.inner.lock().await;
 
             // 2. Live per-connection idempotency dedupe check (read-only until send succeeds!).
             match st.dedupe.check(
@@ -2344,20 +2357,19 @@ impl AppDaemon {
         let party_id = req.party_id;
         let client_msg_id = req.client_msg_id;
 
-        let (p2p, target_pks, plan, frame) = {
-            let st = self.inner.lock().await;
-
-            // Scan BOTH room_scope AND payload with the secret-disclosure guard!
+        // Scan BOTH room_scope AND payload OUTSIDE `self.inner` mutex!
+        {
+            let (device_secret, device_cwt) = self.snapshot_secret_guard_material().await;
             if let Some(kind) = scan_outbound_secrets(
                 req.room_scope.as_bytes(),
-                &st.device.device_secret,
-                &st.device.device_cwt,
+                &device_secret,
+                device_cwt.as_slice(),
             )
             .or_else(|| {
                 scan_outbound_secrets(
                     &req.payload,
-                    &st.device.device_secret,
-                    &st.device.device_cwt,
+                    &device_secret,
+                    device_cwt.as_slice(),
                 )
             }) {
                 return Err(ipc_err(
@@ -2366,6 +2378,10 @@ impl AppDaemon {
                     "outbound board envelope refused by secret-disclosure guard",
                 ));
             }
+        }
+
+        let (p2p, target_pks, plan, frame) = {
+            let st = self.inner.lock().await;
 
             match st.dedupe.check(
                 conn_id,
@@ -2462,13 +2478,13 @@ impl AppDaemon {
         let kind = P2pControlNoticeKind::from_u8(req.notice_kind)
             .map_err(|e| ipc_err(ERR_INVALID_PARAMS, false, e.to_string()))?;
 
-        let (p2p, target_pks, plan, frame) = {
-            let st = self.inner.lock().await;
-            // L4-10: Enforce accidental-secret-disclosure guard on control notice text!
+        // Enforce accidental-secret-disclosure guard on control notice text OUTSIDE `self.inner`!
+        {
+            let (device_secret, device_cwt) = self.snapshot_secret_guard_material().await;
             if let Some(secret_kind) = scan_outbound_secrets(
                 req.text.as_bytes(),
-                &st.device.device_secret,
-                &st.device.device_cwt,
+                &device_secret,
+                device_cwt.as_slice(),
             ) {
                 return Err(ipc_err(
                     secret_kind_to_error_code(secret_kind),
@@ -2476,6 +2492,10 @@ impl AppDaemon {
                     "outbound control notice refused by secret-disclosure guard",
                 ));
             }
+        }
+
+        let (p2p, target_pks, plan, frame) = {
+            let st = self.inner.lock().await;
             let Some(sess) = st.active_party.as_ref() else {
                 return Err(ipc_err(ERR_NOT_FOUND, false, "no active party"));
             };

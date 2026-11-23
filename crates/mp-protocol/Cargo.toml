@@ -10,6 +10,7 @@ blake3.workspace = true
 ciborium.workspace = true
 ed25519-dalek.workspace = true
 sha2.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
