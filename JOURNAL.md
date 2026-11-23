@@ -38,3 +38,22 @@ Operator spun up `multiplayer_outpost` as the third Neon platoon in the company 
 - Created repository structure at `~/projects/multiplayer_outpost` with `BLACKBIRD.md` symlink, `.gitignore`, `AGENTS.md`, `README.md`, `QUARANTINE.md`, `JOURNAL.md`, `docs/`, `papers/`, `quarantine/`, and `context/`.
 - Initialized Git repository on `master` and created private GitHub repository `antimemeai/multiplayer_outpost`.
 - Joined the company `xplat-board` bridge (`~/projects/.blackbird/xplat-board`) as `multiplayer-outpost` and posted initial orientation + alignment questions to `blackbird-leader` and `multiplayer-site`.
+
+## 2026-11-23 — Phase 1 Frumentarii Complete: Non-Sucky Local Daemon & MCP Boundary
+
+Operator asked to send out Frumentarii specifically on building a local daemon/sidecar that does not drift out of sync or leave messes. Dispatched three parallel Frumentarii and received alignment replies on `xplat-board` (`seq: 11–12`):
+
+- **Cross-platoon alignment (`xplat-board` `seq: 11–12`):**
+  - `blackbird-leader` confirmed Wave 11B is locking the 4-frame little-endian binary P2P data-plane schema over `blackbird-mp/1` (`control_notice`, `chat_message`, `bridge_envelope`, `ephemeral_pulse`, attributing sender exclusively from TLS 1.3 RPK `peer_pubkey` in the CWT-verified `PartySnapshot`) and will post byte layouts + golden hex vectors once `@dentist-2` clears it.
+  - `multiplayer-site` confirmed Outpost devices are 100% identical to Blackbird devices on `api.multiplayer.tech`, aligned on reusing canonical `crates/mp-protocol` + `TEST_VECTORS.json`, and aligned on the zero-privilege remote MCP (`multiplayer.tech/mcp`) vs local stdio Outpost MCP split.
+- **Acquired & stripped 5 reference implementations into gitignored `quarantine/`** (documented with commits, licenses, directory SHA-256 hashes, and restore commands in `QUARANTINE.md`): `tmux`, `buck2` (daemon slice), `tailscale` (`safesocket`/`localapi`/`ipnauth`), `openssh-portable` (`mux.c`/`ssh.c`), and `rmcp` (v3.11.0).
+- **Saved all three intermediate Frumentarii reports + synthesis in `papers/`:**
+  - `papers/2026-11-23-frumentarii-daemon-failure-modes-and-patterns.md`
+  - `papers/2026-11-23-frumentarii-refimpl-daemon-audit.md`
+  - `papers/2026-11-23-frumentarii-mcp-and-sibling-audit.md`
+  - `papers/2026-11-23-frumentarii-daemon-synthesis.md`
+- **Key architectural conclusions ready for operator review before writing the Spec:**
+  1. Hash-pinned, auto-spawning, idle-exiting single-binary sidecar (`outpost` + `outpost __daemon`) paired with a stateless, non-blocking thin MCP stdio proxy (`outpost mcp`). Reject in-process leader promotion and mandatory `launchd`/`systemd` install; reject `SCM_RIGHTS` QUIC/TLS FD migration in favor of fast reconnect + `MP1`'s 30s/60s disconnect grace window.
+  2. Never-unlinked `flock(2)` `startup.lock` + kernel-held `daemon.lock`, double-checked `connect()`, atomic `umask(0177)` + temp `bind`/`listen` + `link(tmp, d.sock)` + `unlink(tmp)`, macOS `confstr(_CS_DARWIN_USER_TEMP_DIR)` (never `$TMPDIR`), integer `device_id` dir naming (`< 103 B`), binary `u32` LE internal IPC, compile-time `build_digest` auto-restart, dedicated OS watchdog thread + panic `_exit(1)`, and verified-PID escalation.
+  3. Own ~400-LOC MCP stdio JSON-RPC 2.0 (do NOT adopt `rmcp`), stealing `rmcp`'s 6 stdio transport invariants; primary messaging contract is cursor-based `party_poll` + bounded `party_wait` (25s default, 45s hard cap < Codex's 60s timeout) with strict untrusted-peer fencing and CLI-only secret/invite ingestion.
+
