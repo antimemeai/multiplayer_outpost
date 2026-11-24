@@ -2997,20 +2997,18 @@ async fn handle_poller_event(app: &mut ChatApp, ev: Option<PollerEvent>) {
         Some(PollerEvent::Batch(resp)) => {
             app.handle_poll_batch(resp, false).await;
         }
-        Some(PollerEvent::PartyDetached(pid)) => {
-            if app.active_party.as_ref().is_some_and(|p| p.party_id == pid) {
-                app.enter_lobby("Active party ended; returned to lobby.");
+        Some(PollerEvent::PartyDetached(pid))
+            if app.active_party.as_ref().is_some_and(|p| p.party_id == pid) =>
+        {
+            app.enter_lobby("Active party ended; returned to lobby.");
+        }
+        Some(PollerEvent::ConnectionState(is_up)) if app.connected != is_up => {
+            app.connected = is_up;
+            if app.tty {
+                app.render_header_and_squad();
             }
         }
-        Some(PollerEvent::ConnectionState(is_up)) => {
-            if app.connected != is_up {
-                app.connected = is_up;
-                if app.tty {
-                    app.render_header_and_squad();
-                }
-            }
-        }
-        None => {}
+        Some(PollerEvent::PartyDetached(_) | PollerEvent::ConnectionState(_)) | None => {}
     }
 }
 
