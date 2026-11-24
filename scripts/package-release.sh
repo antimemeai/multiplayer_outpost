@@ -102,6 +102,9 @@ chmod 0755 "$PKG_DIR/mp-outpost"
 if [ -f "$ROOT_DIR/README.md" ]; then
   cp "$ROOT_DIR/README.md" "$PKG_DIR/README.md"
 fi
+if [ -f "$ROOT_DIR/LICENSE" ]; then
+  cp "$ROOT_DIR/LICENSE" "$PKG_DIR/LICENSE"
+fi
 
 TARBALL_NAME="${PKG_STEM}.tar.gz"
 TARBALL_PATH="$OUT_DIR_ABS/$TARBALL_NAME"

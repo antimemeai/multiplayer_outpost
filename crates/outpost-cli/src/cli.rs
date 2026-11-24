@@ -43,10 +43,9 @@ use outpost_core::trust::{
 };
 use outpost_daemon::{
     ClientConfig, DAEMON_LOCK_NAME, DAEMON_LOG_NAME, DaemonClient, DaemonError, DrainMode,
-    FlockGuard, ForceStopOutcome, STARTUP_LOCK_NAME, atomic_write_in_dir,
-    atomic_write_in_dir_no_replace, fill_random, force_stop_daemon, open_dir_nofollow,
-    open_or_create_private_dir, read_file_in_dir, read_regular_file_bounded_nofollow,
-    resolve_runtime_dir,
+    FlockGuard, ForceStopOutcome, STARTUP_LOCK_NAME, atomic_write_in_dir_no_replace, fill_random,
+    force_stop_daemon, open_dir_nofollow, open_or_create_private_dir, read_file_in_dir,
+    read_regular_file_bounded_nofollow, resolve_runtime_dir,
 };
 use serde_json::{Value, json};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -221,7 +220,7 @@ fn contains_private_pem_header_local(haystack: &[u8]) -> bool {
     false
 }
 
-fn redact_unknown_arg(arg: &str) -> String {
+pub(crate) fn redact_unknown_arg(arg: &str) -> String {
     if let Some((flag, _val)) = arg.split_once('=') {
         let fl = flag.to_ascii_lowercase();
         if fl == "--passphrase"
@@ -395,7 +394,7 @@ pub async fn run_cli_command(args: &[String]) -> Result<(), String> {
         "relays" => cmd_relays(&opts, sub).await,
         "lan" => crate::lan::run_lan(&opts, sub).await,
         "upgrade" => crate::upgrade::run_upgrade(&opts, sub).await,
-        "mcp" => cmd_mcp(&opts, sub),
+        "mcp" => crate::mcp_setup::cmd_mcp(&opts, sub),
         "peer" | "peers" => cmd_peer(&opts, sub).await,
         "friend" => cmd_friend(&opts, sub).await,
         "party" => cmd_party(&opts, sub).await,
@@ -434,7 +433,7 @@ Advanced Commands:\n\
   board post|read\n\
   friend list|add|accept|deny|decline|remove|block <@handle>\n\
   lan status|scan|host|join\n\
-  mcp [setup [--client claude|codex|cursor|antigravity|all] [--write] [--config <path>] [--global]]\n\
+  mcp [setup [--client claude|codex|cursor|antigravity|hermes|gemini|opencode|zed|all] [--write] [--config <path>] [--global]]\n\
   daemon status|start|stop|restart|logs\n\
   account register|rename|recovery-key|export-mpkey|recover\n\
   device init|install-cwt|enroll|renew|revoke|link <create|join|approve>\n\
@@ -483,7 +482,11 @@ fn extract_global_opts(args: &[String]) -> Result<(GlobalOpts, Vec<String>), Str
     Ok((opts, rest))
 }
 
-fn next_val<'a>(args: &'a [String], idx: &mut usize, flag: &str) -> Result<&'a str, String> {
+pub(crate) fn next_val<'a>(
+    args: &'a [String],
+    idx: &mut usize,
+    flag: &str,
+) -> Result<&'a str, String> {
     let val = args
         .get(*idx + 1)
         .map(String::as_str)
@@ -751,7 +754,7 @@ fn read_passphrase_from_stdin() -> Result<Zeroizing<String>, String> {
     Ok(s)
 }
 
-fn print_json(val: &Value) {
+pub(crate) fn print_json(val: &Value) {
     if let Ok(s) = serde_json::to_string_pretty(val) {
         println!("{s}");
     }
@@ -860,7 +863,7 @@ fn check_no_colliding_device_record(
     Ok(())
 }
 
-fn shell_single_quote(s: &str) -> String {
+pub(crate) fn shell_single_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for ch in s.chars() {
@@ -874,7 +877,7 @@ fn shell_single_quote(s: &str) -> String {
     out
 }
 
-fn toml_basic_string(s: &str) -> String {
+pub(crate) fn toml_basic_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for ch in s.chars() {
@@ -6575,390 +6578,7 @@ async fn cmd_doctor(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// `mcp setup` Command (with opt-in `--write`)
-// ---------------------------------------------------------------------------
-
-const MAX_MCP_CONFIG_BYTES: usize = 1024 * 1024;
-
-fn resolve_home_dir() -> Result<PathBuf, String> {
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| "HOME environment variable is not set; pass --config <path>".to_string())
-}
-
-fn default_mcp_config_path(client: &str, global: bool) -> Result<PathBuf, String> {
-    match client {
-        "claude" => {
-            if global {
-                Ok(resolve_home_dir()?.join(".claude.json"))
-            } else {
-                Ok(PathBuf::from(".mcp.json"))
-            }
-        }
-        "cursor" => {
-            if global {
-                Ok(resolve_home_dir()?.join(".cursor").join("mcp.json"))
-            } else {
-                Ok(PathBuf::from(".cursor").join("mcp.json"))
-            }
-        }
-        "codex" => Ok(resolve_home_dir()?.join(".codex").join("config.toml")),
-        "antigravity" => Ok(resolve_home_dir()?
-            .join(".gemini")
-            .join("antigravity")
-            .join("mcp_config.json")),
-        other => Err(format!("cannot determine default config path for '{other}'")),
-    }
-}
-
-fn is_codex_multiplayer_section_header(line: &str) -> bool {
-    let trimmed = line.trim();
-    if !trimmed.starts_with('[') || trimmed.starts_with("[[") {
-        return false;
-    }
-    let Some(close_idx) = trimmed.find(']') else {
-        return false;
-    };
-    let after = trimmed.get(close_idx + 1..).unwrap_or("").trim();
-    if !after.is_empty() && !after.starts_with('#') {
-        return false;
-    }
-    let inner = trimmed.get(1..close_idx).unwrap_or("").trim();
-    inner == "mcp_servers.multiplayer"
-}
-
-fn is_toml_section_header(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed.starts_with('[') && trimmed.contains(']')
-}
-
-fn upsert_codex_mcp_toml(existing: &str, bin: &str) -> String {
-    let block = format!(
-        "[mcp_servers.multiplayer]\ncommand = {}\nargs = [\"mcp\"]",
-        toml_basic_string(bin)
-    );
-    let mut out_lines: Vec<String> = Vec::new();
-    let mut in_target = false;
-    let mut replaced = false;
-
-    for raw_line in existing.lines() {
-        if is_toml_section_header(raw_line) {
-            if is_codex_multiplayer_section_header(raw_line) {
-                in_target = true;
-                if !replaced {
-                    out_lines.push(block.clone());
-                    replaced = true;
-                }
-                continue;
-            }
-            in_target = false;
-        }
-        if !in_target {
-            out_lines.push(raw_line.to_string());
-        }
-    }
-
-    if !replaced {
-        if !out_lines.is_empty() && !out_lines.last().is_some_and(|l| l.trim().is_empty()) {
-            out_lines.push(String::new());
-        }
-        out_lines.push(block);
-    }
-
-    let mut rendered = out_lines.join("\n");
-    rendered.push('\n');
-    rendered
-}
-
-fn write_mcp_client_config(
-    client: &str,
-    bin: &str,
-    target_path: &Path,
-) -> Result<Option<PathBuf>, String> {
-    let file_name = target_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| format!("invalid config path '{}'", target_path.display()))?;
-    let parent = match target_path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    if !parent.exists() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            format!(
-                "failed creating config directory '{}': {e}",
-                parent.display()
-            )
-        })?;
-    }
-    let dir_fd = open_dir_nofollow(parent)
-        .map_err(|e| format!("failed opening config directory '{}': {e}", parent.display()))?;
-
-    let existing_bytes: Option<Vec<u8>> = if target_path.exists() {
-        Some(
-            read_regular_file_bounded_nofollow(target_path, MAX_MCP_CONFIG_BYTES)
-                .map_err(|e| format!("failed reading existing config '{}': {e}", target_path.display()))?,
-        )
-    } else {
-        None
-    };
-
-    let new_contents = if client == "codex" {
-        let existing_str = match existing_bytes.as_deref() {
-            Some(bytes) => core::str::from_utf8(bytes).map_err(|_| {
-                format!(
-                    "existing TOML config '{}' is not valid UTF-8",
-                    target_path.display()
-                )
-            })?,
-            None => "",
-        };
-        upsert_codex_mcp_toml(existing_str, bin)
-    } else {
-        let mut root_obj = match existing_bytes.as_deref() {
-            Some(bytes) => {
-                let text = core::str::from_utf8(bytes).map_err(|_| {
-                    format!(
-                        "existing JSON config '{}' is not valid UTF-8",
-                        target_path.display()
-                    )
-                })?;
-                if text.trim().is_empty() {
-                    serde_json::Map::new()
-                } else {
-                    let parsed: Value = serde_json::from_str(text).map_err(|e| {
-                        format!(
-                            "refusing to modify invalid JSON config '{}': {e}",
-                            target_path.display()
-                        )
-                    })?;
-                    match parsed {
-                        Value::Object(map) => map,
-                        _ => {
-                            return Err(format!(
-                                "refusing to modify '{}': top-level JSON value must be an object",
-                                target_path.display()
-                            ));
-                        }
-                    }
-                }
-            }
-            None => serde_json::Map::new(),
-        };
-
-        let servers_entry = root_obj
-            .entry("mcpServers".to_string())
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        let Value::Object(servers_map) = servers_entry else {
-            return Err(format!(
-                "refusing to modify '{}': existing 'mcpServers' field is not a JSON object",
-                target_path.display()
-            ));
-        };
-        servers_map.insert(
-            "multiplayer".to_string(),
-            json!({
-                "command": bin,
-                "args": ["mcp"],
-            }),
-        );
-
-        let mut pretty = serde_json::to_string_pretty(&Value::Object(root_obj))
-            .map_err(|e| format!("failed serializing JSON config: {e}"))?;
-        pretty.push('\n');
-        pretty
-    };
-
-    let backup_path = if let Some(ref prev_bytes) = existing_bytes {
-        let bak_name = format!("{file_name}.bak");
-        atomic_write_in_dir(dir_fd.as_raw_fd(), &bak_name, prev_bytes)
-            .map_err(|e| format!("failed writing backup '{bak_name}': {e}"))?;
-        Some(parent.join(bak_name))
-    } else {
-        None
-    };
-
-    atomic_write_in_dir(dir_fd.as_raw_fd(), file_name, new_contents.as_bytes())
-        .map_err(|e| format!("failed atomically writing config '{}': {e}", target_path.display()))?;
-
-    Ok(backup_path)
-}
-
-fn cmd_mcp(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
-    let Some(sub) = args.first().map(String::as_str) else {
-        return Err(
-            "usage: mp-outpost mcp setup [--client claude|codex|cursor|antigravity|all] [--write] [--config <path>] [--global]"
-                .to_string(),
-        );
-    };
-    if sub != "setup" {
-        return Err(format!(
-            "unknown mcp subcommand '{}'",
-            redact_unknown_arg(sub)
-        ));
-    }
-    let rest = args.get(1..).unwrap_or_default();
-    let mut client = "all".to_string();
-    let mut write_flag = false;
-    let mut config_override: Option<PathBuf> = None;
-    let mut global_flag = false;
-    let mut i = 0usize;
-    while i < rest.len() {
-        let a = rest.get(i).map(String::as_str).unwrap_or_default();
-        match a {
-            "--client" => client = next_val(rest, &mut i, "--client")?.to_ascii_lowercase(),
-            "--write" => {
-                write_flag = true;
-                i += 1;
-            }
-            "--config" => {
-                config_override = Some(PathBuf::from(next_val(rest, &mut i, "--config")?));
-            }
-            "--global" => {
-                global_flag = true;
-                i += 1;
-            }
-            other => {
-                return Err(format!(
-                    "unknown argument to `mcp setup`: {}",
-                    redact_unknown_arg(other)
-                ));
-            }
-        }
-    }
-    if !matches!(
-        client.as_str(),
-        "claude" | "codex" | "cursor" | "antigravity" | "all"
-    ) {
-        return Err(format!(
-            "invalid --client '{client}' (expected claude|codex|cursor|antigravity|all)"
-        ));
-    }
-    if !write_flag && (config_override.is_some() || global_flag) {
-        return Err("--config and --global require --write".to_string());
-    }
-
-    let bin = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_string))
-        .unwrap_or_else(|| "mp-outpost".to_string());
-
-    if write_flag {
-        if client == "all" {
-            return Err(
-                "--write requires an explicit --client (claude|codex|cursor|antigravity); refusing --client all"
-                    .to_string(),
-            );
-        }
-        let target_path = match config_override {
-            Some(p) => p,
-            None => default_mcp_config_path(&client, global_flag)?,
-        };
-        let backup_path = write_mcp_client_config(&client, &bin, &target_path)?;
-        if opts.json {
-            print_json(&json!({
-                "written": true,
-                "client": client,
-                "binary": bin,
-                "path": target_path.display().to_string(),
-                "backup_path": backup_path.as_ref().map(|p| p.display().to_string()),
-            }));
-        } else {
-            println!(
-                "Configured MCP server 'multiplayer' for {client} in '{}'.",
-                target_path.display()
-            );
-            if let Some(bak) = backup_path {
-                println!("Previous configuration backed up to '{}'.", bak.display());
-            }
-        }
-        return Ok(());
-    }
-
-    let stdio_json = json!({
-        "mcpServers": {
-            "multiplayer": {
-                "command": bin,
-                "args": ["mcp"]
-            }
-        }
-    });
-    let quoted_bin = shell_single_quote(&bin);
-    let claude_cmd = format!("claude mcp add multiplayer -- {quoted_bin} mcp");
-    let codex_cmd = format!("codex mcp add multiplayer -- {quoted_bin} mcp");
-    let codex_toml = format!(
-        "[mcp_servers.multiplayer]\ncommand = {}\nargs = [\"mcp\"]",
-        toml_basic_string(&bin)
-    );
-
-    if opts.json {
-        let mut configs = serde_json::Map::new();
-        if client == "all" || client == "claude" {
-            configs.insert(
-                "claude".to_string(),
-                json!({
-                    "command": claude_cmd,
-                    "mcp_json": stdio_json,
-                }),
-            );
-        }
-        if client == "all" || client == "codex" {
-            configs.insert(
-                "codex".to_string(),
-                json!({
-                    "command": codex_cmd,
-                    "config_toml": codex_toml,
-                }),
-            );
-        }
-        if client == "all" || client == "cursor" {
-            configs.insert(
-                "cursor".to_string(),
-                json!({
-                    "config_path": ".cursor/mcp.json",
-                    "mcp_json": stdio_json,
-                }),
-            );
-        }
-        if client == "all" || client == "antigravity" {
-            configs.insert(
-                "antigravity".to_string(),
-                json!({
-                    "mcp_json": stdio_json,
-                }),
-            );
-        }
-        print_json(&json!({
-            "binary": bin,
-            "client": client,
-            "configs": Value::Object(configs),
-        }));
-        return Ok(());
-    }
-
-    let pretty_json = serde_json::to_string_pretty(&stdio_json).unwrap_or_default();
-    if client == "all" || client == "claude" {
-        println!("=== Claude Code ===");
-        println!("Run:\n  {claude_cmd}\n");
-        println!("Or add to .mcp.json (or pass `--client claude --write`):\n{pretty_json}\n");
-    }
-    if client == "all" || client == "codex" {
-        println!("=== Codex CLI ===");
-        println!("Run:\n  {codex_cmd}\n");
-        println!("Or add to ~/.codex/config.toml (or pass `--client codex --write`):\n{codex_toml}\n");
-    }
-    if client == "all" || client == "cursor" {
-        println!("=== Cursor ===");
-        println!("Add to .cursor/mcp.json or ~/.cursor/mcp.json (or pass `--client cursor --write`):\n{pretty_json}\n");
-    }
-    if client == "all" || client == "antigravity" {
-        println!("=== Antigravity ===");
-        println!("Add to ~/.gemini/antigravity/mcp_config.json (or pass `--client antigravity --write`):\n{pretty_json}\n");
-    }
-    Ok(())
-}
+// `mcp setup` lives in `crate::mcp_setup`.
 
 // ---------------------------------------------------------------------------
 // Output Formatting Helpers
@@ -7319,8 +6939,8 @@ mod tests {
     #[test]
     fn codex_toml_upsert_is_idempotent_and_preserves_other_sections() {
         let initial = "[model]\nprovider = \"openai\"\n\n[mcp_servers.multiplayer]\ncommand = \"/old/bin\"\nargs = [\"mcp\"]\n\n[other]\nkey = \"val\"\n";
-        let once = upsert_codex_mcp_toml(initial, "/Users/o'brien/mp-outpost");
-        let twice = upsert_codex_mcp_toml(&once, "/Users/o'brien/mp-outpost");
+        let once = crate::mcp_setup::upsert_codex_mcp_toml(initial, "/Users/o'brien/mp-outpost");
+        let twice = crate::mcp_setup::upsert_codex_mcp_toml(&once, "/Users/o'brien/mp-outpost");
         assert_eq!(once, twice);
         assert!(once.contains("command = \"/Users/o'brien/mp-outpost\""));
         assert!(once.contains("[model]"));

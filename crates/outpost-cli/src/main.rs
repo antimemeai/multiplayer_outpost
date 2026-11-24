@@ -16,6 +16,7 @@ mod cli;
 mod ipc_payloads;
 mod lan;
 mod mcp_bridge;
+mod mcp_setup;
 mod mpkey;
 mod storage;
 mod upgrade;

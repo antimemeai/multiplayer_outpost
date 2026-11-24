@@ -5,13 +5,32 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+description = "Standalone E2EE sidecar CLI, daemon, and MCP server for multiplayer.tech"
+homepage = "https://multiplayer.tech"
+repository = "https://github.com/antimemeai/multiplayer_outpost"
 
 [[bin]]
 name = "mp-outpost"
 path = "src/main.rs"
 
 [features]
+packaged = []
 test-tls-overrides = ["outpost-daemon/test-tls-overrides"]
+
+[package.metadata.binstall]
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "https://github.com/antimemeai/multiplayer_outpost/releases/download/v{ version }/mp-outpost-v{ version }-darwin-arm64.tar.gz"
+bin-dir = "mp-outpost-v{ version }-darwin-arm64/{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "https://github.com/antimemeai/multiplayer_outpost/releases/download/v{ version }/mp-outpost-v{ version }-linux-x86_64.tar.gz"
+bin-dir = "mp-outpost-v{ version }-linux-x86_64/{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "https://github.com/antimemeai/multiplayer_outpost/releases/download/v{ version }/mp-outpost-v{ version }-linux-arm64.tar.gz"
+bin-dir = "mp-outpost-v{ version }-linux-arm64/{ bin }{ binary-ext }"
 
 [dependencies]
 aes-gcm.workspace = true

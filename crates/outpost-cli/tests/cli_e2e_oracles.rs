@@ -703,6 +703,212 @@ fn oracle_4_mcp_setup_and_recovery_key_argv_rejection() -> Result<(), String> {
     Ok(())
 }
 
+#[test]
+fn oracle_4b_multihost_mcp_setup_and_self_upgrade_guard() -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root_tmp = make_short_tempdir("mpo4b")?;
+    let state_dir = make_private_subdir(root_tmp.path(), "st")?;
+    let runtime_dir = make_private_subdir(root_tmp.path(), "rt")?;
+    let fake_home = make_private_subdir(root_tmp.path(), "home")?;
+    let home_str = fake_home.to_string_lossy().into_owned();
+    let home_env = [("HOME", home_str.as_str())];
+
+    // 1. `mcp setup --json` lists all 8 supported clients
+    let setup_all = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &["mcp", "setup", "--json"],
+        None,
+        &home_env,
+    )?;
+    if !setup_all.status_ok {
+        return Err(format!("mcp setup --json failed: {}", setup_all.stderr));
+    }
+    let j: Value =
+        serde_json::from_str(&setup_all.stdout).map_err(|e| format!("parse setup json: {e}"))?;
+    let configs = j
+        .get("configs")
+        .and_then(Value::as_object)
+        .ok_or("missing configs object")?;
+    for client in [
+        "claude",
+        "codex",
+        "cursor",
+        "antigravity",
+        "hermes",
+        "gemini",
+        "opencode",
+        "zed",
+    ] {
+        if !configs.contains_key(client) {
+            return Err(format!("missing client '{client}' in mcp setup --json"));
+        }
+    }
+
+    // 2. Hermes `--write` writes ~/.hermes/config.yaml with 0600 perms, .bak, timeout 90 & connect_timeout 15
+    let hermes_dir = fake_home.join(".hermes");
+    std::fs::create_dir_all(&hermes_dir).map_err(|e| format!("mkdir hermes: {e}"))?;
+    let hermes_cfg = hermes_dir.join("config.yaml");
+    std::fs::write(&hermes_cfg, "agent:\n  model: default\n")
+        .map_err(|e| format!("seed hermes: {e}"))?;
+    let wr_hermes = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &["--json", "mcp", "setup", "--client", "hermes", "--write"],
+        None,
+        &home_env,
+    )?;
+    if !wr_hermes.status_ok {
+        return Err(format!("hermes --write failed: {}", wr_hermes.stderr));
+    }
+    let hermes_text =
+        std::fs::read_to_string(&hermes_cfg).map_err(|e| format!("read hermes: {e}"))?;
+    if !hermes_text.contains("agent:\n  model: default")
+        || !hermes_text.contains("mcp_servers:")
+        || !hermes_text.contains("timeout: 90")
+        || !hermes_text.contains("connect_timeout: 15")
+    {
+        return Err(format!("unexpected hermes yaml: {hermes_text}"));
+    }
+    let hermes_mode = std::fs::metadata(&hermes_cfg)
+        .map_err(|e| format!("stat hermes: {e}"))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if hermes_mode != 0o600 {
+        return Err(format!("expected hermes config mode 0600, got {hermes_mode:o}"));
+    }
+    if !hermes_dir.join("config.yaml.bak").is_file() {
+        return Err("missing hermes config.yaml.bak".to_string());
+    }
+
+    // 3. Gemini, OpenCode, and Zed `--write` land in their exact default paths
+    for (client, rel_path, ptr) in [
+        ("gemini", ".gemini/settings.json", "/mcpServers/multiplayer/args/0"),
+        (
+            "opencode",
+            ".config/opencode/opencode.json",
+            "/mcp/multiplayer/type",
+        ),
+        (
+            "zed",
+            ".config/zed/settings.json",
+            "/context_servers/multiplayer/args/0",
+        ),
+    ] {
+        let wr = run_bin(
+            &state_dir,
+            &runtime_dir,
+            &["--json", "mcp", "setup", "--client", client, "--write"],
+            None,
+            &home_env,
+        )?;
+        if !wr.status_ok {
+            return Err(format!("{client} --write failed: {}", wr.stderr));
+        }
+        let target = fake_home.join(rel_path);
+        let parsed: Value = serde_json::from_str(
+            &std::fs::read_to_string(&target).map_err(|e| format!("read {client}: {e}"))?,
+        )
+        .map_err(|e| format!("parse {client} json: {e}"))?;
+        if parsed.pointer(ptr).is_none() {
+            return Err(format!("{client} config missing {ptr}: {parsed}"));
+        }
+    }
+
+    // 4. Antigravity `--write` on fresh dirs writes BOTH IDE and CLI config paths
+    let wr_ag = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &["--json", "mcp", "setup", "--client", "antigravity", "--write"],
+        None,
+        &home_env,
+    )?;
+    if !wr_ag.status_ok {
+        return Err(format!("antigravity --write failed: {}", wr_ag.stderr));
+    }
+    for ag_rel in [
+        ".gemini/antigravity/mcp_config.json",
+        ".gemini/config/mcp_config.json",
+    ] {
+        let ag_path = fake_home.join(ag_rel);
+        if !ag_path.is_file() {
+            return Err(format!("expected antigravity config at {}", ag_path.display()));
+        }
+    }
+
+    // 5. OUTPOST_NO_SELF_UPGRADE=1 refuses in-place `upgrade --yes` with package-manager guidance
+    let no_upg = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &["upgrade", "--yes"],
+        None,
+        &[("OUTPOST_NO_SELF_UPGRADE", "1")],
+    )?;
+    if no_upg.status_ok || !no_upg.stderr.contains("brew upgrade mp-outpost") {
+        return Err(format!(
+            "OUTPOST_NO_SELF_UPGRADE=1 MUST refuse upgrade --yes: ok={} stderr={}",
+            no_upg.status_ok, no_upg.stderr
+        ));
+    }
+
+    // 6. `OUTPOST_NO_SELF_UPGRADE=1 upgrade --check` STILL succeeds read-only against a file:// manifest
+    let rel_dir = make_private_subdir(root_tmp.path(), "rel")?;
+    let target_slug = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "darwin-arm64"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "linux-x86_64"
+    } else {
+        "linux-arm64"
+    };
+    let fake_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let asset_name = format!("mp-outpost-v9.9.9-{target_slug}.tar.gz");
+    std::fs::write(
+        rel_dir.join("SHA256SUMS.txt"),
+        format!("{fake_sha}  {asset_name}\n"),
+    )
+    .map_err(|e| format!("write sums: {e}"))?;
+    std::fs::write(
+        rel_dir.join("release-manifest.json"),
+        serde_json::json!({
+            "version": "v9.9.9",
+            "commit": "deadbeef1234",
+            "assets": [{
+                "target": target_slug,
+                "filename": asset_name,
+                "sha256": fake_sha,
+                "size_bytes": 1024
+            }]
+        })
+        .to_string(),
+    )
+    .map_err(|e| format!("write manifest: {e}"))?;
+    let base_url = format!("file://{}", rel_dir.display());
+    let chk = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &["--json", "upgrade", "--check", "--base-url", &base_url],
+        None,
+        &[("OUTPOST_NO_SELF_UPGRADE", "1")],
+    )?;
+    if !chk.status_ok {
+        return Err(format!(
+            "OUTPOST_NO_SELF_UPGRADE=1 upgrade --check MUST succeed read-only: {}",
+            chk.stderr
+        ));
+    }
+    let chk_json: Value =
+        serde_json::from_str(&chk.stdout).map_err(|e| format!("parse check json: {e}"))?;
+    if chk_json.get("self_upgrade_disabled").and_then(Value::as_bool) != Some(true)
+        || chk_json.get("update_available").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(format!("unexpected upgrade --check json: {chk_json}"));
+    }
+
+    Ok(())
+}
+
 // ===========================================================================
 // Oracle 7: LAN Party! CLI Mandates, 2-Binary Encrypted QUIC Chat, & Relays
 // ===========================================================================
