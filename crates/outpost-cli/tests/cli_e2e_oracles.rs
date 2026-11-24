@@ -1345,6 +1345,85 @@ fn oracle_3_default_binary_ignores_test_tls_overrides() -> Result<(), String> {
 }
 
 // ===========================================================================
+// Oracle 9: `mp-outpost chat --no-tty` lobby mode, /help, secret refusal, /quit
+// ===========================================================================
+
+#[test]
+fn oracle_9_chat_no_tty_lobby_help_secret_refusal_and_quit() -> Result<(), String> {
+    let root_tmp = make_short_tempdir("mpo9")?;
+    let state_dir = make_private_subdir(root_tmp.path(), "st")?;
+    let runtime_dir = make_private_subdir(root_tmp.path(), "rt")?;
+
+    let _dev = provision_device(&state_dir, &runtime_dir, 1009, 2009, [0x99u8; 32], "oracle9")?;
+
+    // Verify `chat` appears in Quick Start usage output.
+    let help_out = run_bin(&state_dir, &runtime_dir, &["--help"], None, &[])?;
+    if !help_out.status_ok || !help_out.stdout.contains("chat [@handle|CODE|url]") {
+        return Err(format!(
+            "expected `chat [@handle|CODE|url]` in --help, got: {}",
+            help_out.stdout
+        ));
+    }
+
+    let script = "\
+/help\n\
+/members\n\
+/leave\n\
+/mute\n\
+/bogus\n\
+my secret mprk1_SHOULD_NEVER_LEAK\n\
+/board leak mpcs1_SESSION_SHOULD_NOT_ECHO\n\
+/board -----BEGIN PRIVATE KEY-----\n\
+hello from lobby\n\
+/quit\n";
+
+    let res = run_bin(
+        &state_dir,
+        &runtime_dir,
+        &["chat", "--no-tty"],
+        Some(script.as_bytes()),
+        &[],
+    )?;
+
+    let _ = run_bin(&state_dir, &runtime_dir, &["daemon", "stop", "--force"], None, &[]);
+
+    if !res.status_ok {
+        return Err(format!(
+            "chat --no-tty exited non-zero: stdout={} stderr={}",
+            res.stdout, res.stderr
+        ));
+    }
+    for expected in [
+        "Lobby mode",
+        "/board <text>",
+        "Not in a party",
+        "Not currently in a party",
+        "notifications muted",
+        "Unknown command /bogus",
+        "refused to send",
+    ] {
+        if !res.stdout.contains(expected) {
+            return Err(format!(
+                "chat --no-tty stdout missing '{expected}':\n{}",
+                res.stdout
+            ));
+        }
+    }
+    for forbidden in [
+        "mprk1_SHOULD_NEVER_LEAK",
+        "mpcs1_SESSION_SHOULD_NOT_ECHO",
+        "BEGIN PRIVATE KEY",
+    ] {
+        if res.stdout.contains(forbidden) || res.stderr.contains(forbidden) {
+            return Err(format!(
+                "chat --no-tty leaked refused secret '{forbidden}'!"
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ===========================================================================
 // Oracle 2: Full 2-Outpost Live E2E Party over Local TLS 1.3 Mock MP1 Server
 //           + Real iroh v1.5.0 QUIC + MCP party_send / party_wait
 // ===========================================================================
@@ -4709,6 +4788,227 @@ async fn oracle_8_xbox_live_mp2_unpinned_chat_login_renew_and_strict_pins() -> R
     let _ = run_bin(&alice_st, &alice_rt, &["daemon", "stop", "--force"], None, &env_vars);
     let _ = run_bin(&bob_st, &bob_rt, &["daemon", "stop", "--force"], None, &env_vars);
     let _ = run_bin(&bob_st, &strict_rt, &["daemon", "stop", "--force"], None, &env_vars);
+    server_task.abort();
+    result
+}
+
+struct ChatProc {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    lines_rx: std::sync::mpsc::Receiver<String>,
+}
+
+impl ChatProc {
+    fn spawn(
+        state_dir: &Path,
+        runtime_dir: &Path,
+        extra_args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self, String> {
+        let mut cmd = Command::new(BIN_PATH);
+        cmd.arg("--state-dir")
+            .arg(state_dir)
+            .arg("--runtime-dir")
+            .arg(runtime_dir)
+            .arg("chat")
+            .arg("--no-tty")
+            .args(extra_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for &(k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().map_err(|e| format!("spawn chat failed: {e}"))?;
+        let stdin = child.stdin.take().ok_or("missing chat stdin")?;
+        let stdout = child.stdout.take().ok_or("missing chat stdout")?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let _ = tx.send(line.clone());
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            child,
+            stdin: Some(stdin),
+            lines_rx: rx,
+        })
+    }
+
+    fn send_line(&mut self, line: &str) -> Result<(), String> {
+        let stdin = self.stdin.as_mut().ok_or("chat stdin closed")?;
+        stdin
+            .write_all(line.as_bytes())
+            .map_err(|e| format!("chat stdin write: {e}"))?;
+        stdin
+            .write_all(b"\n")
+            .map_err(|e| format!("chat stdin nl: {e}"))?;
+        stdin.flush().map_err(|e| format!("chat stdin flush: {e}"))
+    }
+
+    fn wait_for_substring(&self, needle: &str, timeout: Duration) -> Result<Vec<String>, String> {
+        let deadline = Instant::now() + timeout;
+        let mut collected = Vec::new();
+        while Instant::now() < deadline {
+            let rem = deadline.saturating_duration_since(Instant::now());
+            match self
+                .lines_rx
+                .recv_timeout(rem.min(Duration::from_millis(100)))
+            {
+                Ok(line) => {
+                    let hit = line.contains(needle);
+                    collected.push(line);
+                    if hit {
+                        return Ok(collected);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Err(format!(
+            "timed out waiting for '{needle}' in chat stdout; saw:\n{}",
+            collected.join("")
+        ))
+    }
+
+    fn wait_exit(&mut self) -> Result<bool, String> {
+        drop(self.stdin.take());
+        let st = self
+            .child
+            .wait()
+            .map_err(|e| format!("wait chat exit: {e}"))?;
+        Ok(st.success())
+    }
+}
+
+impl Drop for ChatProc {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oracle_10_chat_second_window_live_mp2_bidirectional_and_board() -> Result<(), String> {
+    let root_tmp = make_short_tempdir("mpo10")?;
+    let alice_st = make_private_subdir(root_tmp.path(), "as")?;
+    let alice_rt = make_private_subdir(root_tmp.path(), "ar")?;
+    let bob_st = make_private_subdir(root_tmp.path(), "bs")?;
+    let bob_rt = make_private_subdir(root_tmp.path(), "br")?;
+
+    let (room_tx, _) = broadcast::channel::<String>(32);
+    let mock_state = Arc::new(Mutex::new(Mp2MockServerState {
+        accounts: HashMap::new(),
+        flows: HashMap::new(),
+        next_login_idx: 0,
+        renew_calls: 0,
+        room_seq: 0,
+        dedup: HashMap::new(),
+        room_members: Vec::new(),
+        pending_invite_for_bob: false,
+        room_tx,
+    }));
+    let (server_addr, cert_pem, server_task) = spawn_mock_mp2_server(Arc::clone(&mock_state)).await?;
+    let ca_path = root_tmp.path().join("mp2_chat_ca.pem");
+    std::fs::write(&ca_path, cert_pem).map_err(|e| format!("write ca: {e}"))?;
+    let addr_str = server_addr.to_string();
+    let ca_str = ca_path.to_string_lossy().into_owned();
+    let env_vars = [
+        ("OUTPOST_TEST_CONNECT_ADDR", addr_str.as_str()),
+        ("OUTPOST_TEST_CA_PEM", ca_str.as_str()),
+        ("OUTPOST_NO_BROWSER", "1"),
+    ];
+
+    let result = async {
+        // 1. Login Alice & Bob, Alice invites Bob to Squad (KAIH)
+        let a_login = run_bin(&alice_st, &alice_rt, &["login", "--no-open", "--poll-ms", "50"], None, &env_vars)?;
+        if !a_login.status_ok {
+            return Err(format!("alice login failed: {}", a_login.stderr));
+        }
+        let b_login = run_bin(&bob_st, &bob_rt, &["login", "--no-open", "--poll-ms", "50"], None, &env_vars)?;
+        if !b_login.status_ok {
+            return Err(format!("bob login failed: {}", b_login.stderr));
+        }
+        let _ = run_bin(&alice_st, &alice_rt, &["invite", "@bob", "--name", "Squad"], None, &env_vars)?;
+
+        // 2. Open Alice Window 2 (`mp-outpost chat --no-tty`) and Bob (`mp-outpost chat https://clank.party/KAIH --no-tty`)
+        let mut alice_chat = ChatProc::spawn(&alice_st, &alice_rt, &[], &env_vars)?;
+        let _ = alice_chat.wait_for_substring("Attached to Squad", Duration::from_secs(5))?;
+
+        let mut bob_chat = ChatProc::spawn(
+            &bob_st,
+            &bob_rt,
+            &["https://clank.party/KAIH"],
+            &env_vars,
+        )?;
+        let _ = bob_chat.wait_for_substring("Joined Squad", Duration::from_secs(5))?;
+
+        // Give both mp2 WS sessions a brief moment to complete hello
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // 3. Alice sends chat -> local echo on Alice AND live delivery on Bob!
+        alice_chat.send_line("yo from second window!")?;
+        let _ = alice_chat.wait_for_substring("you: yo from second window!", Duration::from_secs(4))?;
+        let _ = bob_chat.wait_for_substring("@alice: yo from second window!", Duration::from_secs(4))?;
+
+        // 4. Bob sends hostile ANSI/OSC/BiDi payload -> Alice receives sanitized clean text!
+        bob_chat.send_line("\x1b[31mred\x1b[0m \x1b]0;evil\x07 \u{202E}clean")?;
+        let alice_recv = alice_chat.wait_for_substring("@bob: red", Duration::from_secs(4))?;
+        let joined_alice = alice_recv.join("");
+        if joined_alice.contains('\x1b')
+            || joined_alice.contains('\x07')
+            || joined_alice.contains('\u{202E}')
+            || !joined_alice.contains("clean")
+        {
+            return Err(format!(
+                "ANSI/OSC/BiDi injection leaked into Alice chat stdout: {joined_alice:?}"
+            ));
+        }
+
+        // 5. Alice posts `/board` -> Bob receives `[board]` event live!
+        alice_chat.send_line("/board release v0.5.1 ready")?;
+        let _ = alice_chat.wait_for_substring("[board] you: release v0.5.1 ready", Duration::from_secs(4))?;
+        let _ = bob_chat.wait_for_substring("[board] @alice: release v0.5.1 ready", Duration::from_secs(4))?;
+
+        // 6. Bob secret refusal in active party!
+        bob_chat.send_line("secret mpguest1_DO_NOT_SEND")?;
+        let bob_refused = bob_chat.wait_for_substring("refused to send", Duration::from_secs(4))?;
+        if bob_refused.join("").contains("mpguest1_DO_NOT_SEND") {
+            return Err("secret leaked in refusal output".to_string());
+        }
+
+        // 7. In-chat `/members`, `/copy`, `/leave`, `/quit`
+        alice_chat.send_line("/members")?;
+        let _ = alice_chat.wait_for_substring("@alice", Duration::from_secs(4))?;
+        alice_chat.send_line("/copy")?;
+        let _ = alice_chat.wait_for_substring("KAIH", Duration::from_secs(4))?;
+        alice_chat.send_line("/leave")?;
+        let _ = alice_chat.wait_for_substring("Left party", Duration::from_secs(4))?;
+
+        alice_chat.send_line("/quit")?;
+        bob_chat.send_line("/quit")?;
+        if !alice_chat.wait_exit()? {
+            return Err("alice_chat exited non-zero".to_string());
+        }
+        if !bob_chat.wait_exit()? {
+            return Err("bob_chat exited non-zero".to_string());
+        }
+        Ok(())
+    }
+    .await;
+
+    let _ = run_bin(&alice_st, &alice_rt, &["daemon", "stop", "--force"], None, &env_vars);
+    let _ = run_bin(&bob_st, &bob_rt, &["daemon", "stop", "--force"], None, &env_vars);
     server_task.abort();
     result
 }

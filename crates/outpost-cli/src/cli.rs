@@ -54,11 +54,12 @@ use crate::build_info::{
     PKG_VERSION, build_digest, build_order, encode_hex, on_disk_exe_matches_local,
 };
 use crate::ipc_payloads::{
-    IpcPartyEventKind, PartyControlNoticeReq, PartyCreateReq, PartyEpochOpReq, PartyInviteMintReq,
-    PartyInviteRevokeReq, PartyJoinReq, PartyKickReq, PartyPollIpcReq, PartyPostBoardReq,
-    PartyPromoteReq, PartyRequestApproveReq, PartyRequestRejectReq, PartyRequestsListReq,
-    PartySendChatReq, PartyWaitIpcReq, RoomEnterIpcReq, RoomInviteIpcReq, RoomLeaveIpcReq,
-    decode_bool_resp, decode_friend_edge_resp, decode_friends_list_resp, decode_friends_live_resp,
+    FriendEdgeResp, FriendsLiveIpcResp, IpcPartyEventKind, PartyControlNoticeReq, PartyCreateReq,
+    PartyEpochOpReq, PartyInviteMintReq, PartyInviteRevokeReq, PartyJoinReq, PartyKickReq,
+    PartyListResp, PartyMembersResp, PartyPollIpcReq, PartyPostBoardReq, PartyPromoteReq,
+    PartyRequestApproveReq, PartyRequestRejectReq, PartyRequestsListReq, PartySendChatReq,
+    PartyWaitIpcReq, RoomEnterIpcReq, RoomEnterIpcResp, RoomInviteIpcReq, RoomInviteIpcResp,
+    RoomLeaveIpcReq, RoomLeaveIpcResp, StatusResp, decode_bool_resp, decode_friend_edge_resp, decode_friends_list_resp, decode_friends_live_resp,
     decode_party_create_resp, decode_party_epoch_resp, decode_party_invite_mint_resp,
     decode_party_join_resp, decode_party_list_resp, decode_party_members_resp,
     decode_party_poll_resp, decode_party_request_approve_resp, decode_party_requests_list_resp,
@@ -173,7 +174,7 @@ pub fn reject_secrets_in_argv(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn contains_private_pem_header_local(haystack: &[u8]) -> bool {
+pub(crate) fn contains_private_pem_header_local(haystack: &[u8]) -> bool {
     const PREFIX: &[u8] = b"-----BEGIN ";
     const SUFFIXES: [&[u8]; 3] = [
         b"PRIVATE KEY-----",
@@ -381,6 +382,7 @@ pub async fn run_cli_command(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "login" => cmd_login(&opts, sub).await,
+        "chat" => crate::chat::cmd_chat(&opts, sub).await,
         "invite" => cmd_invite(&opts, sub).await,
         "join" => cmd_join(&opts, sub).await,
         "leave" => cmd_leave(&opts, sub).await,
@@ -414,6 +416,7 @@ Usage:\n\
   mp-outpost [GLOBAL FLAGS] <command> ...\n\n\
 Quick Start:\n\
   login [--no-open]                       Sign in via browser\n\
+  chat [@handle|CODE|url]                 Open live second-window party chat\n\
   invite [@handle] [--name <name>]        Invite a friend or get a share link & 4-char code\n\
   join [@handle|CODE|url]                 Join a party (bare `join` accepts latest invite; supports multiplayer.tech, mp.gg, clank.party)\n\
   leave                                   Leave the current party\n\
@@ -495,7 +498,7 @@ pub(crate) fn next_val<'a>(
     Ok(val)
 }
 
-fn parse_safe_id(raw: &str, name: &str) -> Result<u64, String> {
+pub(crate) fn parse_safe_id(raw: &str, name: &str) -> Result<u64, String> {
     let id = raw
         .parse::<u64>()
         .map_err(|_| format!("invalid integer for {name}: '{raw}'"))?;
@@ -766,7 +769,7 @@ fn random_bytes_32_zeroizing() -> Result<Zeroizing<[u8; 32]>, String> {
     Ok(b)
 }
 
-fn random_safe_id() -> Result<u64, String> {
+pub(crate) fn random_safe_id() -> Result<u64, String> {
     let mut b = [0u8; 8];
     fill_random(&mut b).map_err(|e| format!("CSPRNG failure: {e}"))?;
     Ok((u64::from_le_bytes(b) % MAX_SAFE_ID).saturating_add(1))
@@ -989,7 +992,7 @@ fn write_root_key_file(path: &Path, secret: &[u8; 32]) -> Result<(), String> {
 // Daemon Client Helpers
 // ---------------------------------------------------------------------------
 
-async fn connect_daemon_cli(
+pub(crate) async fn connect_daemon_cli(
     opts: &GlobalOpts,
     read_only_cli: bool,
     auto_spawn: bool,
@@ -1285,6 +1288,99 @@ async fn cmd_login(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     }
 }
 
+pub(crate) async fn rpc_get_status(client: &mut DaemonClient) -> Result<StatusResp, String> {
+    let raw = client
+        .request(IpcOpcode::GetStatus, Vec::new())
+        .await
+        .map_err(|e| e.to_string())?;
+    decode_status_resp(&raw).map_err(|e| e.to_string())
+}
+
+pub(crate) async fn rpc_party_list(client: &mut DaemonClient) -> Result<PartyListResp, String> {
+    let raw = client
+        .request(IpcOpcode::PartyList, Vec::new())
+        .await
+        .map_err(|e| e.to_string())?;
+    decode_party_list_resp(&raw).map_err(|e| e.to_string())
+}
+
+pub(crate) async fn rpc_party_members(
+    client: &mut DaemonClient,
+    party_id: u64,
+) -> Result<PartyMembersResp, String> {
+    let raw = client
+        .request(IpcOpcode::PartyMembers, encode_u64_req(party_id))
+        .await
+        .map_err(|e| e.to_string())?;
+    decode_party_members_resp(&raw).map_err(|e| e.to_string())
+}
+
+pub(crate) async fn rpc_room_invite(
+    client: &mut DaemonClient,
+    req: RoomInviteIpcReq,
+) -> Result<RoomInviteIpcResp, String> {
+    let raw = client
+        .request(
+            IpcOpcode::RoomInvite,
+            encode_room_invite_req(&req).map_err(|e| e.to_string())?,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    decode_room_invite_resp(&raw).map_err(|e| e.to_string())
+}
+
+pub(crate) async fn rpc_room_enter(
+    client: &mut DaemonClient,
+    req: RoomEnterIpcReq,
+) -> Result<RoomEnterIpcResp, String> {
+    let raw = client
+        .request(
+            IpcOpcode::RoomEnter,
+            encode_room_enter_req(&req).map_err(|e| e.to_string())?,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    decode_room_enter_resp(&raw).map_err(|e| e.to_string())
+}
+
+pub(crate) async fn rpc_room_leave(
+    client: &mut DaemonClient,
+    party_id: Option<u64>,
+) -> Result<RoomLeaveIpcResp, String> {
+    let raw = client
+        .request(
+            IpcOpcode::RoomLeave,
+            encode_room_leave_req(&RoomLeaveIpcReq { party_id }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    decode_room_leave_resp(&raw).map_err(|e| e.to_string())
+}
+
+pub(crate) async fn rpc_friends_live(
+    client: &mut DaemonClient,
+) -> Result<FriendsLiveIpcResp, String> {
+    let raw = client
+        .request(IpcOpcode::FriendsLive, Vec::new())
+        .await
+        .map_err(|e| e.to_string())?;
+    decode_friends_live_resp(&raw).map_err(|e| e.to_string())
+}
+
+pub(crate) async fn rpc_add_friend(
+    client: &mut DaemonClient,
+    target_str: &str,
+) -> Result<(String, FriendEdgeResp), String> {
+    let clean_display = sanitize_cli_meta(target_str.trim().trim_start_matches('@'));
+    let target_id = resolve_account_target(client, target_str).await?;
+    let raw = client
+        .request(IpcOpcode::FriendRequest, encode_u64_req(target_id))
+        .await
+        .map_err(|e| e.to_string())?;
+    let resp = decode_friend_edge_resp(&raw).map_err(|e| e.to_string())?;
+    Ok((clean_display, resp))
+}
+
 async fn cmd_invite(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     let mut handle: Option<String> = None;
     let mut name: Option<String> = None;
@@ -1309,19 +1405,15 @@ async fn cmd_invite(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     }
 
     let (mut client, _) = connect_daemon_cli(opts, false, true).await?;
-    let raw = client
-        .request(
-            IpcOpcode::RoomInvite,
-            encode_room_invite_req(&RoomInviteIpcReq {
-                handle,
-                party_id: None,
-                name,
-            })
-            .map_err(|e| e.to_string())?,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    let resp = decode_room_invite_resp(&raw).map_err(|e| e.to_string())?;
+    let resp = rpc_room_invite(
+        &mut client,
+        RoomInviteIpcReq {
+            handle,
+            party_id: None,
+            name,
+        },
+    )
+    .await?;
 
     if opts.json {
         print_json(&json!({
@@ -1355,7 +1447,7 @@ async fn cmd_invite(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn format_member_display(account_id: u64, raw_handle: &str) -> String {
+pub(crate) fn format_member_display(account_id: u64, raw_handle: &str) -> String {
     let trimmed = raw_handle.trim();
     let is_guest = account_id == 0 || trimmed.ends_with(" (guest)");
     let clean = sanitize_cli_meta(
@@ -1402,15 +1494,7 @@ async fn cmd_join(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     }
 
     let (mut client, _) = connect_daemon_cli(opts, false, true).await?;
-    let raw = client
-        .request(
-            IpcOpcode::RoomEnter,
-            encode_room_enter_req(&RoomEnterIpcReq { target, agent_name })
-                .map_err(|e| e.to_string())?,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    let resp = decode_room_enter_resp(&raw).map_err(|e| e.to_string())?;
+    let resp = rpc_room_enter(&mut client, RoomEnterIpcReq { target, agent_name }).await?;
 
     if opts.json {
         let members: Vec<Value> = resp
@@ -1475,14 +1559,7 @@ async fn cmd_leave(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
         }
     };
     let (mut client, _) = connect_daemon_cli(opts, false, true).await?;
-    let raw = client
-        .request(
-            IpcOpcode::RoomLeave,
-            encode_room_leave_req(&RoomLeaveIpcReq { party_id }),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-    let resp = decode_room_leave_resp(&raw).map_err(|e| e.to_string())?;
+    let resp = rpc_room_leave(&mut client, party_id).await?;
     if opts.json {
         print_json(&json!({
             "left": resp.left,
@@ -1502,11 +1579,7 @@ async fn cmd_friends_live(opts: &GlobalOpts, args: &[String]) -> Result<(), Stri
         ));
     }
     let (mut client, _) = connect_daemon_cli(opts, false, true).await?;
-    let raw = client
-        .request(IpcOpcode::FriendsLive, Vec::new())
-        .await
-        .map_err(|e| e.to_string())?;
-    let resp = decode_friends_live_resp(&raw).map_err(|e| e.to_string())?;
+    let resp = rpc_friends_live(&mut client).await?;
 
     if opts.json {
         let friends: Vec<Value> = resp
@@ -1600,13 +1673,7 @@ async fn cmd_add_friend(opts: &GlobalOpts, args: &[String]) -> Result<(), String
         .map(String::as_str)
         .ok_or_else(|| "usage: mp-outpost add @handle".to_string())?;
     let (mut client, _) = connect_daemon_cli(opts, false, true).await?;
-    let clean_display = sanitize_cli_meta(target_str.trim().trim_start_matches('@'));
-    let target_id = resolve_account_target(&mut client, target_str).await?;
-    let raw = client
-        .request(IpcOpcode::FriendRequest, encode_u64_req(target_id))
-        .await
-        .map_err(|e| e.to_string())?;
-    let resp = decode_friend_edge_resp(&raw).map_err(|e| e.to_string())?;
+    let (clean_display, resp) = rpc_add_friend(&mut client, target_str).await?;
     let state_label = friend_state_label(resp.state);
     if opts.json {
         print_json(&json!({
@@ -4208,7 +4275,10 @@ fn friend_state_sort_key(state: u8) -> u8 {
     }
 }
 
-async fn resolve_account_target(client: &mut DaemonClient, raw: &str) -> Result<u64, String> {
+pub(crate) async fn resolve_account_target(
+    client: &mut DaemonClient,
+    raw: &str,
+) -> Result<u64, String> {
     if let Ok(id) = parse_safe_id(raw, "account_id") {
         return Ok(id);
     }

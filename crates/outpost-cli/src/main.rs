@@ -12,6 +12,7 @@
 
 mod app_daemon;
 mod build_info;
+mod chat;
 mod cli;
 mod ipc_payloads;
 mod lan;
