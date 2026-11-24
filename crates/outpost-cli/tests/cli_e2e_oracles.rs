@@ -1365,8 +1365,9 @@ fn oracle_9_chat_no_tty_lobby_help_secret_refusal_and_quit() -> Result<(), Strin
         ));
     }
 
-    let script = "\
-/help\n\
+    let oversized = format!("{}\n", "a".repeat(5000));
+    let mut script = String::from(
+        "/help\n\
 /members\n\
 /leave\n\
 /mute\n\
@@ -1374,8 +1375,10 @@ fn oracle_9_chat_no_tty_lobby_help_secret_refusal_and_quit() -> Result<(), Strin
 my secret mprk1_SHOULD_NEVER_LEAK\n\
 /board leak mpcs1_SESSION_SHOULD_NOT_ECHO\n\
 /board -----BEGIN PRIVATE KEY-----\n\
-hello from lobby\n\
-/quit\n";
+hello from lobby\n",
+    );
+    script.push_str(&oversized);
+    script.push_str("/quit\n");
 
     let res = run_bin(
         &state_dir,
@@ -1385,9 +1388,8 @@ hello from lobby\n\
         &[],
     )?;
 
-    let _ = run_bin(&state_dir, &runtime_dir, &["daemon", "stop", "--force"], None, &[]);
-
     if !res.status_ok {
+        let _ = run_bin(&state_dir, &runtime_dir, &["daemon", "stop", "--force"], None, &[]);
         return Err(format!(
             "chat --no-tty exited non-zero: stdout={} stderr={}",
             res.stdout, res.stderr
@@ -1401,8 +1403,10 @@ hello from lobby\n\
         "notifications muted",
         "Unknown command /bogus",
         "refused to send",
+        "exceeded max",
     ] {
         if !res.stdout.contains(expected) {
+            let _ = run_bin(&state_dir, &runtime_dir, &["daemon", "stop", "--force"], None, &[]);
             return Err(format!(
                 "chat --no-tty stdout missing '{expected}':\n{}",
                 res.stdout
@@ -1415,12 +1419,61 @@ hello from lobby\n\
         "BEGIN PRIVATE KEY",
     ] {
         if res.stdout.contains(forbidden) || res.stderr.contains(forbidden) {
+            let _ = run_bin(&state_dir, &runtime_dir, &["daemon", "stop", "--force"], None, &[]);
             return Err(format!(
                 "chat --no-tty leaked refused secret '{forbidden}'!"
             ));
         }
     }
-    Ok(())
+
+    // Regression test: `/quit` MUST exit promptly EVEN WHILE the parent keeps stdin pipe OPEN!
+    let mut open_cmd = Command::new(BIN_PATH);
+    open_cmd
+        .arg("--state-dir")
+        .arg(&state_dir)
+        .arg("--runtime-dir")
+        .arg(&runtime_dir)
+        .arg("chat")
+        .arg("--no-tty")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = open_cmd
+        .spawn()
+        .map_err(|e| format!("spawn open-stdin chat failed: {e}"))?;
+    let mut held_stdin = child.stdin.take().ok_or("missing chat stdin")?;
+    held_stdin
+        .write_all(b"/quit\n")
+        .map_err(|e| format!("write /quit failed: {e}"))?;
+    held_stdin
+        .flush()
+        .map_err(|e| format!("flush /quit failed: {e}"))?;
+
+    let exit_deadline = Instant::now() + Duration::from_secs(3);
+    let mut exited_status = None;
+    while Instant::now() < exit_deadline {
+        if let Some(st) = child
+            .try_wait()
+            .map_err(|e| format!("try_wait failed: {e}"))?
+        {
+            exited_status = Some(st);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // Keep `held_stdin` alive until AFTER we observed child exit!
+    drop(held_stdin);
+    let _ = run_bin(&state_dir, &runtime_dir, &["daemon", "stop", "--force"], None, &[]);
+
+    match exited_status {
+        Some(st) if st.success() => Ok(()),
+        Some(st) => Err(format!("open-stdin /quit exited with non-zero status: {st}")),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err("mp-outpost chat --no-tty hung on /quit while stdin pipe stayed open!".to_string())
+        }
+    }
 }
 
 // ===========================================================================

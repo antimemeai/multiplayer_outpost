@@ -31,7 +31,6 @@ use outpost_core::ipc_wire::IpcOpcode;
 use outpost_core::party_state::DEFAULT_POLL_MAX_BYTES;
 use outpost_daemon::DaemonClient;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt as _, BufReader as TokioBufReader};
 use tokio::sync::{mpsc, watch};
 use zeroize::Zeroizing;
 
@@ -757,7 +756,7 @@ fn truncate_to_cols(s: &str, max_cols: usize) -> String {
 }
 
 fn wrap_to_cols(s: &str, max_cols: usize) -> Vec<String> {
-    let width = max_cols.max(8);
+    let width = max_cols.max(1);
     let mut lines = Vec::new();
     for raw_line in s.split('\n') {
         if raw_line.is_empty() {
@@ -783,6 +782,95 @@ fn wrap_to_cols(s: &str, max_cols: usize) -> Vec<String> {
     lines
 }
 
+/// Validates a shareable URL before displaying or emitting in an OSC 52 clipboard escape.
+/// Requires `https://`, non-empty host/path, no whitespace, strict printable ASCII, and `<= 256` bytes.
+pub fn validate_share_url(raw: &str) -> Option<String> {
+    let cleaned = sanitize_terminal_inline(raw);
+    if !cleaned.starts_with("https://")
+        || cleaned.len() <= "https://".len()
+        || cleaned.len() > 256
+        || cleaned.chars().any(char::is_whitespace)
+        || !cleaned.bytes().all(|b| (0x21..=0x7E).contains(&b))
+    {
+        return None;
+    }
+    Some(cleaned)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalLayout {
+    cols: usize,
+    rows: u16,
+    header_row: Option<u16>,
+    squad_row: Option<u16>,
+    transcript_bounds: Option<(u16, u16)>,
+    divider_row: Option<u16>,
+    composer_row: u16,
+}
+
+impl TerminalLayout {
+    fn compute(cols: u16, rows: u16) -> Self {
+        let cols = usize::from(cols.max(1));
+        let rows = rows.max(1);
+        match rows {
+            1 => Self {
+                cols,
+                rows,
+                header_row: None,
+                squad_row: None,
+                transcript_bounds: None,
+                divider_row: None,
+                composer_row: 1,
+            },
+            2 => Self {
+                cols,
+                rows,
+                header_row: Some(1),
+                squad_row: None,
+                transcript_bounds: None,
+                divider_row: None,
+                composer_row: 2,
+            },
+            3 => Self {
+                cols,
+                rows,
+                header_row: Some(1),
+                squad_row: None,
+                transcript_bounds: Some((2, 2)),
+                divider_row: None,
+                composer_row: 3,
+            },
+            4 => Self {
+                cols,
+                rows,
+                header_row: Some(1),
+                squad_row: None,
+                transcript_bounds: Some((2, 2)),
+                divider_row: Some(3),
+                composer_row: 4,
+            },
+            5 => Self {
+                cols,
+                rows,
+                header_row: Some(1),
+                squad_row: Some(2),
+                transcript_bounds: Some((3, 3)),
+                divider_row: Some(4),
+                composer_row: 5,
+            },
+            _ => Self {
+                cols,
+                rows,
+                header_row: Some(1),
+                squad_row: Some(2),
+                transcript_bounds: Some((3, rows.saturating_sub(2))),
+                divider_row: Some(rows.saturating_sub(1)),
+                composer_row: rows,
+            },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Local Echo + Sequence Deduplication & Cursor Tracking
 // ---------------------------------------------------------------------------
@@ -795,6 +883,7 @@ pub enum EchoKind {
 
 #[derive(Debug, Clone)]
 struct PendingEcho {
+    id: u64,
     kind: EchoKind,
     body: String,
     sent_at: Instant,
@@ -805,6 +894,7 @@ pub struct MessageDedupState {
     party_id: Option<u64>,
     daemon_epoch: u64,
     next_seq: u64,
+    next_echo_id: u64,
     seen_seqs: HashSet<u64>,
     seen_order: VecDeque<u64>,
     pending_echoes: VecDeque<PendingEcho>,
@@ -824,16 +914,27 @@ impl MessageDedupState {
         self.pending_echoes.clear();
     }
 
-    pub fn record_local_echo(&mut self, kind: EchoKind, body: String, now: Instant) {
+    pub fn record_local_echo(&mut self, kind: EchoKind, body: String, now: Instant) -> u64 {
         self.prune_echoes(now);
         while self.pending_echoes.len() >= MAX_LOCAL_ECHOES {
             let _ = self.pending_echoes.pop_front();
         }
+        self.next_echo_id = self.next_echo_id.saturating_add(1);
+        let id = self.next_echo_id;
         self.pending_echoes.push_back(PendingEcho {
+            id,
             kind,
             body,
             sent_at: now,
         });
+        id
+    }
+
+    /// Rolls back a previously recorded local echo (e.g. when outbound send fails).
+    pub fn cancel_local_echo(&mut self, id: u64) {
+        if let Some(pos) = self.pending_echoes.iter().position(|e| e.id == id) {
+            let _ = self.pending_echoes.remove(pos);
+        }
     }
 
     fn prune_echoes(&mut self, now: Instant) {
@@ -1256,6 +1357,108 @@ fn parse_escape_key(fd: RawFd) -> Option<KeyEvent> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StdinLineEvent {
+    Line(String),
+    TooLong,
+    Eof,
+}
+
+/// Non-TTY poll-driven bounded line reader thread that exits promptly on `stop` even if the
+/// parent keeps stdin open, and caps buffered line memory at `MAX_INPUT_BYTES`.
+fn spawn_non_tty_line_reader(
+    stop: Arc<AtomicBool>,
+) -> (
+    mpsc::UnboundedReceiver<StdinLineEvent>,
+    std::thread::JoinHandle<()>,
+) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = std::thread::spawn(move || {
+        let fd = libc::STDIN_FILENO;
+        let mut line_buf: Vec<u8> = Vec::with_capacity(256);
+        let mut discarding = false;
+        let mut chunk = [0u8; 512];
+
+        while !stop.load(Ordering::Acquire) {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, 100) };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                let _ = tx.send(StdinLineEvent::Eof);
+                return;
+            }
+            if rc == 0 {
+                continue;
+            }
+
+            let n = unsafe {
+                libc::read(
+                    fd,
+                    chunk.as_mut_ptr().cast::<libc::c_void>(),
+                    chunk.len(),
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                let _ = tx.send(StdinLineEvent::Eof);
+                return;
+            }
+            if n == 0 {
+                if discarding {
+                    let _ = tx.send(StdinLineEvent::TooLong);
+                } else if !line_buf.is_empty() {
+                    if line_buf.last() == Some(&b'\r') {
+                        let _ = line_buf.pop();
+                    }
+                    let text = String::from_utf8_lossy(&line_buf).into_owned();
+                    let _ = tx.send(StdinLineEvent::Line(text));
+                }
+                let _ = tx.send(StdinLineEvent::Eof);
+                return;
+            }
+
+            let read_len = usize::try_from(n).unwrap_or(0).min(chunk.len());
+            for &b in chunk.get(..read_len).unwrap_or_default() {
+                if b == b'\n' {
+                    if discarding {
+                        discarding = false;
+                        if tx.send(StdinLineEvent::TooLong).is_err() {
+                            return;
+                        }
+                    } else {
+                        if line_buf.last() == Some(&b'\r') {
+                            let _ = line_buf.pop();
+                        }
+                        let text = String::from_utf8_lossy(&line_buf).into_owned();
+                        line_buf.clear();
+                        if tx.send(StdinLineEvent::Line(text)).is_err() {
+                            return;
+                        }
+                    }
+                } else if !discarding {
+                    if line_buf.len() >= MAX_INPUT_BYTES {
+                        line_buf.clear();
+                        discarding = true;
+                    } else {
+                        line_buf.push(b);
+                    }
+                }
+            }
+        }
+    });
+    (rx, handle)
+}
+
 // ---------------------------------------------------------------------------
 // Background Daemon Poller (`PartyWait` with 2s timeout)
 // ---------------------------------------------------------------------------
@@ -1527,13 +1730,6 @@ impl ChatApp {
         self.push_line(format!("[{ts}] [error] {safe}"), LineStyle::Error);
     }
 
-    fn scroll_region_bounds(&self) -> Option<(u16, u16)> {
-        if self.rows < 6 {
-            return None;
-        }
-        Some((3, self.rows.saturating_sub(2)))
-    }
-
     fn format_header_bar(&self) -> String {
         let conn = if self.connected { "connected" } else { "reconnecting" };
         match &self.active_party {
@@ -1614,30 +1810,37 @@ impl ChatApp {
         }
     }
 
+    fn layout(&self) -> TerminalLayout {
+        TerminalLayout::compute(self.cols, self.rows)
+    }
+
     fn render_full_screen(&self) {
         if !self.tty {
             return;
         }
-        let cols = usize::from(self.cols.max(20));
+        let layout = self.layout();
         let mut out = io::stdout();
         let _ = write!(out, "\x1b[?25l\x1b[0m\x1b[r\x1b[2J\x1b[H");
 
-        // Row 1: Header bar
-        let header = truncate_to_cols(&self.format_header_bar(), cols);
-        let _ = write!(out, "\x1b[1;1H\x1b[1;7m{header}\x1b[K\x1b[0m");
+        if let Some(row) = layout.header_row {
+            let header = truncate_to_cols(&self.format_header_bar(), layout.cols);
+            let _ = write!(out, "\x1b[{row};1H\x1b[1;7m{header}\x1b[K\x1b[0m");
+        }
 
-        // Row 2: Squad strip
-        let squad = truncate_to_cols(&self.format_squad_strip(), cols);
-        let _ = write!(out, "\x1b[2;1H\x1b[2m{squad}\x1b[K\x1b[0m");
+        if let Some(row) = layout.squad_row {
+            let squad = truncate_to_cols(&self.format_squad_strip(), layout.cols);
+            let _ = write!(out, "\x1b[{row};1H\x1b[2m{squad}\x1b[K\x1b[0m");
+        }
 
-        // Rows 3..=rows-2: Scroll region + visible tail of transcript
-        if let Some((top, bottom)) = self.scroll_region_bounds() {
-            let _ = write!(out, "\x1b[{top};{bottom}r");
+        if let Some((top, bottom)) = layout.transcript_bounds {
+            if bottom > top {
+                let _ = write!(out, "\x1b[{top};{bottom}r");
+            }
             let viewport_rows = usize::from(bottom.saturating_sub(top).saturating_add(1));
 
             let mut wrapped: Vec<(String, LineStyle)> = Vec::new();
             for entry in &self.transcript {
-                for l in wrap_to_cols(&entry.text, cols) {
+                for l in wrap_to_cols(&entry.text, layout.cols) {
                     wrapped.push((l, entry.style));
                 }
             }
@@ -1652,13 +1855,12 @@ impl ChatApp {
             }
         }
 
-        // Row rows-1: Divider
-        let div_row = self.rows.saturating_sub(1).max(1);
-        let divider = truncate_to_cols(&self.format_divider(), cols);
-        let _ = write!(out, "\x1b[{div_row};1H\x1b[2m{divider}\x1b[K\x1b[0m");
+        if let Some(div_row) = layout.divider_row {
+            let divider = truncate_to_cols(&self.format_divider(), layout.cols);
+            let _ = write!(out, "\x1b[{div_row};1H\x1b[2m{divider}\x1b[K\x1b[0m");
+        }
 
-        // Row rows: Composer
-        self.write_composer_to(&mut out);
+        self.write_composer_to(&mut out, layout);
         let _ = write!(out, "\x1b[?25h");
         let _ = out.flush();
     }
@@ -1667,14 +1869,18 @@ impl ChatApp {
         if !self.tty {
             return;
         }
-        let cols = usize::from(self.cols.max(20));
+        let layout = self.layout();
         let mut out = io::stdout();
         let _ = write!(out, "\x1b[?25l");
-        let header = truncate_to_cols(&self.format_header_bar(), cols);
-        let _ = write!(out, "\x1b[1;1H\x1b[1;7m{header}\x1b[K\x1b[0m");
-        let squad = truncate_to_cols(&self.format_squad_strip(), cols);
-        let _ = write!(out, "\x1b[2;1H\x1b[2m{squad}\x1b[K\x1b[0m");
-        self.write_composer_to(&mut out);
+        if let Some(row) = layout.header_row {
+            let header = truncate_to_cols(&self.format_header_bar(), layout.cols);
+            let _ = write!(out, "\x1b[{row};1H\x1b[1;7m{header}\x1b[K\x1b[0m");
+        }
+        if let Some(row) = layout.squad_row {
+            let squad = truncate_to_cols(&self.format_squad_strip(), layout.cols);
+            let _ = write!(out, "\x1b[{row};1H\x1b[2m{squad}\x1b[K\x1b[0m");
+        }
+        self.write_composer_to(&mut out, layout);
         let _ = write!(out, "\x1b[?25h");
         let _ = out.flush();
     }
@@ -1683,15 +1889,17 @@ impl ChatApp {
         if !self.tty {
             return;
         }
-        let cols = usize::from(self.cols.max(20));
-        let div_row = self.rows.saturating_sub(1).max(1);
-        let divider = truncate_to_cols(&self.format_divider(), cols);
+        let layout = self.layout();
+        let Some(div_row) = layout.divider_row else {
+            return;
+        };
+        let divider = truncate_to_cols(&self.format_divider(), layout.cols);
         let mut out = io::stdout();
         let _ = write!(
             out,
             "\x1b[?25l\x1b[{div_row};1H\x1b[2m{divider}\x1b[K\x1b[0m"
         );
-        self.write_composer_to(&mut out);
+        self.write_composer_to(&mut out, layout);
         let _ = write!(out, "\x1b[?25h");
         let _ = out.flush();
     }
@@ -1700,20 +1908,31 @@ impl ChatApp {
         if !self.tty {
             return;
         }
+        let layout = self.layout();
         let mut out = io::stdout();
         let _ = write!(out, "\x1b[?25l");
-        self.write_composer_to(&mut out);
+        self.write_composer_to(&mut out, layout);
         let _ = write!(out, "\x1b[?25h");
         let _ = out.flush();
     }
 
-    fn write_composer_to(&self, out: &mut impl io::Write) {
-        let input_row = self.rows.max(1);
-        let cols = usize::from(self.cols.max(20));
-        let prompt = "> ";
+    fn write_composer_to(&self, out: &mut impl io::Write, layout: TerminalLayout) {
+        let input_row = layout.composer_row;
+        let cols = layout.cols;
+        let prompt = if cols >= 3 {
+            "> "
+        } else if cols == 2 {
+            ">"
+        } else {
+            ""
+        };
         let avail = cols.saturating_sub(prompt.len());
         let (vis, cursor_col) = self.editor.visible_slice(avail);
-        let cursor_1based = prompt.len().saturating_add(cursor_col).saturating_add(1);
+        let cursor_1based = prompt
+            .len()
+            .saturating_add(cursor_col)
+            .saturating_add(1)
+            .min(cols);
         let _ = write!(
             out,
             "\x1b[{input_row};1H\x1b[0m{prompt}{vis}\x1b[K\x1b[{input_row};{cursor_1based}H"
@@ -1721,21 +1940,24 @@ impl ChatApp {
     }
 
     fn append_tty_line(&self, text: &str, style: LineStyle) {
-        let cols = usize::from(self.cols.max(20));
+        let layout = self.layout();
         let mut out = io::stdout();
         let _ = write!(out, "\x1b[?25l");
         let prefix = Self::ansi_prefix(style);
-        if let Some((top, bottom)) = self.scroll_region_bounds() {
-            let _ = write!(out, "\x1b[{top};{bottom}r");
-            for line in wrap_to_cols(text, cols) {
-                let _ = write!(out, "\x1b[{bottom};1H\r\n{prefix}{line}\x1b[0m\x1b[K");
-            }
-        } else {
-            for line in wrap_to_cols(text, cols) {
-                let _ = write!(out, "\r\n{prefix}{line}\x1b[0m\x1b[K");
+        if let Some((top, bottom)) = layout.transcript_bounds {
+            let wrapped = wrap_to_cols(text, layout.cols);
+            if bottom > top {
+                let _ = write!(out, "\x1b[{top};{bottom}r");
+                for line in wrapped {
+                    let _ = write!(out, "\x1b[{bottom};1H\r\n{prefix}{line}\x1b[0m\x1b[K");
+                }
+            } else if let Some(last) = wrapped.last() {
+                // Single-row transcript viewport on very short terminals (rows 3..=5):
+                // overwrite the viewport row cleanly without scrolling headers/composer.
+                let _ = write!(out, "\x1b[{top};1H{prefix}{last}\x1b[0m\x1b[K");
             }
         }
-        self.write_composer_to(&mut out);
+        self.write_composer_to(&mut out, layout);
         let _ = write!(out, "\x1b[?25h");
         let _ = out.flush();
     }
@@ -2099,20 +2321,31 @@ impl ChatApp {
 
     fn best_share_url(&self) -> Option<String> {
         if let Some(ref p) = self.active_party {
-            let share = sanitize_terminal_inline(&p.share_url);
-            if !share.is_empty() {
-                return Some(share);
+            if let Some(valid) = validate_share_url(&p.share_url) {
+                return Some(valid);
             }
             let code = sanitize_terminal_inline(&p.room_code);
-            if !code.is_empty() {
-                return Some(format!("https://clank.party/{code}"));
+            if !code.is_empty()
+                && code.len() <= 32
+                && code
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && let Some(valid) = validate_share_url(&format!("https://clank.party/{code}"))
+            {
+                return Some(valid);
             }
         }
         if !self.own_handle.is_empty() {
-            return Some(format!(
-                "https://clank.party/@{}",
-                sanitize_terminal_inline(&self.own_handle)
-            ));
+            let handle = sanitize_terminal_inline(self.own_handle.trim_start_matches('@'));
+            if !handle.is_empty()
+                && handle.len() <= 64
+                && handle
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+                && let Some(valid) = validate_share_url(&format!("https://clank.party/@{handle}"))
+            {
+                return Some(valid);
+            }
         }
         None
     }
@@ -2159,9 +2392,13 @@ impl ChatApp {
         };
         let clean_body = sanitize_terminal_text(body, true);
         let ts = format_hhmm_now();
-        // Record local echo BEFORE send completes so a fast server echo never duplicates.
-        self.dedup
-            .record_local_echo(EchoKind::Chat, clean_body.trim().to_string(), Instant::now());
+        // Record local echo BEFORE send completes so a fast server echo never duplicates,
+        // and roll it back on send/decode failure so retries are never swallowed.
+        let echo_id = self.dedup.record_local_echo(
+            EchoKind::Chat,
+            clean_body.trim().to_string(),
+            Instant::now(),
+        );
 
         let send_res = self
             .cmd_client
@@ -2178,9 +2415,13 @@ impl ChatApp {
                         ));
                     }
                 }
-                Err(e) => self.push_error(&e.to_string()),
+                Err(e) => {
+                    self.dedup.cancel_local_echo(echo_id);
+                    self.push_error(&e.to_string());
+                }
             },
             Err(e) => {
+                self.dedup.cancel_local_echo(echo_id);
                 self.push_error(&format!("send failed: {e}"));
             }
         }
@@ -2222,11 +2463,11 @@ impl ChatApp {
                         return;
                     }
                 };
-                let clean = sanitize_terminal_text(trimmed, true);
+                let formatted = format_board_payload(trimmed.as_bytes());
                 let ts = format_hhmm_now();
-                self.dedup.record_local_echo(
+                let echo_id = self.dedup.record_local_echo(
                     EchoKind::Board,
-                    clean.trim().to_string(),
+                    formatted.trim().to_string(),
                     Instant::now(),
                 );
                 match self
@@ -2236,11 +2477,17 @@ impl ChatApp {
                 {
                     Ok(raw) => match decode_send_result_resp(&raw) {
                         Ok(_) => {
-                            self.emit_multiline(&ts, "[board] you", &clean, LineStyle::Board);
+                            self.emit_multiline(&ts, "[board] you", &formatted, LineStyle::Board);
                         }
-                        Err(e) => self.push_error(&e.to_string()),
+                        Err(e) => {
+                            self.dedup.cancel_local_echo(echo_id);
+                            self.push_error(&e.to_string());
+                        }
                     },
-                    Err(e) => self.push_error(&format!("board post failed: {e}")),
+                    Err(e) => {
+                        self.dedup.cancel_local_echo(echo_id);
+                        self.push_error(&format!("board post failed: {e}"));
+                    }
                 }
             }
             SlashCommand::Invite(handle) => {
@@ -2697,8 +2944,10 @@ pub async fn cmd_chat(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
         reader_stop.store(true, Ordering::Release);
         let _ = reader_handle.join();
     } else {
-        // Non-TTY / `--no-tty` line-oriented mode.
-        let mut stdin_lines = TokioBufReader::new(tokio::io::stdin()).lines();
+        // Non-TTY / `--no-tty` bounded poll-based line reader (exits promptly on /quit/SIGINT/SIGTERM
+        // even while the parent keeps stdin open, and caps buffered line memory at MAX_INPUT_BYTES).
+        let reader_stop = Arc::new(AtomicBool::new(false));
+        let (mut line_rx, reader_handle) = spawn_non_tty_line_reader(Arc::clone(&reader_stop));
 
         while !app.should_quit {
             tokio::select! {
@@ -2709,12 +2958,17 @@ pub async fn cmd_chat(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
                 _ = sigterm.recv() => {
                     app.should_quit = true;
                 }
-                line_res = stdin_lines.next_line() => {
-                    match line_res {
-                        Ok(Some(line)) => {
+                maybe_line = line_rx.recv() => {
+                    match maybe_line {
+                        Some(StdinLineEvent::Line(line)) => {
                             app.handle_user_line(&line).await;
                         }
-                        Ok(None) | Err(_) => {
+                        Some(StdinLineEvent::TooLong) => {
+                            app.push_error(&format!(
+                                "input line exceeded max {MAX_INPUT_BYTES} bytes"
+                            ));
+                        }
+                        Some(StdinLineEvent::Eof) | None => {
                             app.should_quit = true;
                         }
                     }
@@ -2727,6 +2981,9 @@ pub async fn cmd_chat(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
                 }
             }
         }
+
+        reader_stop.store(true, Ordering::Release);
+        let _ = reader_handle.join();
     }
 
     // Drop poller sender so background poller task exits cleanly.
@@ -3070,5 +3327,84 @@ mod tests {
             "release v0.5.1 ready"
         );
         assert_eq!(format_board_payload(b"\xff\xfe\xfd"), "<3 bytes binary>");
+    }
+
+    #[test]
+    fn tiny_terminal_layout_never_overlaps_or_overflows() {
+        for rows in 0u16..=10 {
+            for cols in 0u16..=25 {
+                let l = TerminalLayout::compute(cols, rows);
+                let eff_rows = rows.max(1);
+                let eff_cols = usize::from(cols.max(1));
+                assert_eq!(l.rows, eff_rows);
+                assert_eq!(l.cols, eff_cols);
+                assert!(l.composer_row >= 1 && l.composer_row <= eff_rows);
+
+                // Every active region must occupy disjoint row ranges within 1..=eff_rows.
+                let mut used = HashSet::new();
+                assert!(used.insert(l.composer_row));
+                if let Some(r) = l.header_row {
+                    assert!(r >= 1 && r <= eff_rows);
+                    assert!(used.insert(r), "header collided at rows={rows}");
+                }
+                if let Some(r) = l.squad_row {
+                    assert!(r >= 1 && r <= eff_rows);
+                    assert!(used.insert(r), "squad collided at rows={rows}");
+                }
+                if let Some(r) = l.divider_row {
+                    assert!(r >= 1 && r <= eff_rows);
+                    assert!(used.insert(r), "divider collided at rows={rows}");
+                }
+                if let Some((top, bottom)) = l.transcript_bounds {
+                    assert!(top >= 1 && top <= bottom && bottom <= eff_rows);
+                    for r in top..=bottom {
+                        assert!(used.insert(r), "transcript collided at rows={rows}");
+                    }
+                }
+
+                // Narrow wrapping & truncation respect actual cols (never clamped up to 8 or 20!)
+                let wrapped = wrap_to_cols("hello world from narrow terminal", eff_cols);
+                for wline in &wrapped {
+                    let line_cols: usize = wline.chars().map(char_display_width).sum();
+                    assert!(line_cols <= eff_cols, "wrapped line overflowed cols={eff_cols}");
+                }
+                let trunc = truncate_to_cols("header bar text", eff_cols);
+                let trunc_cols: usize = trunc.chars().map(char_display_width).sum();
+                assert!(trunc_cols <= eff_cols);
+            }
+        }
+    }
+
+    #[test]
+    fn local_echo_rollback_and_json_board_echo_matching() {
+        let mut dedup = MessageDedupState::new();
+        dedup.reset_for_party(Some(8801));
+        let now = Instant::now();
+
+        // Failed send rolls back echo so a retry / Window-1 message is NOT swallowed
+        let id = dedup.record_local_echo(EchoKind::Chat, "retry me".to_string(), now);
+        dedup.cancel_local_echo(id);
+        assert!(!dedup.consume_matching_echo(EchoKind::Chat, "retry me", now));
+
+        // JSON board payload formatted via format_board_payload matches decoded echo
+        let raw_json = r#"{"title":"Shipped","summary":"all green"}"#;
+        let formatted = format_board_payload(raw_json.as_bytes());
+        assert_eq!(formatted, "Shipped — all green");
+        let _ = dedup.record_local_echo(EchoKind::Board, formatted.trim().to_string(), now);
+        assert!(dedup.consume_matching_echo(EchoKind::Board, "Shipped — all green", now));
+    }
+
+    #[test]
+    fn validate_share_url_enforces_https_bounds_and_no_whitespace() {
+        assert_eq!(
+            validate_share_url("https://clank.party/KAIH"),
+            Some("https://clank.party/KAIH".to_string())
+        );
+        assert_eq!(validate_share_url("http://clank.party/KAIH"), None);
+        assert_eq!(validate_share_url("javascript:alert(1)"), None);
+        assert_eq!(validate_share_url("https://"), None);
+        assert_eq!(validate_share_url("https://clank.party/KAIH extra"), None);
+        let huge = format!("https://clank.party/{}", "a".repeat(250));
+        assert_eq!(validate_share_url(&huge), None);
     }
 }
