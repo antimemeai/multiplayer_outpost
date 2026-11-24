@@ -3317,3 +3317,491 @@ async fn oracle_create_party_with_scope_and_invalid_ids() {
 
     srv.await.expect("server task");
 }
+
+#[tokio::test]
+async fn oracle_mp2_rest_room_v2_and_cloud_auth_contract() {
+    let pki = generate_test_pki();
+    let acceptor = make_server_acceptor(&pki, &[&rustls::version::TLS13]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let root_sk = SigningKey::from_bytes(&[0x31; 32]);
+    let root_pk_b64 = B64_STD.encode(root_sk.verifying_key().to_bytes());
+    let dev_secret = [0x32; 32];
+    let dev_sk = SigningKey::from_bytes(&dev_secret);
+    let dev_pk = dev_sk.verifying_key().to_bytes();
+    let now_s = wall_now_secs();
+    let cwt_bytes =
+        encode_device_cwt(&root_sk, &dev_pk, now_s, now_s + 7 * 86_400).expect("encode cwt");
+    let cwt_b64 = B64_STD.encode(&cwt_bytes);
+    let renewed_cwt =
+        encode_device_cwt(&root_sk, &dev_pk, now_s, now_s + 14 * 86_400).expect("encode renew");
+    let renewed_cwt_b64 = B64_STD.encode(&renewed_cwt);
+
+    let poll_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let poll_calls_srv = Arc::clone(&poll_calls);
+
+    let srv = tokio::spawn(async move {
+        // Expect 8 requests: start, poll(pending), poll(approved), renew, invite, enter, friends/live, leave
+        for _ in 0..8usize {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let mut tls = acceptor.accept(tcp).await.expect("tls accept");
+            let req = read_http_request(&mut tls).await;
+            let (status_line, body_str) = match (req.method.as_str(), req.path.as_str()) {
+                ("POST", "/v1/auth/session/start") => (
+                    "200 OK",
+                    serde_json::json!({
+                        "flow_id": "flow_abc",
+                        "poll_token": "tok_secret_123",
+                        "user_code": "ABCD-EFGH",
+                        "verify_url": "https://multiplayer.tech/login?code=ABCD-EFGH",
+                        "expires_at_ms": wall_now_ms() + 300_000
+                    })
+                    .to_string(),
+                ),
+                ("POST", "/v1/auth/session/poll") => {
+                    let n = poll_calls_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n == 0 {
+                        ("200 OK", r#"{"status":"pending"}"#.to_owned())
+                    } else {
+                        (
+                            "200 OK",
+                            serde_json::json!({
+                                "status": "approved",
+                                "account_id": 1001,
+                                "handle": "antimeme",
+                                "device_id": 2001,
+                                "root_pubkey_b64": root_pk_b64,
+                                "device_cwt_b64": cwt_b64,
+                                "cwt_expires_ms": (now_s as u64 + 7 * 86_400) * 1000,
+                                "session_token": "mpcs1_session_tok"
+                            })
+                            .to_string(),
+                        )
+                    }
+                }
+                ("POST", "/v1/devices/me/renew") => (
+                    "200 OK",
+                    serde_json::json!({
+                        "device_id": 2001,
+                        "device_cwt_b64": renewed_cwt_b64,
+                        "cwt_expires_ms": (now_s as u64 + 14 * 86_400) * 1000
+                    })
+                    .to_string(),
+                ),
+                ("POST", "/v1/rooms/invite") => (
+                    "200 OK",
+                    serde_json::json!({
+                        "party_id": 1234567890u64,
+                        "room_code": "KAIH",
+                        "share_url": "https://multiplayer.tech/p/KAIH",
+                        "handle_url": "https://multiplayer.tech/@antimeme",
+                        "ws_path": "/v1/parties/1234567890/ws",
+                        "invited_handle": "phall"
+                    })
+                    .to_string(),
+                ),
+                ("POST", "/v1/rooms/enter") => (
+                    "200 OK",
+                    serde_json::json!({
+                        "party_id": 1234567890u64,
+                        "room_code": "KAIH",
+                        "name": "antimeme's party",
+                        "share_url": "https://multiplayer.tech/p/KAIH",
+                        "ws_path": "/v1/parties/1234567890/ws",
+                        "members": [
+                            { "account_id": 1001, "handle": "antimeme", "client": "blackbird", "agent_name": "Blackbird", "status": "live" }
+                        ]
+                    })
+                    .to_string(),
+                ),
+                ("GET", "/v1/friends/live") => (
+                    "200 OK",
+                    serde_json::json!({
+                        "friends": [
+                            { "account_id": 1002, "handle": "phall", "state": "friend", "presence": "in_party", "client": "outpost", "party_room_code": "KAIH", "joinable": true }
+                        ],
+                        "pending_invites": [
+                            { "party_id": 1234567890u64, "room_code": "KAIH", "from_handle": "phall", "created_at_ms": 1795495422986u64 }
+                        ]
+                    })
+                    .to_string(),
+                ),
+                ("POST", "/v1/rooms/leave") => (
+                    "200 OK",
+                    serde_json::json!({ "left": true, "party_id": 1234567890u64 }).to_string(),
+                ),
+                (m, p) => panic!("unexpected request {m} {p}"),
+            };
+            let resp = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body_str.len(),
+                body_str
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write resp");
+            tls.shutdown().await.expect("shutdown");
+        }
+    });
+
+    let unauth_client = ControlClient::new(make_client_config(&pki, addr));
+    let start = unauth_client
+        .auth_session_start(&outpost_control::AuthSessionStartRequest {
+            device_pubkey: dev_pk,
+            device_label: "MacBook Pro".to_owned(),
+            client: "outpost".to_owned(),
+        })
+        .await
+        .expect("auth_session_start");
+    assert_eq!(start.user_code, "ABCD-EFGH");
+
+    let pending = unauth_client
+        .auth_session_poll(&start.flow_id, &start.poll_token)
+        .await
+        .expect("poll pending");
+    assert!(matches!(
+        pending,
+        outpost_control::AuthSessionPollResponse::Pending { .. }
+    ));
+
+    let approved = unauth_client
+        .auth_session_poll(&start.flow_id, &start.poll_token)
+        .await
+        .expect("poll approved");
+    assert!(matches!(
+        approved,
+        outpost_control::AuthSessionPollResponse::Approved {
+            account_id: 1001,
+            device_id: 2001,
+            ..
+        }
+    ));
+
+    let signer = RequestSigner::device(
+        AccountId::new(1001).expect("aid"),
+        DeviceId::new(2001).expect("did"),
+        dev_secret,
+    );
+    let client = ControlClient::with_device_signer(make_client_config(&pki, addr), signer);
+
+    let renewed = client.renew_my_device().await.expect("renew_my_device");
+    assert_eq!(renewed.device_id, 2001);
+
+    let inv = client
+        .room_invite(&outpost_control::RoomInviteRequest {
+            handle: Some("phall".to_owned()),
+            party_id: None,
+            name: Some("Friday Build".to_owned()),
+        })
+        .await
+        .expect("room_invite");
+    assert_eq!(inv.party_id, 1234567890);
+    assert_eq!(inv.room_code, "KAIH");
+    assert_eq!(inv.invited_handle.as_deref(), Some("phall"));
+
+    let entered = client
+        .room_enter(&outpost_control::RoomEnterRequest {
+            target: "@phall".to_owned(),
+            client: "outpost".to_owned(),
+            agent_name: Some("Claude Code".to_owned()),
+        })
+        .await
+        .expect("room_enter");
+    assert_eq!(entered.room_code, "KAIH");
+    assert_eq!(entered.members.len(), 1);
+    assert_eq!(entered.members[0].handle, "antimeme");
+
+    let live = client.friends_live().await.expect("friends_live");
+    assert_eq!(live.friends.len(), 1);
+    assert_eq!(live.friends[0].handle, "phall");
+    assert!(live.friends[0].joinable);
+    assert_eq!(live.pending_invites.len(), 1);
+    assert_eq!(live.pending_invites[0].room_code, "KAIH");
+
+    let left = client
+        .room_leave(PartyId::new(1234567890).expect("pid"))
+        .await
+        .expect("room_leave");
+    assert!(left.left);
+    assert_eq!(left.party_id, 1234567890);
+
+    srv.await.expect("server task");
+}
+
+#[tokio::test]
+async fn oracle_mp2_ws_chat_ack_resume_dedup_agent_card_and_ping_pong() {
+    let pki = generate_test_pki();
+    let acceptor = make_server_acceptor(&pki, &[&rustls::version::TLS13]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let srv = tokio::spawn(async move {
+        // Connection 1: Reject wrong subprotocol (`mp1` echoed when client asked `mp2`)
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 1");
+            let mut tls = acceptor.accept(tcp).await.expect("tls 1");
+            let req = read_http_request(&mut tls).await;
+            assert_eq!(
+                req.headers.get("sec-websocket-protocol").map(String::as_str),
+                Some("mp2")
+            );
+            let accept = ws_accept_value(req.headers.get("sec-websocket-key").expect("key"));
+            let resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: mp1\r\n\r\n"
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write 101");
+            let _ = tls.shutdown().await;
+        }
+
+        // Connection 2: Full `mp2` lifecycle: hello, ping/pong, send chat + dedup ack, agent_card, status->presence, resume
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 2");
+            let mut tls = acceptor.accept(tcp).await.expect("tls 2");
+            let req = read_http_request(&mut tls).await;
+            assert_eq!(req.path, "/v1/parties/9001/ws");
+            assert_eq!(
+                req.headers.get("sec-websocket-protocol").map(String::as_str),
+                Some("mp2")
+            );
+            let accept = ws_accept_value(req.headers.get("sec-websocket-key").expect("key"));
+            let resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: mp2\r\n\r\n"
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write 101");
+
+            // Immediately send `hello`
+            let hello = serde_json::json!({
+                "v": 2,
+                "t": "hello",
+                "party_id": "9001",
+                "room_code": "KAIH",
+                "name": "Squad Room",
+                "self": { "account_id": "1001", "handle": "antimeme", "client": "outpost" },
+                "latest_seq": 1,
+                "members": [
+                    { "account_id": "1001", "handle": "antimeme", "client": "outpost", "status": "live" },
+                    { "account_id": "1002", "handle": "phall", "client": "blackbird", "agent_name": "Blackbird", "status": "live" }
+                ],
+                "history": []
+            })
+            .to_string();
+            tls.write_all(&encode_server_ws_frame(true, 0x1, hello.as_bytes()))
+                .await
+                .expect("write hello");
+            tls.flush().await.expect("flush");
+
+            let mut seq: u64 = 1;
+            let mut dedup: HashMap<String, u64> = HashMap::new();
+            let mut log: Vec<serde_json::Value> = Vec::new();
+
+            loop {
+                let (op, payload) = read_masked_client_ws_frame(&mut tls).await;
+                if op == 0x8 {
+                    break;
+                }
+                assert_eq!(op, 0x1, "mp2 client sends UTF-8 text frames");
+                let text = std::str::from_utf8(&payload).expect("utf8");
+                if text == outpost_control::MP2_PING_TEXT {
+                    tls.write_all(&encode_server_ws_frame(
+                        true,
+                        0x1,
+                        outpost_control::MP2_PONG_TEXT.as_bytes(),
+                    ))
+                    .await
+                    .expect("write pong");
+                    tls.flush().await.expect("flush");
+                    continue;
+                }
+                let frame: serde_json::Value = serde_json::from_str(text).expect("json");
+                match frame.get("t").and_then(|v| v.as_str()) {
+                    Some("send") => {
+                        let cid = frame["client_msg_id"].as_str().expect("cid").to_owned();
+                        let assigned_seq = if let Some(&existing) = dedup.get(&cid) {
+                            existing
+                        } else {
+                            seq += 1;
+                            dedup.insert(cid.clone(), seq);
+                            let ev = serde_json::json!({
+                                "v": 2,
+                                "t": "event",
+                                "seq": seq,
+                                "ts_ms": 1795495430000u64 + seq,
+                                "client_msg_id": cid,
+                                "sender": { "account_id": "1001", "handle": "antimeme", "client": "outpost" },
+                                "target": frame["target"],
+                                "kind": frame["kind"],
+                                "body_encoding": frame["body_encoding"],
+                                "body": frame["body"]
+                            });
+                            log.push(ev.clone());
+                            let ev_s = ev.to_string();
+                            tls.write_all(&encode_server_ws_frame(true, 0x1, ev_s.as_bytes()))
+                                .await
+                                .expect("write event");
+                            seq
+                        };
+                        let ack = serde_json::json!({
+                            "v": 2,
+                            "t": "ack",
+                            "client_msg_id": cid,
+                            "seq": assigned_seq,
+                            "ts_ms": 1795495430000u64 + assigned_seq
+                        })
+                        .to_string();
+                        tls.write_all(&encode_server_ws_frame(true, 0x1, ack.as_bytes()))
+                            .await
+                            .expect("write ack");
+                        tls.flush().await.expect("flush");
+                    }
+                    Some("status") => {
+                        let pres = serde_json::json!({
+                            "v": 2,
+                            "t": "presence",
+                            "members": [
+                                {
+                                    "account_id": "1001",
+                                    "handle": "antimeme",
+                                    "client": frame["client"],
+                                    "agent_name": frame["agent_name"],
+                                    "agent_state": frame["agent_state"],
+                                    "agent_summary": frame["agent_summary"],
+                                    "status": "live"
+                                }
+                            ]
+                        })
+                        .to_string();
+                        tls.write_all(&encode_server_ws_frame(true, 0x1, pres.as_bytes()))
+                            .await
+                            .expect("write presence");
+                        tls.flush().await.expect("flush");
+                    }
+                    Some("resume") => {
+                        let last = frame["last_seq"].as_u64().unwrap_or(0);
+                        for ev in &log {
+                            if ev["seq"].as_u64().unwrap_or(0) > last {
+                                let s = ev.to_string();
+                                tls.write_all(&encode_server_ws_frame(true, 0x1, s.as_bytes()))
+                                    .await
+                                    .expect("write resumed ev");
+                            }
+                        }
+                        tls.flush().await.expect("flush");
+                    }
+                    other => panic!("unexpected mp2 client frame: {other:?}"),
+                }
+            }
+        }
+    });
+
+    let signer = RequestSigner::device(
+        AccountId::new(1001).expect("aid"),
+        DeviceId::new(2001).expect("did"),
+        [0x44; 32],
+    );
+    let client = ControlClient::with_device_signer(make_client_config(&pki, addr), signer);
+    let pid = PartyId::new(9001).expect("pid");
+
+    // 1. Wrong subprotocol rejected cleanly
+    let err = client
+        .connect_mp2_room(pid)
+        .await
+        .expect_err("mp1 echo must fail mp2 connect");
+    assert!(matches!(
+        err,
+        WsConnectError::MissingSubprotocol { expected: "mp2" }
+    ));
+
+    // 2. Real mp2 room session
+    let mut sock = client.connect_mp2_room(pid).await.expect("connect mp2");
+    match sock.next_event().await.expect("hello") {
+        Some(outpost_control::Mp2RoomEvent::Hello(h)) => {
+            assert_eq!(h.party_id, 9001);
+            assert_eq!(h.room_code, "KAIH");
+            assert_eq!(h.self_info.handle, "antimeme");
+            assert_eq!(h.members.len(), 2);
+        }
+        other => panic!("expected Hello, got {other:?}"),
+    }
+
+    // Ping/Pong
+    sock.send_ping().await.expect("ping");
+    assert_eq!(
+        sock.next_event().await.expect("pong"),
+        Some(outpost_control::Mp2RoomEvent::Pong)
+    );
+
+    // Chat send + event + ack
+    sock.send_chat("msg-1", "@all", "hello mp2!")
+        .await
+        .expect("send chat");
+    match sock.next_event().await.expect("ev1") {
+        Some(outpost_control::Mp2RoomEvent::Event(ev)) => {
+            assert_eq!(ev.seq, 2);
+            assert_eq!(ev.kind, outpost_control::Mp2EventKind::Chat);
+            assert_eq!(ev.body, "hello mp2!");
+        }
+        other => panic!("expected Event, got {other:?}"),
+    }
+    match sock.next_event().await.expect("ack1") {
+        Some(outpost_control::Mp2RoomEvent::Ack(ack)) => {
+            assert_eq!(ack.client_msg_id, "msg-1");
+            assert_eq!(ack.seq, 2);
+        }
+        other => panic!("expected Ack, got {other:?}"),
+    }
+
+    // Idempotent duplicate send returns SAME seq=2 and NO duplicate event!
+    sock.send_chat("msg-1", "@all", "hello mp2!")
+        .await
+        .expect("resend chat");
+    match sock.next_event().await.expect("ack dup") {
+        Some(outpost_control::Mp2RoomEvent::Ack(ack)) => {
+            assert_eq!(ack.client_msg_id, "msg-1");
+            assert_eq!(ack.seq, 2);
+        }
+        other => panic!("expected deduplicated Ack, got {other:?}"),
+    }
+
+    // Agent card send
+    let card_json = r#"{"title":"Fixed auth test","summary":"2 files changed"}"#;
+    sock.send_agent_card("card-1", "@all", "utf8", card_json)
+        .await
+        .expect("send agent_card");
+    match sock.next_event().await.expect("ev2") {
+        Some(outpost_control::Mp2RoomEvent::Event(ev)) => {
+            assert_eq!(ev.seq, 3);
+            assert_eq!(ev.kind, outpost_control::Mp2EventKind::AgentCard);
+            assert_eq!(ev.body, card_json);
+        }
+        other => panic!("expected AgentCard Event, got {other:?}"),
+    }
+    assert!(matches!(
+        sock.next_event().await.expect("ack2"),
+        Some(outpost_control::Mp2RoomEvent::Ack(a)) if a.seq == 3
+    ));
+
+    // Status -> Presence
+    sock.send_status("outpost", "Claude Code", "working", Some("Running tests"))
+        .await
+        .expect("send status");
+    match sock.next_event().await.expect("presence") {
+        Some(outpost_control::Mp2RoomEvent::Presence { members }) => {
+            assert_eq!(members.len(), 1);
+            assert_eq!(members[0].agent_state.as_deref(), Some("working"));
+            assert_eq!(members[0].agent_summary.as_deref(), Some("Running tests"));
+        }
+        other => panic!("expected Presence, got {other:?}"),
+    }
+
+    // Resume(last_seq=2) replays only seq=3
+    sock.send_resume(2).await.expect("send resume");
+    match sock.next_event().await.expect("resumed") {
+        Some(outpost_control::Mp2RoomEvent::Event(ev)) => {
+            assert_eq!(ev.seq, 3);
+            assert_eq!(ev.kind, outpost_control::Mp2EventKind::AgentCard);
+        }
+        other => panic!("expected resumed seq=3 event, got {other:?}"),
+    }
+
+    sock.close(1000, "done").await.expect("close");
+    srv.await.expect("server task");
+}

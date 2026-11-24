@@ -24,9 +24,10 @@ use mp_protocol::{
     encode_recovery_key, sha256, validate_ed25519_pubkey_strict, verify_device_cwt,
 };
 use outpost_control::{
-    ControlClient, ControlError, DEFAULT_API_AUTHORITY, DeviceLinkApproveRequest,
-    DeviceLinkInspectResponse, DeviceLinkPollResponse, EnrollDeviceRequest,
-    RegisterAccountRequest, RequestSigner, wall_now_ms, wall_now_secs,
+    AuthSessionPollResponse, AuthSessionStartRequest, ControlClient, ControlError,
+    DEFAULT_API_AUTHORITY, DeviceLinkApproveRequest, DeviceLinkInspectResponse,
+    DeviceLinkPollResponse, EnrollDeviceRequest, RegisterAccountRequest, RequestSigner,
+    wall_now_ms, wall_now_secs,
 };
 use outpost_core::fence::{
     contains_device_link_token, contains_recovery_file, contains_recovery_key, fence_peer_text,
@@ -57,20 +58,22 @@ use crate::ipc_payloads::{
     IpcPartyEventKind, PartyControlNoticeReq, PartyCreateReq, PartyEpochOpReq, PartyInviteMintReq,
     PartyInviteRevokeReq, PartyJoinReq, PartyKickReq, PartyPollIpcReq, PartyPostBoardReq,
     PartyPromoteReq, PartyRequestApproveReq, PartyRequestRejectReq, PartyRequestsListReq,
-    PartySendChatReq, PartyWaitIpcReq, decode_bool_resp, decode_friend_edge_resp,
-    decode_friends_list_resp, decode_party_create_resp, decode_party_epoch_resp,
-    decode_party_invite_mint_resp, decode_party_join_resp, decode_party_list_resp,
-    decode_party_members_resp, decode_party_poll_resp, decode_party_request_approve_resp,
-    decode_party_requests_list_resp, decode_reload_resp, decode_resolve_handle_resp,
-    decode_send_result_resp, decode_status_resp, encode_control_notice_req,
-    encode_party_create_req, encode_party_epoch_op_req, encode_party_invite_mint_req,
-    encode_party_invite_revoke_req, encode_party_join_req, encode_party_kick_req,
-    encode_party_poll_req, encode_party_post_board_req, encode_party_promote_req,
-    encode_party_request_approve_req, encode_party_request_reject_req,
+    PartySendChatReq, PartyWaitIpcReq, RoomEnterIpcReq, RoomInviteIpcReq, RoomLeaveIpcReq,
+    decode_bool_resp, decode_friend_edge_resp, decode_friends_list_resp, decode_friends_live_resp,
+    decode_party_create_resp, decode_party_epoch_resp, decode_party_invite_mint_resp,
+    decode_party_join_resp, decode_party_list_resp, decode_party_members_resp,
+    decode_party_poll_resp, decode_party_request_approve_resp, decode_party_requests_list_resp,
+    decode_reload_resp, decode_resolve_handle_resp, decode_room_enter_resp,
+    decode_room_invite_resp, decode_room_leave_resp, decode_send_result_resp, decode_status_resp,
+    encode_control_notice_req, encode_party_create_req, encode_party_epoch_op_req,
+    encode_party_invite_mint_req, encode_party_invite_revoke_req, encode_party_join_req,
+    encode_party_kick_req, encode_party_poll_req, encode_party_post_board_req,
+    encode_party_promote_req, encode_party_request_approve_req, encode_party_request_reject_req,
     encode_party_requests_list_req, encode_party_send_chat_req, encode_party_wait_req,
-    encode_resolve_handle_req, encode_u64_req, relay_policy_name, trust_state_name,
+    encode_resolve_handle_req, encode_room_enter_req, encode_room_invite_req,
+    encode_room_leave_req, encode_u64_req, relay_policy_name, trust_state_name,
 };
-use crate::mcp_bridge::build_spawn_command;
+use crate::mcp_bridge::build_spawn_command_with_opts;
 use crate::mpkey::{
     MAX_PEM_BYTES, decrypt_mpkey, encrypt_mpkey, write_mpkey_atomic_0600,
     write_mpkey_atomic_0600_with_force,
@@ -91,6 +94,8 @@ pub struct GlobalOpts {
     pub runtime_dir: Option<PathBuf>,
     pub device_id: Option<u64>,
     pub json: bool,
+    pub debug: bool,
+    pub strict_pins: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +106,7 @@ pub struct DaemonSubcommandArgs {
     pub state_dir: Option<PathBuf>,
     pub idle_timeout_secs: Option<u64>,
     pub foreground: bool,
+    pub strict_pins: bool,
 }
 
 /// Global fail-closed `argv` secret guard called at the VERY TOP of `main()` BEFORE
@@ -248,6 +254,7 @@ pub fn parse_daemon_subcommand_if_present(
     let mut ready_fd: Option<i32> = None;
     let mut idle_timeout_secs: Option<u64> = None;
     let mut foreground = false;
+    let mut strict_pins = false;
     let mut is_daemon = false;
 
     while i < args.len() {
@@ -287,6 +294,10 @@ pub fn parse_daemon_subcommand_if_present(
                 foreground = true;
                 i += 1;
             }
+            "--strict-pins" => {
+                strict_pins = true;
+                i += 1;
+            }
             _ if !is_daemon => {
                 // Another subcommand; not `__daemon`.
                 return Ok(None);
@@ -312,6 +323,7 @@ pub fn parse_daemon_subcommand_if_present(
         state_dir,
         idle_timeout_secs,
         foreground,
+        strict_pins,
     }))
 }
 
@@ -369,6 +381,12 @@ pub async fn run_cli_command(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        "login" => cmd_login(&opts, sub).await,
+        "invite" => cmd_invite(&opts, sub).await,
+        "join" => cmd_join(&opts, sub).await,
+        "leave" => cmd_leave(&opts, sub).await,
+        "friends" => cmd_friends_live(&opts, sub).await,
+        "add" => cmd_add_friend(&opts, sub).await,
         "account" => cmd_account(&opts, sub).await,
         "whoami" => cmd_whoami(&opts, sub),
         "device" => cmd_device(&opts, sub).await,
@@ -378,7 +396,7 @@ pub async fn run_cli_command(args: &[String]) -> Result<(), String> {
         "lan" => crate::lan::run_lan(&opts, sub).await,
         "upgrade" => crate::upgrade::run_upgrade(&opts, sub).await,
         "mcp" => cmd_mcp(&opts, sub),
-        "peer" => cmd_peer(&opts, sub).await,
+        "peer" | "peers" => cmd_peer(&opts, sub).await,
         "friend" => cmd_friend(&opts, sub).await,
         "party" => cmd_party(&opts, sub).await,
         "board" => cmd_board(&opts, sub).await,
@@ -392,29 +410,36 @@ pub async fn run_cli_command(args: &[String]) -> Result<(), String> {
 
 fn print_usage() {
     println!(
-        "mp-outpost {PKG_VERSION} — standalone multiplayer.tech P2P party sidecar\n\n\
+        "mp-outpost {PKG_VERSION} — multiplayer.tech party sidecar & MCP bridge\n\n\
 Usage:\n\
   mp-outpost [GLOBAL FLAGS] <command> ...\n\n\
+Quick Start:\n\
+  login [--no-open]                       Sign in via browser\n\
+  invite [@handle] [--name <name>]        Invite a friend or get a share link & 4-char code\n\
+  join [@handle|CODE|url]                 Join a party (bare `join` accepts latest invite)\n\
+  leave                                   Leave the current party\n\
+  friends                                 Live friends roster & pending party invites\n\
+  add @handle                             Add a friend or accept their request\n\n\
 Global Flags:\n\
+  --json                  Emit structured JSON output\n\
+  --debug                 Show internal IDs and technical diagnostics\n\
+  --strict-pins           Require manual safety-number pinning before sending\n\
   --state-dir <path>      Override state directory (or OUTPOST_STATE_DIR)\n\
   --runtime-dir <path>    Override runtime directory (or OUTPOST_RUNTIME_DIR)\n\
-  --device-id <u64>       Select device ID (or OUTPOST_DEVICE_ID)\n\
-  --json                  Emit structured JSON output\n\n\
-Commands:\n\
-  account register|rename|recovery-key|export-mpkey|recover\n\
+  --device-id <u64>       Select device ID (or OUTPOST_DEVICE_ID)\n\n\
+Advanced Commands:\n\
   whoami [--safety-number]\n\
+  peers list|verify|trust|revoke\n\
+  party status|list|members|say|read|wait|create|join|invite|leave|disband\n\
+  board post|read\n\
+  friend list|add|accept|deny|decline|remove|block <@handle>\n\
+  lan status|scan|host|join\n\
+  mcp [setup [--client claude|codex|cursor|antigravity|all] [--write] [--config <path>] [--global]]\n\
+  daemon status|start|stop|restart|logs\n\
+  account register|rename|recovery-key|export-mpkey|recover\n\
   device init|install-cwt|enroll|renew|revoke|link <create|join|approve>\n\
   web approve <XXXX-XXXX>\n\
-  doctor [--api-authority <host>] [--relay-url <url>]\n\
-  relays [--ping] [--api-authority <host>]\n\
-  lan status|scan|host|join\n\
-  upgrade [--check] [--yes|-y] [--version <vX.Y.Z|latest>]\n\
-  peer list|trust|revoke\n\
-  friend list|add|accept|deny|decline|remove|block <@handle|account_id>\n\
-  party create|join|invite|requests|approve|reject|leave|disband|kick|promote|status|list|members|say|read|wait\n\
-  board post|read\n\
-  daemon status|start|stop|restart|logs\n\
-  mcp [setup [--client claude|codex|cursor|antigravity|all] [--write] [--config <path>] [--global]]"
+  doctor | relays | upgrade"
     );
 }
 
@@ -439,6 +464,14 @@ fn extract_global_opts(args: &[String]) -> Result<(GlobalOpts, Vec<String>), Str
             }
             "--json" => {
                 opts.json = true;
+                i += 1;
+            }
+            "--debug" => {
+                opts.debug = true;
+                i += 1;
+            }
+            "--strict-pins" => {
+                opts.strict_pins = true;
                 i += 1;
             }
             _ => {
@@ -974,10 +1007,11 @@ async fn connect_daemon_cli(
     cfg.read_only_cli = read_only_cli;
     cfg.on_disk_exe_matches_local = on_disk_exe_matches_local();
     if auto_spawn {
-        cfg.spawn_command = Some(build_spawn_command(
+        cfg.spawn_command = Some(build_spawn_command_with_opts(
             device_id,
             &state_dir,
             runtime_override.as_deref(),
+            opts.strict_pins,
         )?);
     }
     let client = DaemonClient::connect_or_spawn(&cfg)
@@ -1008,6 +1042,551 @@ async fn notify_daemon_reload_if_running(opts: &GlobalOpts, device_id: u64) {
     {
         let _ = decode_reload_resp(&raw);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Xbox Live 1-Verb Commands (`login`, `invite`, `join`, `leave`, `friends`, `add`)
+// ---------------------------------------------------------------------------
+
+fn default_device_label() -> String {
+    let raw = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "outpost".to_string());
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| c.is_ascii() && (0x20..=0x7e).contains(&(*c as u32)))
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "outpost".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn try_open_browser(url: &str) -> bool {
+    if std::env::var("OUTPOST_NO_BROWSER")
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+    {
+        return false;
+    }
+    if !url.starts_with("https://") {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+async fn cmd_login(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let mut api_authority = DEFAULT_API_AUTHORITY.to_string();
+    let mut device_label = default_device_label();
+    let mut no_open = false;
+    let mut poll_interval_ms: u64 = 1_500;
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--api-authority" => {
+                api_authority = next_val(args, &mut i, "--api-authority")?.to_string();
+            }
+            "--device-label" => {
+                device_label = next_val(args, &mut i, "--device-label")?.to_string();
+            }
+            "--no-open" => {
+                no_open = true;
+                i += 1;
+            }
+            "--poll-ms" => {
+                poll_interval_ms = next_val(args, &mut i, "--poll-ms")?
+                    .parse::<u64>()
+                    .map_err(|_| "invalid --poll-ms".to_string())?
+                    .clamp(50, 10_000);
+            }
+            other => {
+                return Err(format!(
+                    "unknown argument to `login`: {}",
+                    redact_unknown_arg(other)
+                ));
+            }
+        }
+    }
+    validate_device_label(&device_label)?;
+
+    let device_secret = random_bytes_32_zeroizing()?;
+    let device_pubkey = SigningKey::from_bytes(&device_secret)
+        .verifying_key()
+        .to_bytes();
+
+    let cfg = build_control_client_config(&api_authority).map_err(|e| e.to_string())?;
+    let client = ControlClient::new(cfg);
+
+    let start = client
+        .auth_session_start(&AuthSessionStartRequest {
+            device_pubkey,
+            device_label: device_label.clone(),
+            client: "outpost".to_string(),
+        })
+        .await
+        .map_err(|e| format!("failed to start login session: {e}"))?;
+
+    let safe_code = sanitize_cli_meta(&start.user_code);
+    let safe_url = sanitize_cli_meta(&start.verify_url);
+    if !opts.json {
+        let opened = if no_open {
+            false
+        } else {
+            try_open_browser(&start.verify_url)
+        };
+        if opened {
+            println!("Opening browser to sign in...");
+        } else {
+            println!("Open this URL to sign in: {safe_url}");
+        }
+        println!("Confirmation code: {safe_code}");
+        println!("Waiting for approval...");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut transient_attempt = 0u32;
+
+    loop {
+        if Instant::now() >= deadline {
+            return Err("login timed out; run `mp-outpost login` to try again".to_string());
+        }
+        let now_ms = wall_now_ms_adjusted(&client);
+        if start.expires_at_ms > 0 && now_ms >= start.expires_at_ms {
+            return Err("login session expired; run `mp-outpost login` to try again".to_string());
+        }
+
+        match client
+            .auth_session_poll(&start.flow_id, &start.poll_token)
+            .await
+        {
+            Ok(AuthSessionPollResponse::Pending { .. }) => {
+                transient_attempt = 0;
+                tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+            }
+            Ok(AuthSessionPollResponse::Expired) => {
+                return Err(
+                    "login session expired; run `mp-outpost login` to try again".to_string()
+                );
+            }
+            Ok(AuthSessionPollResponse::Denied) => {
+                return Err("login was cancelled in browser".to_string());
+            }
+            Ok(AuthSessionPollResponse::Approved {
+                account_id,
+                handle,
+                device_id,
+                root_pubkey_b64,
+                device_cwt_b64,
+                cwt_expires_ms,
+                session_token: _,
+            }) => {
+                let root_raw = B64
+                    .decode(root_pubkey_b64.as_bytes())
+                    .map_err(|_| "server returned invalid root_pubkey_b64".to_string())?;
+                let root_pubkey: [u8; 32] = root_raw
+                    .try_into()
+                    .map_err(|_| "server returned non-32-byte root_pubkey".to_string())?;
+                validate_ed25519_pubkey_strict(&root_pubkey)
+                    .map_err(|e| format!("server returned invalid root_pubkey: {e}"))?;
+
+                let device_cwt = B64
+                    .decode(device_cwt_b64.as_bytes())
+                    .map_err(|_| "server returned invalid device_cwt_b64".to_string())?;
+                verify_device_cwt(
+                    &device_cwt,
+                    &root_pubkey,
+                    Some(&device_pubkey),
+                    wall_now_secs(),
+                )
+                .map_err(|e| format!("server returned invalid device_cwt: {e}"))?;
+
+                let state_dir_path = resolve_effective_state_dir(opts.state_dir.as_deref())?;
+                let state_dir = open_state_dir(&state_dir_path)?;
+                let lock = lock_state(&state_dir)?;
+                let rec = DeviceRecord {
+                    account_id,
+                    device_id,
+                    root_pubkey,
+                    device_secret: *device_secret,
+                    device_pubkey,
+                    device_cwt,
+                    local_relay_policy: RelayPolicy::AllowRelays,
+                    api_authority: api_authority.clone(),
+                    default_relay_url: DEFAULT_RELAY_URL.to_string(),
+                    device_label: device_label.clone(),
+                };
+                save_device_record(&state_dir_path, &lock, &rec)?;
+                save_default_device_id(&state_dir, &lock, device_id)?;
+                drop(lock);
+
+                notify_daemon_reload_if_running(opts, device_id).await;
+
+                let clean_handle = sanitize_cli_meta(handle.trim_start_matches('@'));
+                if opts.json {
+                    print_json(&json!({
+                        "status": "signed_in",
+                        "handle": clean_handle,
+                        "account_id": account_id,
+                        "device_id": device_id,
+                        "cwt_expires_ms": cwt_expires_ms,
+                    }));
+                } else {
+                    println!("Signed in as @{clean_handle}");
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                if let Some(delay) = classify_poll_retry_sleep(&err, transient_attempt, rem) {
+                    transient_attempt = transient_attempt.saturating_add(1);
+                    tokio::time::sleep(delay).await;
+                } else {
+                    return Err(format!("login failed: {err}"));
+                }
+            }
+        }
+    }
+}
+
+async fn cmd_invite(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let mut handle: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--name" => {
+                name = Some(next_val(args, &mut i, "--name")?.to_string());
+            }
+            other if !other.starts_with('-') && handle.is_none() => {
+                handle = Some(other.trim().trim_start_matches('@').to_string());
+                i += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown argument to `invite`: {}",
+                    redact_unknown_arg(other)
+                ));
+            }
+        }
+    }
+
+    let (mut client, _) = connect_daemon_cli(opts, false, true).await?;
+    let raw = client
+        .request(
+            IpcOpcode::RoomInvite,
+            encode_room_invite_req(&RoomInviteIpcReq {
+                handle,
+                party_id: None,
+                name,
+            })
+            .map_err(|e| e.to_string())?,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let resp = decode_room_invite_resp(&raw).map_err(|e| e.to_string())?;
+
+    if opts.json {
+        print_json(&json!({
+            "party_id": resp.party_id,
+            "room_code": resp.room_code,
+            "share_url": resp.share_url,
+            "handle_url": resp.handle_url,
+            "ws_path": resp.ws_path,
+            "invited_handle": resp.invited_handle,
+        }));
+    } else {
+        let code = sanitize_cli_meta(&resp.room_code);
+        let share = sanitize_cli_meta(&resp.share_url);
+        if let Some(ref inv) = resp.invited_handle
+            && !inv.is_empty()
+        {
+            println!(
+                "Invited @{} — code {code} ({share})",
+                sanitize_cli_meta(inv.trim_start_matches('@'))
+            );
+        } else {
+            println!("Party ready — code {code} ({share})");
+        }
+        if !resp.handle_url.is_empty() {
+            println!("Link: {}", sanitize_cli_meta(&resp.handle_url));
+        }
+        if opts.debug {
+            println!("debug: party_id={} ws_path={}", resp.party_id, resp.ws_path);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_join(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let mut target = String::new();
+    let mut agent_name: Option<String> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--agent-name" => {
+                agent_name = Some(next_val(args, &mut i, "--agent-name")?.to_string());
+            }
+            other if !other.starts_with('-') && target.is_empty() => {
+                target = other.trim().to_string();
+                i += 1;
+            }
+            other => {
+                return Err(format!(
+                    "unknown argument to `join`: {}",
+                    redact_unknown_arg(other)
+                ));
+            }
+        }
+    }
+
+    let (mut client, _) = connect_daemon_cli(opts, false, true).await?;
+    let raw = client
+        .request(
+            IpcOpcode::RoomEnter,
+            encode_room_enter_req(&RoomEnterIpcReq { target, agent_name })
+                .map_err(|e| e.to_string())?,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let resp = decode_room_enter_resp(&raw).map_err(|e| e.to_string())?;
+
+    if opts.json {
+        let members: Vec<Value> = resp
+            .members
+            .iter()
+            .map(|m| {
+                json!({
+                    "account_id": m.account_id,
+                    "handle": m.handle,
+                    "client": m.client,
+                    "agent_name": m.agent_name,
+                    "status": m.status,
+                })
+            })
+            .collect();
+        print_json(&json!({
+            "party_id": resp.party_id,
+            "room_code": resp.room_code,
+            "name": resp.name,
+            "share_url": resp.share_url,
+            "ws_path": resp.ws_path,
+            "members": members,
+        }));
+    } else {
+        let name = if resp.name.is_empty() {
+            "party".to_string()
+        } else {
+            sanitize_cli_meta(&resp.name)
+        };
+        let code = sanitize_cli_meta(&resp.room_code);
+        println!("Joined {name} (code {code}) · {} live", resp.members.len());
+        for m in &resp.members {
+            let h = sanitize_cli_meta(m.handle.trim_start_matches('@'));
+            let badge = if m.status == "live" || m.status.is_empty() {
+                "●"
+            } else {
+                "○"
+            };
+            let client_tag = if m.client.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", sanitize_cli_meta(&m.client))
+            };
+            println!("  {badge} @{h}{client_tag}");
+        }
+        if opts.debug {
+            println!("debug: party_id={} ws_path={}", resp.party_id, resp.ws_path);
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_leave(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let party_id = match args.first().map(String::as_str) {
+        None => None,
+        Some(raw) if args.len() == 1 => Some(parse_safe_id(raw, "<party_id>")?),
+        Some(other) => {
+            return Err(format!(
+                "unknown argument to `leave`: {}",
+                redact_unknown_arg(other)
+            ));
+        }
+    };
+    let (mut client, _) = connect_daemon_cli(opts, false, true).await?;
+    let raw = client
+        .request(
+            IpcOpcode::RoomLeave,
+            encode_room_leave_req(&RoomLeaveIpcReq { party_id }),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let resp = decode_room_leave_resp(&raw).map_err(|e| e.to_string())?;
+    if opts.json {
+        print_json(&json!({
+            "left": resp.left,
+            "party_id": resp.party_id,
+        }));
+    } else {
+        println!("Left party.");
+    }
+    Ok(())
+}
+
+async fn cmd_friends_live(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err(format!(
+            "unknown argument to `friends`: {}",
+            redact_unknown_arg(args.first().map(String::as_str).unwrap_or_default())
+        ));
+    }
+    let (mut client, _) = connect_daemon_cli(opts, false, true).await?;
+    let raw = client
+        .request(IpcOpcode::FriendsLive, Vec::new())
+        .await
+        .map_err(|e| e.to_string())?;
+    let resp = decode_friends_live_resp(&raw).map_err(|e| e.to_string())?;
+
+    if opts.json {
+        let friends: Vec<Value> = resp
+            .friends
+            .iter()
+            .map(|f| {
+                json!({
+                    "account_id": f.account_id,
+                    "handle": f.handle,
+                    "state": f.state,
+                    "presence": f.presence,
+                    "client": f.client,
+                    "party_room_code": f.party_room_code,
+                    "joinable": f.joinable,
+                })
+            })
+            .collect();
+        let invites: Vec<Value> = resp
+            .pending_invites
+            .iter()
+            .map(|inv| {
+                json!({
+                    "party_id": inv.party_id,
+                    "room_code": inv.room_code,
+                    "from_handle": inv.from_handle,
+                    "created_at_ms": inv.created_at_ms,
+                })
+            })
+            .collect();
+        print_json(&json!({
+            "friends": friends,
+            "pending_invites": invites,
+        }));
+    } else {
+        if !resp.pending_invites.is_empty() {
+            println!("Pending party invites:");
+            for inv in &resp.pending_invites {
+                println!(
+                    "  ● @{} invited you (code {}) — run `mp-outpost join`",
+                    sanitize_cli_meta(inv.from_handle.trim_start_matches('@')),
+                    sanitize_cli_meta(&inv.room_code)
+                );
+            }
+            if !resp.friends.is_empty() {
+                println!();
+            }
+        }
+        if resp.friends.is_empty() {
+            if resp.pending_invites.is_empty() {
+                println!("No friends yet. Run `mp-outpost add @handle` to add someone.");
+            }
+        } else {
+            for f in &resp.friends {
+                let h = sanitize_cli_meta(f.handle.trim_start_matches('@'));
+                let icon = match f.presence.as_str() {
+                    "online" | "in_party" => "●",
+                    _ => "○",
+                };
+                let status = if f.state == "pending_in" {
+                    format!("incoming request — run `mp-outpost add @{h}`")
+                } else if f.state == "pending_out" {
+                    "request sent".to_string()
+                } else if f.presence == "in_party" {
+                    match (&f.party_room_code, f.joinable) {
+                        (Some(code), true) => {
+                            format!("in party ({}) [Join: mp-outpost join @{h}]", sanitize_cli_meta(code))
+                        }
+                        (Some(code), false) => format!("in party ({})", sanitize_cli_meta(code)),
+                        (None, true) => format!("in party [Join: mp-outpost join @{h}]"),
+                        (None, false) => "in party".to_string(),
+                    }
+                } else if f.presence == "online" {
+                    "online".to_string()
+                } else {
+                    "offline".to_string()
+                };
+                if opts.debug {
+                    println!("{icon} @{h} — {status} (account_id={})", f.account_id);
+                } else {
+                    println!("{icon} @{h} — {status}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_add_friend(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
+    let target_str = args
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| "usage: mp-outpost add @handle".to_string())?;
+    let (mut client, _) = connect_daemon_cli(opts, false, true).await?;
+    let clean_display = sanitize_cli_meta(target_str.trim().trim_start_matches('@'));
+    let target_id = resolve_account_target(&mut client, target_str).await?;
+    let raw = client
+        .request(IpcOpcode::FriendRequest, encode_u64_req(target_id))
+        .await
+        .map_err(|e| e.to_string())?;
+    let resp = decode_friend_edge_resp(&raw).map_err(|e| e.to_string())?;
+    let state_label = friend_state_label(resp.state);
+    if opts.json {
+        print_json(&json!({
+            "handle": clean_display,
+            "target_account_id": resp.target_account_id,
+            "state": resp.state,
+            "state_label": state_label,
+        }));
+    } else if resp.state == 0 {
+        println!("You and @{clean_display} are now friends.");
+    } else {
+        println!("Sent friend request to @{clean_display}.");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1951,7 +2530,7 @@ fn cmd_whoami(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
         }));
     } else if show_sn {
         println!("{sn}");
-    } else {
+    } else if opts.debug {
         println!(
             "account_id:    {}\ndevice_id:     {}\ndevice_label:  {}\napi_authority: {}\nrelay_policy:  {}\nsafety_number: {}",
             dev.account_id,
@@ -1960,6 +2539,12 @@ fn cmd_whoami(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
             dev.api_authority,
             relay_policy_name(dev.local_relay_policy as u8),
             sn
+        );
+    } else {
+        println!(
+            "device:  {}\nserver:  {}",
+            sanitize_cli_meta(&dev.device_label),
+            sanitize_cli_meta(&dev.api_authority),
         );
     }
     Ok(())
@@ -3238,12 +3823,12 @@ fn require_interactive_tty(op: &str) -> Result<File, String> {
 
 async fn cmd_peer(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     let Some(sub) = args.first().map(String::as_str) else {
-        return Err("usage: mp-outpost peer <list|trust|revoke> ...".to_string());
+        return Err("usage: mp-outpost peers <list|verify|trust|revoke> ...".to_string());
     };
     let rest = args.get(1..).unwrap_or_default();
     match sub {
         "list" => cmd_peer_list(opts, rest),
-        "trust" => cmd_peer_trust(opts, rest).await,
+        "trust" | "verify" => cmd_peer_trust(opts, rest).await,
         "revoke" => cmd_peer_revoke(opts, rest).await,
         other => Err(format!("unknown peer subcommand '{other}'")),
     }
@@ -3660,21 +4245,25 @@ async fn cmd_friend(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                     for f in &incoming {
                         let safe_h = sanitize_cli_meta(&f.handle);
                         let target_ref = if safe_h.is_empty() {
-                            f.account_id.to_string()
+                            if opts.debug {
+                                f.account_id.to_string()
+                            } else {
+                                "unknown".to_string()
+                            }
                         } else {
                             format!("@{safe_h}")
                         };
-                        if f.safety_number.is_empty() {
-                            println!("  {target_ref} (account_id={})", f.account_id);
-                        } else {
+                        if opts.debug {
                             println!(
                                 "  {target_ref} (account_id={} safety_number={})",
                                 f.account_id,
                                 sanitize_cli_meta(&f.safety_number)
                             );
+                        } else {
+                            println!("  {target_ref}");
                         }
                         println!(
-                            "    Accept: mp-outpost friend accept {target_ref}  |  Deny: mp-outpost friend deny {target_ref}"
+                            "    Accept: mp-outpost add {target_ref}  |  Deny: mp-outpost friend deny {target_ref}"
                         );
                     }
                 }
@@ -3685,23 +4274,41 @@ async fn cmd_friend(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                     }
                     for f in others {
                         let safe_h = sanitize_cli_meta(&f.handle);
-                        let handle_part = if safe_h.is_empty() {
-                            String::new()
+                        if opts.debug {
+                            let handle_part = if safe_h.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" handle=@{safe_h}")
+                            };
+                            let sn_part = if f.safety_number.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" safety_number={}", sanitize_cli_meta(&f.safety_number))
+                            };
+                            println!(
+                                "account_id={}{handle_part} state={} ({}) presence={}{sn_part}",
+                                f.account_id,
+                                friend_state_label(f.state),
+                                f.state,
+                                f.presence_status
+                            );
                         } else {
-                            format!(" handle=@{safe_h}")
-                        };
-                        let sn_part = if f.safety_number.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" safety_number={}", sanitize_cli_meta(&f.safety_number))
-                        };
-                        println!(
-                            "account_id={}{handle_part} state={} ({}) presence={}{sn_part}",
-                            f.account_id,
-                            friend_state_label(f.state),
-                            f.state,
-                            f.presence_status
-                        );
+                            let icon = if f.presence_status > 0 { "●" } else { "○" };
+                            let label = if safe_h.is_empty() {
+                                "friend".to_string()
+                            } else {
+                                format!("@{safe_h}")
+                            };
+                            let status = match (f.state, f.presence_status) {
+                                (0, 2) => "in party",
+                                (0, 1) => "online",
+                                (0, _) => "offline",
+                                (1, _) => "request sent",
+                                (3, _) => "blocked",
+                                _ => friend_state_label(f.state),
+                            };
+                            println!("{icon} {label} — {status}");
+                        }
                     }
                 }
             }
@@ -4262,14 +4869,32 @@ async fn cmd_party(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                 println!("No active party.");
             } else {
                 for p in &resp.parties {
-                    println!(
-                        "party_id={} epoch={} policy={} members={} next_seq={}",
-                        p.party_id,
-                        p.party_epoch,
-                        relay_policy_name(p.relay_policy),
-                        p.member_count,
-                        p.next_seq
-                    );
+                    if opts.debug {
+                        println!(
+                            "party_id={} code={} epoch={} policy={} members={} next_seq={}",
+                            p.party_id,
+                            sanitize_cli_meta(&p.room_code),
+                            p.party_epoch,
+                            relay_policy_name(p.relay_policy),
+                            p.member_count,
+                            p.next_seq
+                        );
+                    } else {
+                        let title = if p.room_name.is_empty() {
+                            "Active party".to_string()
+                        } else {
+                            sanitize_cli_meta(&p.room_name)
+                        };
+                        if p.room_code.is_empty() {
+                            println!("● {title} · {} live", p.member_count);
+                        } else {
+                            println!(
+                                "● {title} (code {}) · {} live",
+                                sanitize_cli_meta(&p.room_code),
+                                p.member_count
+                            );
+                        }
+                    }
                 }
             }
             Ok(())
@@ -4310,15 +4935,35 @@ async fn cmd_party(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                 }));
             } else {
                 for m in &resp.members {
-                    println!(
-                        "device={} account={} handle={} trust={} p2p={} sn={}",
-                        m.device_id,
-                        m.account_id,
-                        sanitize_cli_meta(&m.server_handle),
-                        trust_state_name(m.trust_state),
-                        m.connected_p2p,
-                        m.safety_number
-                    );
+                    if opts.debug {
+                        println!(
+                            "device={} account={} handle={} trust={} p2p={} sn={}",
+                            m.device_id,
+                            m.account_id,
+                            sanitize_cli_meta(&m.server_handle),
+                            trust_state_name(m.trust_state),
+                            m.connected_p2p,
+                            m.safety_number
+                        );
+                    } else {
+                        let icon = if m.connected_p2p || m.connected_mp1 {
+                            "●"
+                        } else {
+                            "○"
+                        };
+                        let handle = sanitize_cli_meta(m.server_handle.trim_start_matches('@'));
+                        let display = if handle.is_empty() {
+                            "member".to_string()
+                        } else {
+                            format!("@{handle}")
+                        };
+                        let state = if m.connected_p2p || m.connected_mp1 {
+                            "live"
+                        } else {
+                            "away"
+                        };
+                        println!("{icon} {display} ({state})");
+                    }
                 }
             }
             Ok(())
@@ -4372,8 +5017,10 @@ async fn cmd_party(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                     "withheld_unpinned": resp.withheld_unpinned,
                     "disconnected": resp.disconnected,
                 }));
-            } else {
+            } else if opts.debug {
                 println!("Delivered to devices {:?}", resp.delivered_to);
+            } else {
+                println!("Sent.");
             }
             Ok(())
         }
@@ -6305,17 +6952,49 @@ fn print_status_resp(opts: &GlobalOpts, st: &crate::ipc_payloads::StatusResp) {
             "control_ws_connected": st.control_ws_connected,
             "dual_host_churn_alert": st.dual_host_churn_alert,
             "active_party_id": st.active_party.as_ref().map(|p| p.party_id),
+            "active_party_room_code": st.active_party.as_ref().map(|p| p.room_code.as_str()),
         }));
-    } else {
+    } else if opts.debug {
         println!(
-            "account_id={} device_id={} pid={} epoch={} ws={} active_party={:?}",
+            "account_id={} device_id={} handle=@{} pid={} epoch={} ws={} active_party={:?}",
             st.account_id,
             st.device_id,
+            sanitize_cli_meta(&st.handle),
             st.daemon_pid,
             st.daemon_epoch,
             st.control_ws_connected,
             st.active_party.as_ref().map(|p| p.party_id)
         );
+    } else {
+        let who = if st.handle.is_empty() {
+            "Signed in".to_string()
+        } else {
+            format!("@{}", sanitize_cli_meta(st.handle.trim_start_matches('@')))
+        };
+        let conn = if st.control_ws_connected {
+            "● Online"
+        } else {
+            "◐ Reconnecting…"
+        };
+        println!("{who} · {conn}");
+        if let Some(ref p) = st.active_party {
+            let title = if p.room_name.is_empty() {
+                "Active party".to_string()
+            } else {
+                sanitize_cli_meta(&p.room_name)
+            };
+            if p.room_code.is_empty() {
+                println!("Party: {title} · {} live", p.member_count);
+            } else {
+                println!(
+                    "Party: {title} (code {}) · {} live",
+                    sanitize_cli_meta(&p.room_code),
+                    p.member_count
+                );
+            }
+        } else {
+            println!("Party: none (run `mp-outpost invite` or `mp-outpost join`)");
+        }
     }
 }
 
@@ -6413,13 +7092,22 @@ fn print_poll_resp(
                     let payload = format!(
                         "scope: {room_scope}\ntarget: {target_selector}\n{body}"
                     );
-                    println!(
-                        "[seq={} from={}({})]\n{}",
-                        ev.event_seq,
-                        sanitize_cli_meta(&provenance.sender_handle),
-                        provenance.sender_account_id,
-                        fence_peer_text(&payload, nonce)
-                    );
+                    if opts.debug {
+                        println!(
+                            "[seq={} from={}({})]\n{}",
+                            ev.event_seq,
+                            sanitize_cli_meta(&provenance.sender_handle),
+                            provenance.sender_account_id,
+                            fence_peer_text(&payload, nonce)
+                        );
+                    } else {
+                        println!(
+                            "[#{} @{}]\n{}",
+                            ev.event_seq,
+                            sanitize_cli_meta(provenance.sender_handle.trim_start_matches('@')),
+                            fence_peer_text(&payload, nonce)
+                        );
+                    }
                 }
                 IpcPartyEventKind::BridgeEnvelope {
                     provenance,
@@ -6430,14 +7118,23 @@ fn print_poll_resp(
                         "scope: {room_scope}\npayload_b64: {}",
                         B64.encode(payload)
                     );
-                    println!(
-                        "[seq={} board from={}({}) bytes={}]\n{}",
-                        ev.event_seq,
-                        sanitize_cli_meta(&provenance.sender_handle),
-                        provenance.sender_account_id,
-                        payload.len(),
-                        fence_peer_text(&fenced_body, nonce)
-                    );
+                    if opts.debug {
+                        println!(
+                            "[seq={} board from={}({}) bytes={}]\n{}",
+                            ev.event_seq,
+                            sanitize_cli_meta(&provenance.sender_handle),
+                            provenance.sender_account_id,
+                            payload.len(),
+                            fence_peer_text(&fenced_body, nonce)
+                        );
+                    } else {
+                        println!(
+                            "[#{} card @{}]\n{}",
+                            ev.event_seq,
+                            sanitize_cli_meta(provenance.sender_handle.trim_start_matches('@')),
+                            fence_peer_text(&fenced_body, nonce)
+                        );
+                    }
                 }
                 IpcPartyEventKind::ControlNotice {
                     provenance, text, ..

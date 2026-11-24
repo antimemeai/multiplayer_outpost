@@ -316,6 +316,9 @@ pub struct ActivePartySummary {
     pub member_count: u8,
     pub next_seq: u64,
     pub daemon_epoch: u64,
+    pub room_code: String,
+    pub room_name: String,
+    pub share_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -648,6 +651,84 @@ pub struct ResolveHandleResp {
     pub root_pubkey: [u8; 32],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoomInviteIpcReq {
+    pub handle: Option<String>,
+    pub party_id: Option<u64>,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomInviteIpcResp {
+    pub party_id: u64,
+    pub room_code: String,
+    pub share_url: String,
+    pub handle_url: String,
+    pub ws_path: String,
+    pub invited_handle: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoomEnterIpcReq {
+    pub target: String,
+    pub agent_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomMemberIpc {
+    pub account_id: u64,
+    pub handle: String,
+    pub client: String,
+    pub agent_name: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomEnterIpcResp {
+    pub party_id: u64,
+    pub room_code: String,
+    pub name: String,
+    pub share_url: String,
+    pub ws_path: String,
+    pub members: Vec<RoomMemberIpc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoomLeaveIpcReq {
+    pub party_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomLeaveIpcResp {
+    pub left: bool,
+    pub party_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveFriendIpc {
+    pub account_id: u64,
+    pub handle: String,
+    pub state: String,
+    pub presence: String,
+    pub client: Option<String>,
+    pub party_room_code: Option<String>,
+    pub joinable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInviteIpc {
+    pub party_id: u64,
+    pub room_code: String,
+    pub from_handle: String,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FriendsLiveIpcResp {
+    pub friends: Vec<LiveFriendIpc>,
+    pub pending_invites: Vec<PendingInviteIpc>,
+}
+
 // ---------------------------------------------------------------------------
 // Encoders / Decoders
 // ---------------------------------------------------------------------------
@@ -666,6 +747,9 @@ fn write_party_summary(w: &mut Writer, p: &ActivePartySummary) -> Result<(), Ipc
     w.u8(p.member_count);
     w.u64(p.next_seq);
     w.u64(p.daemon_epoch);
+    w.str_u16(&p.room_code)?;
+    w.str_u16(&p.room_name)?;
+    w.str_u16(&p.share_url)?;
     Ok(())
 }
 
@@ -684,6 +768,9 @@ fn read_party_summary(r: &mut Reader<'_>) -> Result<ActivePartySummary, IpcWireE
         member_count: r.u8()?,
         next_seq: r.u64()?,
         daemon_epoch: r.u64()?,
+        room_code: r.str_u16(32)?,
+        room_name: r.str_u16(128)?,
+        share_url: r.str_u16(512)?,
     })
 }
 
@@ -1815,6 +1902,213 @@ pub fn poll_resp_to_board_events(r: PartyPollIpcResp) -> outpost_mcp::BoardReadR
         gap_possible: r.gap_possible,
         events,
     }
+}
+
+pub fn encode_room_invite_req(req: &RoomInviteIpcReq) -> Result<Vec<u8>, IpcWireError> {
+    let mut w = Writer::new();
+    w.opt_str_u16(req.handle.as_deref())?;
+    w.opt_u64(req.party_id);
+    w.opt_str_u16(req.name.as_deref())?;
+    Ok(w.finish())
+}
+
+pub fn decode_room_invite_req(bytes: &[u8]) -> Result<RoomInviteIpcReq, IpcWireError> {
+    let mut r = Reader::new(bytes);
+    let handle = r.opt_str_u16(128)?;
+    let party_id = r.opt_u64()?;
+    let name = r.opt_str_u16(128)?;
+    r.finish()?;
+    Ok(RoomInviteIpcReq {
+        handle,
+        party_id,
+        name,
+    })
+}
+
+pub fn encode_room_invite_resp(resp: &RoomInviteIpcResp) -> Result<Vec<u8>, IpcWireError> {
+    let mut w = Writer::new();
+    w.u64(resp.party_id);
+    w.str_u16(&resp.room_code)?;
+    w.str_u16(&resp.share_url)?;
+    w.str_u16(&resp.handle_url)?;
+    w.str_u16(&resp.ws_path)?;
+    w.opt_str_u16(resp.invited_handle.as_deref())?;
+    Ok(w.finish())
+}
+
+pub fn decode_room_invite_resp(bytes: &[u8]) -> Result<RoomInviteIpcResp, IpcWireError> {
+    let mut r = Reader::new(bytes);
+    let party_id = r.u64()?;
+    let room_code = r.str_u16(32)?;
+    let share_url = r.str_u16(512)?;
+    let handle_url = r.str_u16(512)?;
+    let ws_path = r.str_u16(256)?;
+    let invited_handle = r.opt_str_u16(128)?;
+    r.finish()?;
+    Ok(RoomInviteIpcResp {
+        party_id,
+        room_code,
+        share_url,
+        handle_url,
+        ws_path,
+        invited_handle,
+    })
+}
+
+pub fn encode_room_enter_req(req: &RoomEnterIpcReq) -> Result<Vec<u8>, IpcWireError> {
+    let mut w = Writer::new();
+    w.str_u16(&req.target)?;
+    w.opt_str_u16(req.agent_name.as_deref())?;
+    Ok(w.finish())
+}
+
+pub fn decode_room_enter_req(bytes: &[u8]) -> Result<RoomEnterIpcReq, IpcWireError> {
+    let mut r = Reader::new(bytes);
+    let target = r.str_u16(512)?;
+    let agent_name = r.opt_str_u16(128)?;
+    r.finish()?;
+    Ok(RoomEnterIpcReq { target, agent_name })
+}
+
+pub fn encode_room_enter_resp(resp: &RoomEnterIpcResp) -> Result<Vec<u8>, IpcWireError> {
+    let mut w = Writer::new();
+    w.u64(resp.party_id);
+    w.str_u16(&resp.room_code)?;
+    w.str_u16(&resp.name)?;
+    w.str_u16(&resp.share_url)?;
+    w.str_u16(&resp.ws_path)?;
+    let len = u16::try_from(resp.members.len()).map_err(|_| IpcWireError::BodyTooLarge)?;
+    w.u16(len);
+    for m in &resp.members {
+        w.u64(m.account_id);
+        w.str_u16(&m.handle)?;
+        w.str_u16(&m.client)?;
+        w.opt_str_u16(m.agent_name.as_deref())?;
+        w.str_u16(&m.status)?;
+    }
+    Ok(w.finish())
+}
+
+pub fn decode_room_enter_resp(bytes: &[u8]) -> Result<RoomEnterIpcResp, IpcWireError> {
+    let mut r = Reader::new(bytes);
+    let party_id = r.u64()?;
+    let room_code = r.str_u16(32)?;
+    let name = r.str_u16(128)?;
+    let share_url = r.str_u16(512)?;
+    let ws_path = r.str_u16(256)?;
+    let count = usize::from(r.u16()?);
+    if count > MAX_LIST_ITEMS {
+        return Err(IpcWireError::BodyTooLarge);
+    }
+    let mut members = Vec::with_capacity(count);
+    for _ in 0..count {
+        members.push(RoomMemberIpc {
+            account_id: r.u64()?,
+            handle: r.str_u16(128)?,
+            client: r.str_u16(64)?,
+            agent_name: r.opt_str_u16(128)?,
+            status: r.str_u16(64)?,
+        });
+    }
+    r.finish()?;
+    Ok(RoomEnterIpcResp {
+        party_id,
+        room_code,
+        name,
+        share_url,
+        ws_path,
+        members,
+    })
+}
+
+pub fn encode_room_leave_req(req: &RoomLeaveIpcReq) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.opt_u64(req.party_id);
+    w.finish()
+}
+
+pub fn decode_room_leave_req(bytes: &[u8]) -> Result<RoomLeaveIpcReq, IpcWireError> {
+    let mut r = Reader::new(bytes);
+    let party_id = r.opt_u64()?;
+    r.finish()?;
+    Ok(RoomLeaveIpcReq { party_id })
+}
+
+pub fn encode_room_leave_resp(resp: &RoomLeaveIpcResp) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.bool(resp.left);
+    w.u64(resp.party_id);
+    w.finish()
+}
+
+pub fn decode_room_leave_resp(bytes: &[u8]) -> Result<RoomLeaveIpcResp, IpcWireError> {
+    let mut r = Reader::new(bytes);
+    let left = r.bool()?;
+    let party_id = r.u64()?;
+    r.finish()?;
+    Ok(RoomLeaveIpcResp { left, party_id })
+}
+
+pub fn encode_friends_live_resp(resp: &FriendsLiveIpcResp) -> Result<Vec<u8>, IpcWireError> {
+    let mut w = Writer::new();
+    let f_len = u16::try_from(resp.friends.len()).map_err(|_| IpcWireError::BodyTooLarge)?;
+    w.u16(f_len);
+    for f in &resp.friends {
+        w.u64(f.account_id);
+        w.str_u16(&f.handle)?;
+        w.str_u16(&f.state)?;
+        w.str_u16(&f.presence)?;
+        w.opt_str_u16(f.client.as_deref())?;
+        w.opt_str_u16(f.party_room_code.as_deref())?;
+        w.bool(f.joinable);
+    }
+    let i_len = u16::try_from(resp.pending_invites.len()).map_err(|_| IpcWireError::BodyTooLarge)?;
+    w.u16(i_len);
+    for inv in &resp.pending_invites {
+        w.u64(inv.party_id);
+        w.str_u16(&inv.room_code)?;
+        w.str_u16(&inv.from_handle)?;
+        w.u64(inv.created_at_ms);
+    }
+    Ok(w.finish())
+}
+
+pub fn decode_friends_live_resp(bytes: &[u8]) -> Result<FriendsLiveIpcResp, IpcWireError> {
+    let mut r = Reader::new(bytes);
+    let f_count = usize::from(r.u16()?);
+    if f_count > MAX_LIST_ITEMS {
+        return Err(IpcWireError::BodyTooLarge);
+    }
+    let mut friends = Vec::with_capacity(f_count);
+    for _ in 0..f_count {
+        friends.push(LiveFriendIpc {
+            account_id: r.u64()?,
+            handle: r.str_u16(128)?,
+            state: r.str_u16(64)?,
+            presence: r.str_u16(64)?,
+            client: r.opt_str_u16(64)?,
+            party_room_code: r.opt_str_u16(32)?,
+            joinable: r.bool()?,
+        });
+    }
+    let i_count = usize::from(r.u16()?);
+    if i_count > MAX_LIST_ITEMS {
+        return Err(IpcWireError::BodyTooLarge);
+    }
+    let mut pending_invites = Vec::with_capacity(i_count);
+    for _ in 0..i_count {
+        pending_invites.push(PendingInviteIpc {
+            party_id: r.u64()?,
+            room_code: r.str_u16(32)?,
+            from_handle: r.str_u16(128)?,
+            created_at_ms: r.u64()?,
+        });
+    }
+    r.finish()?;
+    Ok(FriendsLiveIpcResp {
+        friends,
+        pending_invites,
+    })
 }
 
 #[cfg(test)]

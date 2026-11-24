@@ -82,6 +82,10 @@ pub enum WsConnectError {
     UpgradeRejected(u16),
     /// Server did not echo `Sec-WebSocket-Protocol: mp1`.
     MissingMp1Subprotocol,
+    /// Server did not echo the expected `Sec-WebSocket-Protocol` (e.g. `mp2`).
+    MissingSubprotocol {
+        expected: &'static str,
+    },
     /// Server negotiated a forbidden extension (e.g. `permessage-deflate`).
     ForbiddenExtension,
     /// Server upgrade response headers exceeded the `8 KiB` cap.
@@ -108,6 +112,9 @@ impl fmt::Display for WsConnectError {
             Self::UpgradeRejected(code) => write!(f, "WebSocket upgrade rejected with HTTP {code}"),
             Self::MissingMp1Subprotocol => {
                 write!(f, "server did not echo Sec-WebSocket-Protocol: mp1")
+            }
+            Self::MissingSubprotocol { expected } => {
+                write!(f, "server did not echo Sec-WebSocket-Protocol: {expected}")
             }
             Self::ForbiddenExtension => {
                 write!(f, "server returned forbidden Sec-WebSocket-Extensions header")
@@ -181,13 +188,13 @@ pub enum Mp1WsEvent {
 
 /// Stream adapter that replays bytes already read past `\r\n\r\n` during the manual
 /// HTTP/1.1 `101 Switching Protocols` handshake before delegating reads to `inner`.
-struct PrefixedIo<S> {
+pub(crate) struct PrefixedIo<S> {
     prefix: Bytes,
     inner: S,
 }
 
 impl<S> PrefixedIo<S> {
-    fn new(prefix: Bytes, inner: S) -> Self {
+    pub(crate) fn new(prefix: Bytes, inner: S) -> Self {
         Self { prefix, inner }
     }
 }
@@ -459,7 +466,7 @@ impl Mp1WsClient {
 // Owned Bounded HTTP/1.1 RFC 6455 Upgrade Handshake & FIPS 180-4 SHA-1
 // ---------------------------------------------------------------------------
 
-fn generate_ws_key() -> Result<String, WsConnectError> {
+pub(crate) fn generate_ws_key() -> Result<String, WsConnectError> {
     let mut raw = [0u8; 16];
     getrandom::getrandom(&mut raw)
         .map_err(|e| WsConnectError::Transport(ControlError::RandomFailure(e.to_string())))?;
@@ -477,9 +484,28 @@ fn build_ws_upgrade_request(
     signature_input: &str,
     signature: &str,
 ) -> Result<Vec<u8>, WsConnectError> {
+    build_ws_upgrade_request_with_protocol(
+        authority,
+        path,
+        ws_key,
+        "mp1",
+        signature_input,
+        signature,
+    )
+}
+
+pub(crate) fn build_ws_upgrade_request_with_protocol(
+    authority: &str,
+    path: &str,
+    ws_key: &str,
+    subprotocol: &str,
+    signature_input: &str,
+    signature: &str,
+) -> Result<Vec<u8>, WsConnectError> {
     if contains_crlf_or_ctl(authority)
         || contains_crlf_or_ctl(path)
         || contains_crlf_or_ctl(ws_key)
+        || contains_crlf_or_ctl(subprotocol)
         || contains_crlf_or_ctl(signature_input)
         || contains_crlf_or_ctl(signature)
     {
@@ -495,7 +521,7 @@ fn build_ws_upgrade_request(
          Connection: Upgrade\r\n\
          Sec-WebSocket-Key: {ws_key}\r\n\
          Sec-WebSocket-Version: 13\r\n\
-         Sec-WebSocket-Protocol: mp1\r\n\
+         Sec-WebSocket-Protocol: {subprotocol}\r\n\
          Signature-Input: {signature_input}\r\n\
          Signature: {signature}\r\n\
          \r\n"
@@ -606,6 +632,14 @@ async fn perform_bounded_upgrade_read<S: AsyncRead + Unpin>(
     stream: &mut S,
     ws_key: &str,
 ) -> Result<Bytes, WsConnectError> {
+    perform_bounded_upgrade_read_with_protocol(stream, ws_key, "mp1").await
+}
+
+pub(crate) async fn perform_bounded_upgrade_read_with_protocol<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    ws_key: &str,
+    expected_protocol: &'static str,
+) -> Result<Bytes, WsConnectError> {
     // Allow up to MAX_RESPONSE_HEADERS_BYTES for the header section plus 4 bytes for `\r\n\r\n`.
     let max_read_before_delim = MAX_RESPONSE_HEADERS_BYTES + 4;
     let mut buf = Vec::with_capacity(2048);
@@ -663,7 +697,7 @@ async fn perform_bounded_upgrade_read<S: AsyncRead + Unpin>(
         return Err(classify_http_status(parsed.status));
     }
 
-    validate_101_headers(&parsed.headers, ws_key)?;
+    validate_101_headers(&parsed.headers, ws_key, expected_protocol)?;
     Ok(Bytes::from(leftover_bytes))
 }
 
@@ -791,6 +825,7 @@ async fn read_bounded_chunked_body<S: AsyncRead + Unpin>(
 fn validate_101_headers(
     headers: &[(String, String)],
     ws_key: &str,
+    expected_protocol: &'static str,
 ) -> Result<(), WsConnectError> {
     let mut upgrade_count: usize = 0;
     let mut connection_has_upgrade = false;
@@ -850,8 +885,13 @@ fn validate_101_headers(
         ));
     }
 
-    if proto_count != 1 || proto_value != Some("mp1") {
-        return Err(WsConnectError::MissingMp1Subprotocol);
+    if proto_count != 1 || proto_value != Some(expected_protocol) {
+        if expected_protocol == "mp1" {
+            return Err(WsConnectError::MissingMp1Subprotocol);
+        }
+        return Err(WsConnectError::MissingSubprotocol {
+            expected: expected_protocol,
+        });
     }
 
     Ok(())

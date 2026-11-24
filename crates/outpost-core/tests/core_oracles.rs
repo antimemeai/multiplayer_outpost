@@ -34,7 +34,8 @@ use outpost_core::p2p_wire::{
 };
 use outpost_core::party_state::{
     DedupeCache, DedupeLookup, DedupeOutcome, EpochFloorStore, MAX_POLL_MAX_BYTES, PartyEventBody,
-    PartyEventRing, PeerSendCandidate, SendPlanError, SendTarget, plan_send_recipients,
+    PartyEventRing, PeerSendCandidate, SendPlanError, SendTarget, SendTrustPolicy,
+    plan_send_recipients, plan_send_recipients_with_policy,
 };
 use outpost_core::storage_codec::{
     DaemonInfoRecord, DefaultDeviceRecord, DeviceRecord, EpochFloorEntry, EpochsStoreRecord,
@@ -568,7 +569,7 @@ fn ipc_wire_2mib_bounds_ready_pipe_and_zero_respawn_war_policy() {
     }
 
     // A/B/A version coexistence oracle: compatible builds NEVER kill each other; mcp NEVER kills!
-    assert_eq!(IPC_SCHEMA_VER, 3);
+    assert_eq!(IPC_SCHEMA_VER, 4);
     let local_a = HelloPayload {
         ipc_schema_ver: IPC_SCHEMA_VER,
         build_order: 100,
@@ -672,7 +673,8 @@ fn party_ring_cursor_reset_byte_budget_dedupe_and_send_planner() {
     assert!(epochs.check_and_advance(auth_h, 5001, 6, true, 102).is_ok());
     assert!(epochs.check_and_advance(auth_h, 5001, 7, false, 103).is_err());
 
-    // Per-destination trust send planner (no late-joiner DoS!)
+    // Per-destination trust send planner:
+    // 1. Default policy (AllowUnpinnedAuthenticated): unpinned connected peers deliver cleanly!
     let peers = vec![
         PeerSendCandidate {
             account_id: 1001,
@@ -685,19 +687,60 @@ fn party_ring_cursor_reset_byte_budget_dedupe_and_send_planner() {
             account_id: 1002,
             device_id: 2002,
             trust: TrustState::Unpinned,
-            connected_p2p: false,
+            connected_p2p: true,
+            key_mismatch: false,
+        },
+        PeerSendCandidate {
+            account_id: 1003,
+            device_id: 2003,
+            trust: TrustState::RevokedBlocked,
+            connected_p2p: true,
             key_mismatch: false,
         },
     ];
-    let bcast = plan_send_recipients(&peers, SendTarget::Broadcast).expect("broadcast to pinned");
-    assert_eq!(bcast.deliver_to, vec![2001]);
-    assert_eq!(bcast.withheld_unpinned, vec![1002]);
+    let default_bcast =
+        plan_send_recipients(&peers, SendTarget::Broadcast).expect("default broadcast delivers to unpinned");
+    assert_eq!(default_bcast.deliver_to, vec![2001, 2002]);
+    assert!(default_bcast.withheld_unpinned.is_empty());
+    let default_targeted =
+        plan_send_recipients(&peers, SendTarget::Device(2002)).expect("default targeted to unpinned");
+    assert_eq!(default_targeted.deliver_to, vec![2002]);
+    assert_eq!(
+        plan_send_recipients(&peers, SendTarget::Device(2003)),
+        Err(SendPlanError::TargetRevoked { account_id: 1003 })
+    );
 
-    // Any key_mismatch in party -> hard fail closed!
+    // 2. Opt-in StrictManualPins (--strict-pins): unpinned peer is withheld / rejected
+    let strict_bcast = plan_send_recipients_with_policy(
+        &peers,
+        SendTarget::Broadcast,
+        SendTrustPolicy::StrictManualPins,
+    )
+    .expect("strict broadcast to pinned");
+    assert_eq!(strict_bcast.deliver_to, vec![2001]);
+    assert_eq!(strict_bcast.withheld_unpinned, vec![1002]);
+    assert_eq!(
+        plan_send_recipients_with_policy(
+            &peers,
+            SendTarget::Device(2002),
+            SendTrustPolicy::StrictManualPins,
+        ),
+        Err(SendPlanError::TargetNotPinned { account_id: 1002 })
+    );
+
+    // 3. Any key_mismatch in party -> hard fail closed under BOTH policies!
     let mut poisoned = peers.clone();
     poisoned[1].key_mismatch = true;
     assert_eq!(
         plan_send_recipients(&poisoned, SendTarget::Broadcast),
+        Err(SendPlanError::KeyMismatchPresent { account_id: 1002 })
+    );
+    assert_eq!(
+        plan_send_recipients_with_policy(
+            &poisoned,
+            SendTarget::Broadcast,
+            SendTrustPolicy::StrictManualPins,
+        ),
         Err(SendPlanError::KeyMismatchPresent { account_id: 1002 })
     );
 }

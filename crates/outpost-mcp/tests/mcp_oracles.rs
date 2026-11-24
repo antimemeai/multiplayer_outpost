@@ -21,10 +21,10 @@ use outpost_core::fence::SecretMatchKind;
 use outpost_core::ipc_wire::IPC_SCHEMA_VER;
 use outpost_mcp::{
     BackendError, BoardEnvelopeEvent, BoardPostReq, BoardReadResp, BoxFuture, CancellationToken,
-    DEFAULT_WAIT_TIMEOUT_MS, MAX_LINE_BYTES, MAX_WAIT_TIMEOUT_MS, McpOutpostBackend,
-    McpPartyEvent, McpPartyEventKind, McpServerConfig, PartyPollReq, PartyPollResp, PartySendReq,
-    PartyWaitReq, PeerProvenance, ProgressSender, SERVER_NAME, SERVER_VERSION, TOOL_NAMES,
-    run_stdio_with_io,
+    DEFAULT_WAIT_TIMEOUT_MS, FriendAddReq, MAX_LINE_BYTES, MAX_WAIT_TIMEOUT_MS, McpOutpostBackend,
+    McpPartyEvent, McpPartyEventKind, McpServerConfig, PartyInviteReq, PartyJoinReq, PartyLeaveReq,
+    PartyPollReq, PartyPollResp, PartySendReq, PartyWaitReq, PeerProvenance, ProgressSender,
+    SERVER_NAME, SERVER_VERSION, TOOL_NAMES, run_stdio_with_io,
 };
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -41,6 +41,10 @@ struct MockState {
     recorded_board_posts: Vec<BoardPostReq>,
     recorded_waits: Vec<PartyWaitReq>,
     recorded_wait_had_progress: Vec<bool>,
+    recorded_invites: Vec<PartyInviteReq>,
+    recorded_joins: Vec<PartyJoinReq>,
+    recorded_leaves: Vec<PartyLeaveReq>,
+    recorded_friend_adds: Vec<FriendAddReq>,
 }
 
 enum WaitBehavior {
@@ -240,7 +244,63 @@ impl McpOutpostBackend for MockBackend {
     fn party_friends(&self) -> BoxFuture<'_, Result<Value, BackendError>> {
         Box::pin(async move {
             self.total_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(json!({ "friends": [] }))
+            Ok(json!({ "friends": [], "pending_invites": [] }))
+        })
+    }
+
+    fn party_invite(&self, req: PartyInviteReq) -> BoxFuture<'_, Result<Value, BackendError>> {
+        Box::pin(async move {
+            self.total_calls.fetch_add(1, Ordering::SeqCst);
+            let invited = req.handle.clone();
+            self.lock_state().recorded_invites.push(req);
+            Ok(json!({
+                "party_id": 7001,
+                "room_code": "KAIH",
+                "share_url": "https://multiplayer.tech/p/KAIH",
+                "handle_url": "https://multiplayer.tech/@alice",
+                "ws_path": "/v1/parties/7001/ws",
+                "invited_handle": invited
+            }))
+        })
+    }
+
+    fn party_join(&self, req: PartyJoinReq) -> BoxFuture<'_, Result<Value, BackendError>> {
+        Box::pin(async move {
+            self.total_calls.fetch_add(1, Ordering::SeqCst);
+            self.lock_state().recorded_joins.push(req);
+            Ok(json!({
+                "party_id": 7001,
+                "room_code": "KAIH",
+                "name": "alice's party",
+                "share_url": "https://multiplayer.tech/p/KAIH",
+                "ws_path": "/v1/parties/7001/ws",
+                "members": [
+                    { "account_id": 1001, "handle": "alice", "client": "blackbird", "status": "live" }
+                ]
+            }))
+        })
+    }
+
+    fn party_leave(&self, req: PartyLeaveReq) -> BoxFuture<'_, Result<Value, BackendError>> {
+        Box::pin(async move {
+            self.total_calls.fetch_add(1, Ordering::SeqCst);
+            let pid = req.party_id.unwrap_or(7001);
+            self.lock_state().recorded_leaves.push(req);
+            Ok(json!({ "left": true, "party_id": pid }))
+        })
+    }
+
+    fn friend_add(&self, req: FriendAddReq) -> BoxFuture<'_, Result<Value, BackendError>> {
+        Box::pin(async move {
+            self.total_calls.fetch_add(1, Ordering::SeqCst);
+            let handle = req.handle.clone();
+            self.lock_state().recorded_friend_adds.push(req);
+            Ok(json!({
+                "handle": handle.trim_start_matches('@'),
+                "account_id": 1002,
+                "state": 0,
+                "state_label": "friend"
+            }))
         })
     }
 }
@@ -384,12 +444,12 @@ async fn oracle_1_lazy_init_version_negotiation_and_structured_content_gating() 
             "instructions must warn host model about untrusted peer content"
         );
 
-        // Verify exact 9 Spec v2 tools and zero collision with sibling MCP servers.
+        // Verify exact 13 tools and zero collision with sibling MCP servers.
         let tools = ptr(&list_reply, "/result/tools")
             .as_array()
             .map(Vec::as_slice)
             .unwrap_or_default();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 13);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str))
@@ -1507,7 +1567,7 @@ async fn oracle_8_identity_portability_secret_refusal_kind_codes() {
 /// (schema 1) without retrying.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oracle_9_gate2_schema_v2_refuses_stale_v01_daemon() {
-    assert_eq!(IPC_SCHEMA_VER, 3);
+    assert_eq!(IPC_SCHEMA_VER, 4);
     let backend = MockBackend::new();
     backend
         .lock_state()
@@ -1547,6 +1607,111 @@ async fn oracle_9_gate2_schema_v2_refuses_stale_v01_daemon() {
         IPC_SCHEMA_VER
     );
     assert_eq!(backend.send_calls.load(Ordering::SeqCst), 1);
+
+    let _ = h.close_and_wait().await;
+}
+
+/// Test 10 (Xbox Live MCP Parity): `party_invite`, `party_join`, `party_leave`, and `friend_add`
+/// validate arguments strictly and dispatch cleanly through `McpOutpostBackend`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oracle_10_xbox_live_party_lifecycle_and_friend_add_tools() {
+    let backend = MockBackend::new();
+    let mut h = PipeHarness::spawn(Arc::clone(&backend), McpServerConfig::default());
+
+    h.send_json(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18" }
+    }));
+    let _ = h.read_json_line();
+
+    // 1. party_invite with handle + name
+    h.send_json(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "party_invite",
+            "arguments": { "handle": "@phall", "name": "Friday Build" }
+        }
+    }));
+    let inv_reply = h.read_json_line();
+    assert_eq!(ptr(&inv_reply, "/result/isError"), false);
+    assert_eq!(ptr(&inv_reply, "/result/structuredContent/room_code"), "KAIH");
+    assert_eq!(
+        ptr(&inv_reply, "/result/structuredContent/invited_handle"),
+        "@phall"
+    );
+
+    // 2. party_invite with empty args (bare invite)
+    h.send_json(&json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": { "name": "party_invite", "arguments": {} }
+    }));
+    let bare_inv = h.read_json_line();
+    assert_eq!(ptr(&bare_inv, "/result/isError"), false);
+
+    // 3. party_join with target and bare party_join (latest pending invite)
+    h.send_json(&json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": { "name": "party_join", "arguments": { "target": "KAIH" } }
+    }));
+    let join_code = h.read_json_line();
+    assert_eq!(ptr(&join_code, "/result/isError"), false);
+    assert_eq!(ptr(&join_code, "/result/structuredContent/party_id"), 7001);
+
+    h.send_json(&json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": { "name": "party_join", "arguments": {} }
+    }));
+    let join_latest = h.read_json_line();
+    assert_eq!(ptr(&join_latest, "/result/isError"), false);
+
+    // 4. party_leave (bare active party)
+    h.send_json(&json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": { "name": "party_leave", "arguments": {} }
+    }));
+    let leave_reply = h.read_json_line();
+    assert_eq!(ptr(&leave_reply, "/result/isError"), false);
+    assert_eq!(ptr(&leave_reply, "/result/structuredContent/left"), true);
+
+    // 5. friend_add requires handle; missing handle -> -32602
+    h.send_json(&json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": { "name": "friend_add", "arguments": {} }
+    }));
+    let bad_friend = h.read_json_line();
+    assert_eq!(ptr(&bad_friend, "/error/code"), -32602);
+
+    h.send_json(&json!({
+        "jsonrpc": "2.0",
+        "id": 8,
+        "method": "tools/call",
+        "params": { "name": "friend_add", "arguments": { "handle": "@phall" } }
+    }));
+    let good_friend = h.read_json_line();
+    assert_eq!(ptr(&good_friend, "/result/isError"), false);
+    assert_eq!(ptr(&good_friend, "/result/structuredContent/handle"), "phall");
+
+    {
+        let st = backend.lock_state();
+        assert_eq!(st.recorded_invites.len(), 2);
+        assert_eq!(st.recorded_joins.len(), 2);
+        assert_eq!(st.recorded_leaves.len(), 1);
+        assert_eq!(st.recorded_friend_adds.len(), 1);
+    }
 
     let _ = h.close_and_wait().await;
 }

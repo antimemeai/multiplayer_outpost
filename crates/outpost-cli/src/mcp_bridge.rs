@@ -21,8 +21,9 @@ use outpost_daemon::{
     encode_cancel_payload, fill_random, read_ipc_frame, write_ipc_frame,
 };
 use outpost_mcp::{
-    BackendError, BoardPostReq, BoardReadResp, BoxFuture, CancellationToken, McpOutpostBackend,
-    PartyPollReq, PartyPollResp, PartySendReq, PartyWaitReq, ProgressSender,
+    BackendError, BoardPostReq, BoardReadResp, BoxFuture, CancellationToken, FriendAddReq,
+    McpOutpostBackend, PartyInviteReq, PartyJoinReq, PartyLeaveReq, PartyPollReq, PartyPollResp,
+    PartySendReq, PartyWaitReq, ProgressSender,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -30,11 +31,15 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use crate::build_info::{build_digest, build_order, encode_hex};
 use crate::ipc_payloads::{
     ERR_INVALID_PARAMS, ERR_NOT_FOUND, PartyPollIpcReq, PartyPostBoardReq, PartySendChatReq,
-    PartyWaitIpcReq, decode_friends_list_resp, decode_party_list_resp, decode_party_members_resp,
-    decode_party_poll_resp, decode_send_result_resp, decode_status_resp, encode_party_poll_req,
+    PartyWaitIpcReq, RoomEnterIpcReq, RoomInviteIpcReq, RoomLeaveIpcReq,
+    decode_friend_edge_resp, decode_friends_live_resp, decode_party_list_resp,
+    decode_party_members_resp, decode_party_poll_resp, decode_resolve_handle_resp,
+    decode_room_enter_resp, decode_room_invite_resp, decode_room_leave_resp,
+    decode_send_result_resp, decode_status_resp, encode_party_poll_req,
     encode_party_post_board_req, encode_party_send_chat_req, encode_party_wait_req,
-    encode_u64_req, error_code_to_secret_kind, poll_resp_to_board_events, relay_policy_name,
-    trust_state_name,
+    encode_resolve_handle_req, encode_room_enter_req, encode_room_invite_req,
+    encode_room_leave_req, encode_u64_req, error_code_to_secret_kind, poll_resp_to_board_events,
+    relay_policy_name, trust_state_name,
 };
 use crate::storage::{pubkey_fingerprint_hex, resolve_active_device_id};
 
@@ -463,10 +468,11 @@ impl DaemonMcpBridge {
     }
 }
 
-pub fn build_spawn_command(
+pub fn build_spawn_command_with_opts(
     device_id: u64,
     state_dir: &std::path::Path,
     runtime_dir_override: Option<&std::path::Path>,
+    strict_pins: bool,
 ) -> Result<SpawnCommand, String> {
     let exe_path =
         std::env::current_exe().map_err(|e| format!("failed to locate current_exe: {e}"))?;
@@ -483,11 +489,22 @@ pub fn build_spawn_command(
         args.push("--runtime-dir".to_string());
         args.push(rt.to_string_lossy().into_owned());
     }
+    if strict_pins {
+        args.push("--strict-pins".to_string());
+    }
     Ok(SpawnCommand {
         exe_path,
         args,
         env: Vec::new(),
     })
+}
+
+pub fn build_spawn_command(
+    device_id: u64,
+    state_dir: &std::path::Path,
+    runtime_dir_override: Option<&std::path::Path>,
+) -> Result<SpawnCommand, String> {
+    build_spawn_command_with_opts(device_id, state_dir, runtime_dir_override, false)
 }
 
 fn build_mcp_client_config(
@@ -575,6 +592,9 @@ impl McpOutpostBackend for DaemonMcpBridge {
                 json!({
                     "party_id": p.party_id,
                     "party_epoch": p.party_epoch,
+                    "room_code": p.room_code,
+                    "name": p.room_name,
+                    "share_url": p.share_url,
                     "leader_account_id": p.leader_account_id,
                     "leader_device_id": p.leader_device_id,
                     "relay_policy": relay_policy_name(p.relay_policy),
@@ -648,6 +668,9 @@ impl McpOutpostBackend for DaemonMcpBridge {
                     json!({
                         "party_id": p.party_id,
                         "party_epoch": p.party_epoch,
+                        "room_code": p.room_code,
+                        "name": p.room_name,
+                        "share_url": p.share_url,
                         "leader_account_id": p.leader_account_id,
                         "leader_device_id": p.leader_device_id,
                         "relay_policy": relay_policy_name(p.relay_policy),
@@ -894,10 +917,10 @@ impl McpOutpostBackend for DaemonMcpBridge {
     fn party_friends(&self) -> BoxFuture<'_, Result<Value, BackendError>> {
         Box::pin(async move {
             let (raw, _conn) = self
-                .call_ipc(IpcOpcode::FriendsList, Vec::new(), None)
+                .call_ipc(IpcOpcode::FriendsLive, Vec::new(), None)
                 .await?;
             let resp =
-                decode_friends_list_resp(&raw).map_err(|_| BackendError::DaemonDisconnected)?;
+                decode_friends_live_resp(&raw).map_err(|_| BackendError::DaemonDisconnected)?;
             let friends: Vec<Value> = resp
                 .friends
                 .iter()
@@ -906,13 +929,153 @@ impl McpOutpostBackend for DaemonMcpBridge {
                         "account_id": f.account_id,
                         "handle": f.handle,
                         "state": f.state,
-                        "presence_status": f.presence_status,
-                        "joinable_party_id": f.joinable_party_id,
-                        "updated_at_ms": f.updated_at_ms,
+                        "presence": f.presence,
+                        "client": f.client,
+                        "party_room_code": f.party_room_code,
+                        "joinable": f.joinable,
                     })
                 })
                 .collect();
-            Ok(json!({ "friends": friends }))
+            let pending_invites: Vec<Value> = resp
+                .pending_invites
+                .iter()
+                .map(|inv| {
+                    json!({
+                        "party_id": inv.party_id,
+                        "room_code": inv.room_code,
+                        "from_handle": inv.from_handle,
+                        "created_at_ms": inv.created_at_ms,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "friends": friends,
+                "pending_invites": pending_invites,
+            }))
+        })
+    }
+
+    fn party_invite(&self, req: PartyInviteReq) -> BoxFuture<'_, Result<Value, BackendError>> {
+        Box::pin(async move {
+            let wire = RoomInviteIpcReq {
+                handle: req.handle,
+                party_id: None,
+                name: req.name,
+            };
+            let encoded = encode_room_invite_req(&wire)
+                .map_err(|e| BackendError::InvalidParams(e.to_string()))?;
+            let (raw, conn) = self
+                .call_ipc(IpcOpcode::RoomInvite, encoded, None)
+                .await?;
+            let resp =
+                decode_room_invite_resp(&raw).map_err(|_| BackendError::DaemonDisconnected)?;
+            conn.active_party_id
+                .store(resp.party_id, Ordering::Release);
+            Ok(json!({
+                "party_id": resp.party_id,
+                "room_code": resp.room_code,
+                "share_url": resp.share_url,
+                "handle_url": resp.handle_url,
+                "ws_path": resp.ws_path,
+                "invited_handle": resp.invited_handle,
+            }))
+        })
+    }
+
+    fn party_join(&self, req: PartyJoinReq) -> BoxFuture<'_, Result<Value, BackendError>> {
+        Box::pin(async move {
+            let wire = RoomEnterIpcReq {
+                target: req.target.unwrap_or_default(),
+                agent_name: None,
+            };
+            let encoded = encode_room_enter_req(&wire)
+                .map_err(|e| BackendError::InvalidParams(e.to_string()))?;
+            let (raw, conn) = self
+                .call_ipc(IpcOpcode::RoomEnter, encoded, None)
+                .await?;
+            let resp =
+                decode_room_enter_resp(&raw).map_err(|_| BackendError::DaemonDisconnected)?;
+            conn.active_party_id
+                .store(resp.party_id, Ordering::Release);
+            let members: Vec<Value> = resp
+                .members
+                .iter()
+                .map(|m| {
+                    json!({
+                        "account_id": m.account_id,
+                        "handle": m.handle,
+                        "client": m.client,
+                        "agent_name": m.agent_name,
+                        "status": m.status,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "party_id": resp.party_id,
+                "room_code": resp.room_code,
+                "name": resp.name,
+                "share_url": resp.share_url,
+                "ws_path": resp.ws_path,
+                "members": members,
+            }))
+        })
+    }
+
+    fn party_leave(&self, req: PartyLeaveReq) -> BoxFuture<'_, Result<Value, BackendError>> {
+        Box::pin(async move {
+            let wire = RoomLeaveIpcReq {
+                party_id: req.party_id,
+            };
+            let (raw, conn) = self
+                .call_ipc(IpcOpcode::RoomLeave, encode_room_leave_req(&wire), None)
+                .await?;
+            let resp =
+                decode_room_leave_resp(&raw).map_err(|_| BackendError::DaemonDisconnected)?;
+            conn.active_party_id.store(0, Ordering::Release);
+            Ok(json!({
+                "left": resp.left,
+                "party_id": resp.party_id,
+            }))
+        })
+    }
+
+    fn friend_add(&self, req: FriendAddReq) -> BoxFuture<'_, Result<Value, BackendError>> {
+        Box::pin(async move {
+            let clean = req.handle.trim().trim_start_matches('@');
+            if clean.is_empty() {
+                return Err(BackendError::InvalidParams(
+                    "handle must not be empty".to_string(),
+                ));
+            }
+            let encoded_handle = encode_resolve_handle_req(clean)
+                .map_err(|e| BackendError::InvalidParams(e.to_string()))?;
+            let (res_raw, _conn) = self
+                .call_ipc(IpcOpcode::ResolveHandle, encoded_handle, None)
+                .await?;
+            let resolved = decode_resolve_handle_resp(&res_raw)
+                .map_err(|_| BackendError::DaemonDisconnected)?;
+            let (edge_raw, _conn2) = self
+                .call_ipc(
+                    IpcOpcode::FriendRequest,
+                    encode_u64_req(resolved.account_id),
+                    None,
+                )
+                .await?;
+            let edge = decode_friend_edge_resp(&edge_raw)
+                .map_err(|_| BackendError::DaemonDisconnected)?;
+            let state_label = match edge.state {
+                0 => "friend",
+                1 => "pending_out",
+                2 => "pending_in",
+                3 => "blocked",
+                _ => "unknown",
+            };
+            Ok(json!({
+                "handle": resolved.handle,
+                "account_id": edge.target_account_id,
+                "state": edge.state,
+                "state_label": state_label,
+            }))
         })
     }
 }

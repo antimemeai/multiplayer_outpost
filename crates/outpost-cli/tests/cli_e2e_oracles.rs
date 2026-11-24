@@ -392,8 +392,8 @@ fn oracle_1_custody_lazy_mcp_eof_and_tty_gate() -> Result<(), String> {
         .pointer("/result/tools")
         .and_then(Value::as_array)
         .ok_or("missing tools array")?;
-    if tools.len() != 9 {
-        return Err(format!("expected 9 MCP tools, got {}", tools.len()));
+    if tools.len() != 13 {
+        return Err(format!("expected 13 MCP tools, got {}", tools.len()));
     }
 
     // Verify NO daemon socket was created during initialize / tools/list!
@@ -1244,6 +1244,7 @@ async fn spawn_mock_mp1_server(
 struct ParsedReq {
     method: String,
     path: String,
+    query: String,
     headers: HashMap<String, String>,
     body: Vec<u8>,
 }
@@ -1273,7 +1274,9 @@ async fn read_http_req<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Resul
     let mut parts = req_line.split_whitespace();
     let method = parts.next().ok_or(())?.to_string();
     let target = parts.next().ok_or(())?;
-    let path = target.split('?').next().unwrap_or(target).to_string();
+    let (path_part, query_part) = target.split_once('?').unwrap_or((target, ""));
+    let path = path_part.to_string();
+    let query = query_part.to_string();
 
     let mut headers = HashMap::new();
     for line in lines {
@@ -1300,6 +1303,7 @@ async fn read_http_req<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Resul
     Ok(ParsedReq {
         method,
         path,
+        query,
         headers,
         body,
     })
@@ -3616,6 +3620,851 @@ pub(super) async fn verify_relays_cli_against_mock_tls13(
         Ok(())
     })();
 
+    server_task.abort();
+    result
+}
+
+// ===========================================================================
+// Oracle 8: Xbox Live `mp2` WSS Room, Unpinned Chat/AgentCard, Cloud Login +
+//           Silent CWT Auto-Renew, 1-Verb CLI Hygiene, New MCP Tools & --strict-pins
+// ===========================================================================
+
+struct Mp2MockAccount {
+    account_id: u64,
+    device_id: u64,
+    handle: String,
+    root_sk: SigningKey,
+    device_pubkey: [u8; 32],
+}
+
+struct Mp2MockServerState {
+    accounts: HashMap<u64, Mp2MockAccount>,
+    flows: HashMap<String, (u64, String, [u8; 32], usize, i64)>, // flow_id -> (acc_id, handle, dev_pk, poll_count, cwt_ttl)
+    next_login_idx: usize,
+    renew_calls: usize,
+    room_seq: u64,
+    dedup: HashMap<String, u64>,
+    room_members: Vec<Value>,
+    pending_invite_for_bob: bool,
+    room_tx: broadcast::Sender<String>,
+}
+
+async fn spawn_mock_mp2_server(
+    state: Arc<Mutex<Mp2MockServerState>>,
+) -> Result<(SocketAddr, String, tokio::task::JoinHandle<()>), String> {
+    let certified = rcgen::generate_simple_self_signed(vec![TEST_AUTHORITY.to_string()])
+        .map_err(|e| format!("rcgen failed: {e}"))?;
+    let cert_pem = certified.cert.pem();
+    let cert_der = certified.cert.der().clone();
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        certified.key_pair.serialize_der(),
+    ));
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut srv_cfg = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| format!("tls13 server cfg: {e}"))?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .map_err(|e| format!("server cert: {e}"))?;
+    srv_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = TlsAcceptor::from(Arc::new(srv_cfg));
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("bind mp2 mock: {e}"))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let acc = acceptor.clone();
+            let st = Arc::clone(&state);
+            tokio::spawn(async move {
+                let Ok(mut tls) = acc.accept(tcp).await else {
+                    return;
+                };
+                let Ok(req) = read_http_req(&mut tls).await else {
+                    return;
+                };
+                handle_mock_mp2_conn(tls, req, st).await;
+            });
+        }
+    });
+    Ok((addr, cert_pem, handle))
+}
+
+async fn handle_mock_mp2_conn<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut stream: S,
+    req: ParsedReq,
+    state: Arc<Mutex<Mp2MockServerState>>,
+) {
+    let caller_acc = extract_caller_account_id(&req.headers).unwrap_or(1001);
+
+    // WebSocket upgrade routes
+    if req
+        .headers
+        .get("upgrade")
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+        == Some("websocket")
+    {
+        let Some(ws_key) = req.headers.get("sec-websocket-key") else {
+            return;
+        };
+        let proto = req
+            .headers
+            .get("sec-websocket-protocol")
+            .map(String::as_str)
+            .unwrap_or("mp1");
+        let accept = compute_ws_accept(ws_key);
+        let upgrade_resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: {proto}\r\n\r\n"
+        );
+        if stream.write_all(upgrade_resp.as_bytes()).await.is_err() {
+            return;
+        }
+        let _ = stream.flush().await;
+
+        if proto == "mp2" {
+            let (self_handle, latest_seq, members, mut rx) = {
+                let st = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let h = st
+                    .accounts
+                    .get(&caller_acc)
+                    .map(|a| a.handle.clone())
+                    .unwrap_or_else(|| format!("user{caller_acc}"));
+                (h, st.room_seq, st.room_members.clone(), st.room_tx.subscribe())
+            };
+            let hello = json!({
+                "v": 2,
+                "t": "hello",
+                "party_id": "8801",
+                "room_code": "KAIH",
+                "name": "Squad",
+                "self": { "account_id": caller_acc.to_string(), "handle": self_handle, "client": "outpost" },
+                "latest_seq": latest_seq,
+                "members": members,
+                "history": []
+            })
+            .to_string();
+            if write_ws_frame(&mut stream, 0x1, hello.as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            loop {
+                tokio::select! {
+                    bcast = rx.recv() => {
+                        if let Ok(text) = bcast
+                            && write_ws_frame(&mut stream, 0x1, text.as_bytes()).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    client_msg = read_ws_client_frame(&mut stream) => {
+                        match client_msg {
+                            Ok(Some((0x1, payload))) => {
+                                let Ok(text) = std::str::from_utf8(&payload) else {
+                                    return;
+                                };
+                                if text == "MP2:PING" {
+                                    if write_ws_frame(&mut stream, 0x1, b"MP2:PONG").await.is_err() {
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                let Ok(v) = serde_json::from_str::<Value>(text) else {
+                                    continue;
+                                };
+                                if v.get("t").and_then(Value::as_str) == Some("send") {
+                                    let cid = v.get("client_msg_id").and_then(Value::as_str).unwrap_or("").to_string();
+                                    let kind = v.get("kind").and_then(Value::as_str).unwrap_or("chat").to_string();
+                                    let target = v.get("target").and_then(Value::as_str).unwrap_or("@all").to_string();
+                                    let body_encoding = v.get("body_encoding").and_then(Value::as_str).unwrap_or("utf8").to_string();
+                                    let body = v.get("body").and_then(Value::as_str).unwrap_or("").to_string();
+                                    let (assigned_seq, ts_ms) = {
+                                        let mut st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        let ts = outpost_control::wall_now_ms();
+                                        let s = if let Some(&prev) = st.dedup.get(&cid) {
+                                            prev
+                                        } else {
+                                            st.room_seq += 1;
+                                            let next_s = st.room_seq;
+                                            st.dedup.insert(cid.clone(), next_s);
+                                            let (sh, did) = st.accounts.get(&caller_acc).map_or_else(
+                                                || (format!("user{caller_acc}"), caller_acc),
+                                                |a| (a.handle.clone(), a.device_id),
+                                            );
+                                            let ev = json!({
+                                                "v": 2,
+                                                "t": "event",
+                                                "seq": next_s,
+                                                "ts_ms": ts,
+                                                "client_msg_id": cid,
+                                                "sender": {
+                                                    "account_id": caller_acc.to_string(),
+                                                    "device_id": did.to_string(),
+                                                    "handle": sh,
+                                                    "client": "outpost"
+                                                },
+                                                "target": target,
+                                                "kind": kind,
+                                                "body_encoding": body_encoding,
+                                                "body": body
+                                            })
+                                            .to_string();
+                                            let _ = st.room_tx.send(ev);
+                                            next_s
+                                        };
+                                        (s, ts)
+                                    };
+                                    let ack = json!({
+                                        "v": 2,
+                                        "t": "ack",
+                                        "client_msg_id": cid,
+                                        "seq": assigned_seq,
+                                        "ts_ms": ts_ms
+                                    })
+                                    .to_string();
+                                    if write_ws_frame(&mut stream, 0x1, ack.as_bytes()).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok(Some((0x8, _))) | Ok(None) | Err(_) => return,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        } else {
+            // Account `/v1/ws` (mp1): send HelloAck and keep alive
+            if let Ok(sid) = SessionId::new(1)
+                && let Ok(hello_frame) = encode_frame(
+                    1,
+                    &Mp1Message::HelloAck {
+                        session_id: sid,
+                        server_now_ms: outpost_control::wall_now_ms(),
+                        ping_interval_ms: 20_000,
+                    },
+                )
+            {
+                let _ = write_ws_frame(&mut stream, 0x2, &hello_frame).await;
+            }
+            while let Ok(Some((op, payload))) = read_ws_client_frame(&mut stream).await {
+                if op == 0x1 && payload == b"MP1:PING" {
+                    if write_ws_frame(&mut stream, 0x1, b"MP1:PONG").await.is_err() {
+                        return;
+                    }
+                } else if op == 0x8 {
+                    return;
+                }
+            }
+        }
+        return;
+    }
+
+    match (req.method.as_str(), req.path.as_str()) {
+        ("POST", "/v1/auth/session/start") => {
+            let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
+                write_http_json(&mut stream, 400, "Bad Request", &json!({"error":"bad_json"})).await;
+                return;
+            };
+            let pk_b64 = v.get("device_pubkey_b64").and_then(Value::as_str).unwrap_or("");
+            let Ok(pk_raw) = B64.decode(pk_b64.as_bytes()) else {
+                return;
+            };
+            let Ok(dev_pk) = <[u8; 32]>::try_from(pk_raw) else {
+                return;
+            };
+            let resp = {
+                let mut st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let idx = st.next_login_idx;
+                st.next_login_idx += 1;
+                let (acc_id, dev_id, handle, root_seed, cwt_ttl) = if idx == 0 {
+                    (1001u64, 2001u64, "alice".to_string(), [0xA1u8; 32], 7 * 86_400i64)
+                } else {
+                    // Bob starts with a short 2-hour CWT (< 3d) to trigger silent background renew!
+                    (1002u64, 2002u64, "bob".to_string(), [0xB2u8; 32], 7_200i64)
+                };
+                let root_sk = SigningKey::from_bytes(&root_seed);
+                st.accounts.insert(
+                    acc_id,
+                    Mp2MockAccount {
+                        account_id: acc_id,
+                        device_id: dev_id,
+                        handle: handle.clone(),
+                        root_sk,
+                        device_pubkey: dev_pk,
+                    },
+                );
+                let flow_id = format!("flow_{idx}");
+                st.flows.insert(flow_id.clone(), (acc_id, handle, dev_pk, 0, cwt_ttl));
+                json!({
+                    "flow_id": flow_id,
+                    "poll_token": format!("poll_{idx}"),
+                    "user_code": "XBOX-LIVE",
+                    "verify_url": "https://multiplayer.tech/login?code=XBOX-LIVE",
+                    "expires_at_ms": outpost_control::wall_now_ms() + 300_000
+                })
+            };
+            write_http_json(&mut stream, 200, "OK", &resp).await;
+        }
+        ("POST", "/v1/auth/session/poll") => {
+            let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
+                return;
+            };
+            let flow_id = v.get("flow_id").and_then(Value::as_str).unwrap_or("");
+            let resp = {
+                let mut st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let info = st.flows.get_mut(flow_id).map(|entry| {
+                    entry.3 += 1;
+                    (entry.0, entry.1.clone(), entry.2, entry.3, entry.4)
+                });
+                match info {
+                    Some((_, _, _, 1, _)) => json!({ "status": "pending" }),
+                    Some((acc_id, handle, dev_pk, _, ttl)) => {
+                        let Some(acc) = st.accounts.get(&acc_id) else {
+                            return;
+                        };
+                        let now_s = outpost_control::wall_now_secs();
+                        let exp_s = now_s + ttl;
+                        let cwt = encode_device_cwt(&acc.root_sk, &dev_pk, now_s, exp_s)
+                            .unwrap_or_default();
+                        json!({
+                            "status": "approved",
+                            "account_id": acc.account_id,
+                            "handle": handle,
+                            "device_id": acc.device_id,
+                            "root_pubkey_b64": B64.encode(acc.root_sk.verifying_key().to_bytes()),
+                            "device_cwt_b64": B64.encode(cwt),
+                            "cwt_expires_ms": (exp_s as u64) * 1000,
+                            "session_token": "mpcs1_test"
+                        })
+                    }
+                    None => json!({ "status": "expired" }),
+                }
+            };
+            write_http_json(&mut stream, 200, "OK", &resp).await;
+        }
+        ("POST", "/v1/devices/me/renew") => {
+            let resp = {
+                let mut st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                st.renew_calls += 1;
+                st.accounts.get(&caller_acc).map(|acc| {
+                    let now_s = outpost_control::wall_now_secs();
+                    let exp_s = now_s + 7 * 86_400;
+                    let cwt = encode_device_cwt(&acc.root_sk, &acc.device_pubkey, now_s, exp_s)
+                        .unwrap_or_default();
+                    json!({
+                        "device_id": acc.device_id,
+                        "device_cwt_b64": B64.encode(cwt),
+                        "cwt_expires_ms": (exp_s as u64) * 1000
+                    })
+                })
+            };
+            if let Some(v) = resp {
+                write_http_json(&mut stream, 200, "OK", &v).await;
+            } else {
+                write_http_json(&mut stream, 404, "Not Found", &json!({"error":"not_found"})).await;
+            }
+        }
+        ("GET", "/v1/accounts/me") => {
+            let resp = {
+                let st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(acc) = st.accounts.get(&caller_acc) else {
+                    return;
+                };
+                json!({
+                    "account_id": acc.account_id,
+                    "handle": acc.handle,
+                    "root_pubkey_b64": B64.encode(acc.root_sk.verifying_key().to_bytes()),
+                    "devices": [],
+                    "active_party_ids": []
+                })
+            };
+            write_http_json(&mut stream, 200, "OK", &resp).await;
+        }
+        ("GET", "/v1/accounts/resolve") => {
+            let target_h = req.query.trim_start_matches("handle=");
+            let resp = {
+                let st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                st.accounts.values().find(|a| a.handle == target_h).map(|acc| {
+                    json!({
+                        "account_id": acc.account_id,
+                        "handle": acc.handle,
+                        "root_pubkey_b64": B64.encode(acc.root_sk.verifying_key().to_bytes())
+                    })
+                })
+            };
+            if let Some(v) = resp {
+                write_http_json(&mut stream, 200, "OK", &v).await;
+            } else {
+                write_http_json(&mut stream, 404, "Not Found", &json!({"error":"not_found"})).await;
+            }
+        }
+        ("POST", "/v1/friends/requests") => {
+            let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
+                return;
+            };
+            let target = v.get("target_account_id").and_then(Value::as_u64).unwrap_or(0);
+            write_http_json(
+                &mut stream,
+                200,
+                "OK",
+                &json!({ "target_account_id": target, "state": 0 }),
+            )
+            .await;
+        }
+        ("GET", "/v1/friends/live") => {
+            let resp = {
+                let st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let other_acc = if caller_acc == 1001 { 1002 } else { 1001 };
+                let other_handle = st
+                    .accounts
+                    .get(&other_acc)
+                    .map(|a| a.handle.clone())
+                    .unwrap_or_else(|| "peer".to_string());
+                let pending = if caller_acc == 1002 && st.pending_invite_for_bob {
+                    vec![json!({
+                        "party_id": 8801,
+                        "room_code": "KAIH",
+                        "from_handle": "alice",
+                        "created_at_ms": outpost_control::wall_now_ms()
+                    })]
+                } else {
+                    Vec::new()
+                };
+                json!({
+                    "friends": [
+                        {
+                            "account_id": other_acc,
+                            "handle": other_handle,
+                            "state": "friend",
+                            "presence": "in_party",
+                            "client": "outpost",
+                            "party_room_code": "KAIH",
+                            "joinable": true
+                        }
+                    ],
+                    "pending_invites": pending
+                })
+            };
+            write_http_json(&mut stream, 200, "OK", &resp).await;
+        }
+        ("POST", "/v1/rooms/invite") => {
+            let Ok(v) = serde_json::from_slice::<Value>(&req.body) else {
+                return;
+            };
+            let invited_handle = v.get("handle").and_then(Value::as_str).map(str::to_string);
+            let resp = {
+                let mut st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if invited_handle.as_deref() == Some("bob") {
+                    st.pending_invite_for_bob = true;
+                }
+                let (h, did) = st.accounts.get(&caller_acc).map_or_else(
+                    || ("alice".to_string(), 2001),
+                    |a| (a.handle.clone(), a.device_id),
+                );
+                if !st
+                    .room_members
+                    .iter()
+                    .any(|m| m.get("account_id").and_then(Value::as_u64) == Some(caller_acc))
+                {
+                    st.room_members.push(json!({
+                        "account_id": caller_acc,
+                        "device_id": did,
+                        "handle": h,
+                        "client": "outpost",
+                        "status": "live"
+                    }));
+                }
+                json!({
+                    "party_id": 8801,
+                    "room_code": "KAIH",
+                    "share_url": "https://multiplayer.tech/p/KAIH",
+                    "handle_url": format!("https://multiplayer.tech/@{h}"),
+                    "ws_path": "/v1/parties/8801/ws",
+                    "invited_handle": invited_handle
+                })
+            };
+            write_http_json(&mut stream, 200, "OK", &resp).await;
+        }
+        ("POST", "/v1/rooms/enter") => {
+            let resp = {
+                let mut st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let (h, did) = st.accounts.get(&caller_acc).map_or_else(
+                    || ("bob".to_string(), 2002),
+                    |a| (a.handle.clone(), a.device_id),
+                );
+                if !st
+                    .room_members
+                    .iter()
+                    .any(|m| m.get("account_id").and_then(Value::as_u64) == Some(caller_acc))
+                {
+                    st.room_members.push(json!({
+                        "account_id": caller_acc,
+                        "device_id": did,
+                        "handle": h,
+                        "client": "outpost",
+                        "status": "live"
+                    }));
+                }
+                let pres = json!({
+                    "v": 2,
+                    "t": "presence",
+                    "members": st.room_members
+                })
+                .to_string();
+                let _ = st.room_tx.send(pres);
+                json!({
+                    "party_id": 8801,
+                    "room_code": "KAIH",
+                    "name": "Squad",
+                    "share_url": "https://multiplayer.tech/p/KAIH",
+                    "ws_path": "/v1/parties/8801/ws",
+                    "members": st.room_members
+                })
+            };
+            write_http_json(&mut stream, 200, "OK", &resp).await;
+        }
+        ("POST", "/v1/rooms/leave") => {
+            write_http_json(&mut stream, 200, "OK", &json!({ "left": true, "party_id": 8801 }))
+                .await;
+        }
+        _ => {
+            write_http_json(&mut stream, 404, "Not Found", &json!({"error":"not_found"})).await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oracle_8_xbox_live_mp2_unpinned_chat_login_renew_and_strict_pins() -> Result<(), String> {
+    let root_tmp = make_short_tempdir("mpo8")?;
+    let alice_st = make_private_subdir(root_tmp.path(), "as")?;
+    let alice_rt = make_private_subdir(root_tmp.path(), "ar")?;
+    let bob_st = make_private_subdir(root_tmp.path(), "bs")?;
+    let bob_rt = make_private_subdir(root_tmp.path(), "br")?;
+    let strict_rt = make_private_subdir(root_tmp.path(), "sr")?;
+
+    let (room_tx, _) = broadcast::channel::<String>(32);
+    let mock_state = Arc::new(Mutex::new(Mp2MockServerState {
+        accounts: HashMap::new(),
+        flows: HashMap::new(),
+        next_login_idx: 0,
+        renew_calls: 0,
+        room_seq: 0,
+        dedup: HashMap::new(),
+        room_members: Vec::new(),
+        pending_invite_for_bob: false,
+        room_tx,
+    }));
+    let (server_addr, cert_pem, server_task) = spawn_mock_mp2_server(Arc::clone(&mock_state)).await?;
+    let ca_path = root_tmp.path().join("mp2_ca.pem");
+    std::fs::write(&ca_path, cert_pem).map_err(|e| format!("write ca: {e}"))?;
+    let addr_str = server_addr.to_string();
+    let ca_str = ca_path.to_string_lossy().into_owned();
+    let env_vars = [
+        ("OUTPOST_TEST_CONNECT_ADDR", addr_str.as_str()),
+        ("OUTPOST_TEST_CA_PEM", ca_str.as_str()),
+        ("OUTPOST_NO_BROWSER", "1"),
+    ];
+
+    let result = async {
+        // 1. Alice and Bob sign in via `mp-outpost login` (ZERO root.seed, ZERO safety-number jargon!)
+        let alice_login = run_bin(
+            &alice_st,
+            &alice_rt,
+            &["login", "--no-open", "--poll-ms", "50"],
+            None,
+            &env_vars,
+        )?;
+        if !alice_login.status_ok || !alice_login.stdout.contains("Signed in as @alice") {
+            return Err(format!(
+                "alice login failed: stdout={} stderr={}",
+                alice_login.stdout, alice_login.stderr
+            ));
+        }
+        if alice_login.stdout.contains("relay_policy") || alice_login.stdout.contains("safety_number") {
+            return Err(format!("login leaked jargon: {}", alice_login.stdout));
+        }
+
+        let bob_login = run_bin(
+            &bob_st,
+            &bob_rt,
+            &["login", "--no-open", "--poll-ms", "50"],
+            None,
+            &env_vars,
+        )?;
+        if !bob_login.status_ok || !bob_login.stdout.contains("Signed in as @bob") {
+            return Err(format!(
+                "bob login failed: stdout={} stderr={}",
+                bob_login.stdout, bob_login.stderr
+            ));
+        }
+
+        // Verify `whoami` default human output hides safety_number, account_id, and relay_policy
+        let whoami_human = run_bin(&alice_st, &alice_rt, &["whoami"], None, &env_vars)?;
+        if !whoami_human.status_ok
+            || whoami_human.stdout.contains("safety_number")
+            || whoami_human.stdout.contains("relay_policy")
+            || whoami_human.stdout.contains("account_id")
+        {
+            return Err(format!("whoami leaked internal fields: {}", whoami_human.stdout));
+        }
+
+        // 2. 1-verb `add`, `invite`, `friends`, bare `join` (accepts latest pending invite!)
+        let add_out = run_bin(&alice_st, &alice_rt, &["add", "@bob"], None, &env_vars)?;
+        if !add_out.status_ok || !add_out.stdout.contains("@bob") {
+            return Err(format!("add @bob failed: {} {}", add_out.stdout, add_out.stderr));
+        }
+
+        let inv_out = run_bin(
+            &alice_st,
+            &alice_rt,
+            &["invite", "@bob", "--name", "Squad"],
+            None,
+            &env_vars,
+        )?;
+        if !inv_out.status_ok
+            || !inv_out.stdout.contains("KAIH")
+            || !inv_out.stdout.contains("@bob")
+            || inv_out.stdout.contains("8801")
+        {
+            return Err(format!(
+                "invite @bob unexpected output: stdout={} stderr={}",
+                inv_out.stdout, inv_out.stderr
+            ));
+        }
+
+        let friends_out = run_bin(&bob_st, &bob_rt, &["friends"], None, &env_vars)?;
+        if !friends_out.status_ok
+            || !friends_out.stdout.contains("@alice")
+            || !friends_out.stdout.contains("KAIH")
+            || friends_out.stdout.contains("safety_number")
+            || friends_out.stdout.contains("account_id")
+        {
+            return Err(format!(
+                "friends unexpected output: stdout={} stderr={}",
+                friends_out.stdout, friends_out.stderr
+            ));
+        }
+
+        // Bare `mp-outpost join` accepts Bob's latest pending invite!
+        let join_out = run_bin(&bob_st, &bob_rt, &["join"], None, &env_vars)?;
+        if !join_out.status_ok
+            || !join_out.stdout.contains("Joined Squad")
+            || !join_out.stdout.contains("@alice")
+        {
+            return Err(format!(
+                "bare join failed: stdout={} stderr={}",
+                join_out.stdout, join_out.stderr
+            ));
+        }
+
+        // Verify Bob's daemon silently renewed his short-lived CWT via `/v1/devices/me/renew`!
+        let renew_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < renew_deadline {
+            let count = mock_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .renew_calls;
+            if count >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let renew_count = mock_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .renew_calls;
+        if renew_count < 1 {
+            return Err("expected silent background /v1/devices/me/renew call for Bob".to_string());
+        }
+
+        // 3. Unpinned peer chat & `board_post` (`agent_card`) over `mp2` WSS via MCP (ZERO safety-number pinning!)
+        let mut alice_mcp = McpProc::spawn(&alice_st, &alice_rt, &env_vars)?;
+        let mut bob_mcp = McpProc::spawn(&bob_st, &bob_rt, &env_vars)?;
+        for (label, p) in [("alice", &mut alice_mcp), ("bob", &mut bob_mcp)] {
+            p.send(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": label, "version": "1.0" }
+                }
+            }))?;
+            let _ = p.recv()?;
+        }
+
+        // Wait briefly for both mp2 WS connections to complete `hello`
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Alice sends chat WITHOUT pinning Bob!
+        alice_mcp.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "party_send",
+                "arguments": { "party_id": 8801, "body": "yo unpinned mp2 chat!" }
+            }
+        }))?;
+        let send_resp = alice_mcp.recv()?;
+        if send_resp.pointer("/result/isError").and_then(Value::as_bool) != Some(false) {
+            return Err(format!("unpinned party_send must succeed by default: {send_resp}"));
+        }
+
+        // Alice posts an `agent_card` via `board_post` WITHOUT pinning Bob!
+        let card_json = r#"{"title":"Fixed auth test","summary":"2 files changed"}"#;
+        alice_mcp.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "board_post",
+                "arguments": {
+                    "party_id": 8801,
+                    "room_scope": "party/main",
+                    "payload_b64": B64.encode(card_json.as_bytes())
+                }
+            }
+        }))?;
+        let card_resp = alice_mcp.recv()?;
+        if card_resp.pointer("/result/isError").and_then(Value::as_bool) != Some(false) {
+            return Err(format!("unpinned board_post must succeed by default: {card_resp}"));
+        }
+
+        // Bob polls and receives BOTH chat AND agent_card with real `@alice` provenance + nonce fences!
+        let poll_deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_chat = false;
+        let mut saw_card = false;
+        let mut rid = 20i64;
+        while Instant::now() < poll_deadline && (!saw_chat || !saw_card) {
+            rid += 1;
+            bob_mcp.send(&json!({
+                "jsonrpc": "2.0",
+                "id": rid,
+                "method": "tools/call",
+                "params": {
+                    "name": "party_poll",
+                    "arguments": { "party_id": 8801, "after_seq": 0 }
+                }
+            }))?;
+            let poll = bob_mcp.recv()?;
+            if let Some(events) = poll
+                .pointer("/result/structuredContent/events")
+                .and_then(Value::as_array)
+            {
+                for ev in events {
+                    if ev.get("kind").and_then(Value::as_str) == Some("chat")
+                        && ev.get("body").and_then(Value::as_str) == Some("yo unpinned mp2 chat!")
+                        && ev.pointer("/provenance/sender_handle").and_then(Value::as_str) == Some("alice")
+                    {
+                        saw_chat = true;
+                    }
+                    if ev.get("kind").and_then(Value::as_str) == Some("bridge_envelope")
+                        && ev.pointer("/provenance/sender_handle").and_then(Value::as_str) == Some("alice")
+                    {
+                        saw_card = true;
+                    }
+                }
+            }
+            if !saw_chat || !saw_card {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            }
+        }
+        if !saw_chat || !saw_card {
+            return Err(format!(
+                "Bob did not receive both unpinned mp2 events (saw_chat={saw_chat}, saw_card={saw_card})"
+            ));
+        }
+
+        // 4. Test new MCP lifecycle tools (`party_leave`, `party_join`, `party_invite`, `friend_add`)
+        bob_mcp.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 50,
+            "method": "tools/call",
+            "params": { "name": "party_leave", "arguments": {} }
+        }))?;
+        let leave_mcp = bob_mcp.recv()?;
+        if leave_mcp.pointer("/result/structuredContent/left").and_then(Value::as_bool) != Some(true)
+        {
+            return Err(format!("MCP party_leave failed: {leave_mcp}"));
+        }
+
+        bob_mcp.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 51,
+            "method": "tools/call",
+            "params": { "name": "party_join", "arguments": { "target": "KAIH" } }
+        }))?;
+        let join_mcp = bob_mcp.recv()?;
+        if join_mcp.pointer("/result/structuredContent/room_code").and_then(Value::as_str)
+            != Some("KAIH")
+        {
+            return Err(format!("MCP party_join failed: {join_mcp}"));
+        }
+
+        bob_mcp.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 52,
+            "method": "tools/call",
+            "params": { "name": "friend_add", "arguments": { "handle": "@alice" } }
+        }))?;
+        let friend_mcp = bob_mcp.recv()?;
+        if friend_mcp.pointer("/result/structuredContent/handle").and_then(Value::as_str)
+            != Some("alice")
+        {
+            return Err(format!("MCP friend_add failed: {friend_mcp}"));
+        }
+
+        // 5. Verify opt-in `--strict-pins` blocks sending to unpinned peers!
+        let strict_env = [
+            ("OUTPOST_TEST_CONNECT_ADDR", addr_str.as_str()),
+            ("OUTPOST_TEST_CA_PEM", ca_str.as_str()),
+            ("OUTPOST_NO_BROWSER", "1"),
+            ("OUTPOST_STRICT_PINS", "1"),
+        ];
+        let _ = run_bin(&bob_st, &strict_rt, &["join", "KAIH"], None, &strict_env)?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let strict_say = run_bin(
+            &bob_st,
+            &strict_rt,
+            &["--strict-pins", "party", "say", "8801", "should block"],
+            None,
+            &strict_env,
+        )?;
+        if strict_say.status_ok {
+            return Err("expected --strict-pins to block send to unpinned peer".to_string());
+        }
+
+        // 6. Clean `mp-outpost leave`
+        let leave_cli = run_bin(&alice_st, &alice_rt, &["leave"], None, &env_vars)?;
+        if !leave_cli.status_ok || !leave_cli.stdout.contains("Left party.") {
+            return Err(format!("leave cli failed: {} {}", leave_cli.stdout, leave_cli.stderr));
+        }
+
+        let _ = alice_mcp.child.kill();
+        let _ = bob_mcp.child.kill();
+        Ok(())
+    }
+    .await;
+
+    let _ = run_bin(&alice_st, &alice_rt, &["daemon", "stop", "--force"], None, &env_vars);
+    let _ = run_bin(&bob_st, &bob_rt, &["daemon", "stop", "--force"], None, &env_vars);
+    let _ = run_bin(&bob_st, &strict_rt, &["daemon", "stop", "--force"], None, &env_vars);
     server_task.abort();
     result
 }

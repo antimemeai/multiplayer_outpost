@@ -12,7 +12,10 @@ use outpost_core::p2p_wire::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::backend::{BoardPostReq, PartyPollReq, PartySendReq, PartyWaitReq};
+use crate::backend::{
+    BoardPostReq, FriendAddReq, PartyInviteReq, PartyJoinReq, PartyLeaveReq, PartyPollReq,
+    PartySendReq, PartyWaitReq,
+};
 
 pub const SERVER_NAME: &str = "multiplayer-outpost";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -24,8 +27,8 @@ pub const MAX_POLL_LIMIT: u16 = 100;
 pub const DEFAULT_POLL_MAX_BYTES: u32 = 512 * 1024;
 pub const MAX_POLL_MAX_BYTES: u32 = 512 * 1024;
 
-/// Exact list of all 9 Spec v2 MCP tool names.
-pub const TOOL_NAMES: [&str; 9] = [
+/// Exact list of all 13 MCP tool names (9 core + 4 Xbox Live party/friend lifecycle tools).
+pub const TOOL_NAMES: [&str; 13] = [
     "outpost_status",
     "party_list",
     "party_members",
@@ -35,6 +38,10 @@ pub const TOOL_NAMES: [&str; 9] = [
     "board_read",
     "party_wait",
     "party_friends",
+    "party_invite",
+    "party_join",
+    "party_leave",
+    "friend_add",
 ];
 
 /// Parsed and validated MCP tool invocation ready for backend dispatch.
@@ -49,6 +56,10 @@ pub enum ParsedToolCall {
     BoardRead(PartyPollReq),
     PartyWait(PartyWaitReq),
     PartyFriends,
+    PartyInvite(PartyInviteReq),
+    PartyJoin(PartyJoinReq),
+    PartyLeave(PartyLeaveReq),
+    FriendAdd(FriendAddReq),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +153,7 @@ pub fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "party_send",
-            "description": "Send a P2P Lane 1 chat message (0x01 chat_message) to pinned trusted party peers. Fails closed on key_mismatch or detected secret material.",
+            "description": "Send a party chat message over mp2 WSS (or P2P fallback) to authenticated party members. Fails closed on key_mismatch or detected secret material.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -166,7 +177,7 @@ pub fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "board_post",
-            "description": "Post an opaque base64-encoded P2P Lane 1 board envelope (0x02 bridge_envelope, <= 1 MiB decoded) to pinned trusted party peers.",
+            "description": "Post an agent_card / opaque base64-encoded board envelope over mp2 WSS (or P2P fallback) to authenticated party members.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -262,13 +273,79 @@ pub fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "party_friends",
-            "description": "Return read-only mutual friends list and live presence snapshot from the local daemon.",
+            "description": "Return friends list with live presence, active joinable room codes, and pending party invites.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false
             },
             "annotations": read_only_ann()
+        }),
+        json!({
+            "name": "party_invite",
+            "description": "Create or reuse an active mp2 party room, attach to it, and optionally ring a friend by @handle. Returns room_code and share_url.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "handle": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64
+                    },
+                    "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64
+                    }
+                },
+                "additionalProperties": false
+            },
+            "annotations": send_ann()
+        }),
+        json!({
+            "name": "party_join",
+            "description": "Join a party by @handle, 4-character room code, share URL, or omit target to accept your latest pending incoming invite.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "minLength": 0,
+                        "maxLength": 256
+                    }
+                },
+                "additionalProperties": false
+            },
+            "annotations": send_ann()
+        }),
+        json!({
+            "name": "party_leave",
+            "description": "Leave the current active party room (or an explicit party_id).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "party_id": safe_id_schema()
+                },
+                "additionalProperties": false
+            },
+            "annotations": send_ann()
+        }),
+        json!({
+            "name": "friend_add",
+            "description": "Send or accept a friend request by @handle.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "handle": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64
+                    }
+                },
+                "required": ["handle"],
+                "additionalProperties": false
+            },
+            "annotations": send_ann()
         }),
     ]
 }
@@ -536,6 +613,27 @@ pub fn parse_tool_call(
         "party_friends" => {
             reject_unknown_keys(args, &[])?;
             Ok(ParsedToolCall::PartyFriends)
+        }
+        "party_invite" => {
+            reject_unknown_keys(args, &["handle", "name"])?;
+            let handle = optional_string(args, "handle", 1, 64)?;
+            let name = optional_string(args, "name", 1, 64)?;
+            Ok(ParsedToolCall::PartyInvite(PartyInviteReq { handle, name }))
+        }
+        "party_join" => {
+            reject_unknown_keys(args, &["target"])?;
+            let target = optional_string(args, "target", 0, 256)?;
+            Ok(ParsedToolCall::PartyJoin(PartyJoinReq { target }))
+        }
+        "party_leave" => {
+            reject_unknown_keys(args, &["party_id"])?;
+            let party_id = optional_safe_id(args, "party_id")?;
+            Ok(ParsedToolCall::PartyLeave(PartyLeaveReq { party_id }))
+        }
+        "friend_add" => {
+            reject_unknown_keys(args, &["handle"])?;
+            let handle = require_string(args, "handle", 1, 64)?.to_string();
+            Ok(ParsedToolCall::FriendAdd(FriendAddReq { handle }))
         }
         _ => Err(ToolParseError::new(format!("unknown tool '{name}'"))),
     }

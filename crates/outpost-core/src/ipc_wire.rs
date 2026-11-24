@@ -5,7 +5,7 @@ use core::fmt;
 
 use mp_protocol::MAX_SAFE_ID;
 
-pub const IPC_SCHEMA_VER: u32 = 3;
+pub const IPC_SCHEMA_VER: u32 = 4;
 pub const IPC_WIRE_VER: u16 = 1;
 pub const IPC_HEADER_BYTES: usize = 16;
 pub const MAX_IPC_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -61,6 +61,10 @@ pub enum IpcOpcode {
     FriendRemove = 0x003C,
     FriendBlock = 0x003D,
     ResolveHandle = 0x003E,
+    RoomInvite = 0x0040,
+    RoomEnter = 0x0041,
+    RoomLeave = 0x0042,
+    FriendsLive = 0x0043,
 }
 
 impl IpcOpcode {
@@ -96,6 +100,10 @@ impl IpcOpcode {
             0x003C => Ok(Self::FriendRemove),
             0x003D => Ok(Self::FriendBlock),
             0x003E => Ok(Self::ResolveHandle),
+            0x0040 => Ok(Self::RoomInvite),
+            0x0041 => Ok(Self::RoomEnter),
+            0x0042 => Ok(Self::RoomLeave),
+            0x0043 => Ok(Self::FriendsLive),
             _ => Err(IpcWireError::UnknownOpcode),
         }
     }

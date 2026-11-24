@@ -10,29 +10,38 @@
 
 pub mod clock;
 pub mod http;
+pub mod mp2;
 pub mod tls;
 pub mod ws;
 
 pub use clock::{sleep_aware_now_ms, wall_now_ms, wall_now_secs};
 pub use http::{
     AccountDeviceInfo, AccountMeResponse, ApprovePartyRequest, ApprovePartyRequestResponse,
+    AuthSessionPollResponse, AuthSessionStartRequest, AuthSessionStartResponse,
     BlockAccountResponse, ControlClient, ControlClientConfig, ControlError, CreatePartyRequest,
     CreatePartyResponse, DEFAULT_REQUEST_TIMEOUT, DeviceLinkApproveRequest,
     DeviceLinkApproveResponse, DeviceLinkClaimResponse, DeviceLinkCreateResponse,
     DeviceLinkInspectResponse, DeviceLinkPollResponse, DisbandPartyResponse, EnrollDeviceRequest,
     EnrollDeviceResponse, FriendEdge, FriendRequestResponse, HealthResponse, JoinPartyRequest,
     JoinPartyResponse, KickMemberResponse, LeavePartyResponse, ListFriendsResponse,
-    ListPartyRequestsResponse, MAX_CLOCK_OFFSET_MS, MAX_DISCOVERED_RELAYS, MAX_FETCH_REDIRECTS,
-    MAX_FETCH_TIMEOUT, MAX_RELAY_METADATA_CHARS, MAX_RESPONSE_BODY_BYTES,
-    MAX_RESPONSE_HEADERS_BYTES, MAX_RETRY_AFTER_MS, MIN_RETRY_AFTER_MS, MintPartyInviteRequest,
-    MintPartyInviteResponse, PartyJoinRequestItem, PartySummaryResponse, PromoteMemberResponse,
-    PublicAccountResponse, PublicDeviceInfo, RawHttpResponse, RecoverLookupResponse,
-    RegisterAccountRequest, RegisterAccountResponse, RejectPartyRequestResponse, RelayInfo,
-    RelaysResponse, RemoveFriendResponse, RenameHandleResponse, RenewDeviceCwtResponse,
-    RequestSigner, ResolvedHandleResponse, RevokeDeviceResponse, RevokePartyInviteResponse,
+    ListPartyRequestsResponse, LiveFriendItem, LiveFriendsResponse, MAX_CLOCK_OFFSET_MS,
+    MAX_DISCOVERED_RELAYS, MAX_FETCH_REDIRECTS, MAX_FETCH_TIMEOUT, MAX_RELAY_METADATA_CHARS,
+    MAX_RESPONSE_BODY_BYTES, MAX_RESPONSE_HEADERS_BYTES, MAX_RETRY_AFTER_MS, MIN_RETRY_AFTER_MS,
+    MintPartyInviteRequest, MintPartyInviteResponse, PartyJoinRequestItem, PartySummaryResponse,
+    PendingRoomInvite, PromoteMemberResponse, PublicAccountResponse, PublicDeviceInfo,
+    RawHttpResponse, RecoverLookupResponse, RegisterAccountRequest, RegisterAccountResponse,
+    RejectPartyRequestResponse, RelayInfo, RelaysResponse, RemoveFriendResponse,
+    RenameHandleResponse, RenewDeviceCwtResponse, RenewMyDeviceResponse, RequestSigner,
+    ResolvedHandleResponse, RevokeDeviceResponse, RevokePartyInviteResponse, RoomEnterRequest,
+    RoomEnterResponse, RoomInviteRequest, RoomInviteResponse, RoomLeaveResponse, RoomMemberSummary,
     SIGNATURE_LIFETIME_SECS, SignedHeaders, WebSessionApproveResponse, WebSessionInspectResponse,
     fetch_https_bytes, generate_nonce, probe_https_get, sanitize_server_error, sign_request,
     validate_link_code,
+};
+pub use mp2::{
+    MAX_MP2_BODY_BYTES, MAX_MP2_FRAME_BYTES, MP2_PING_TEXT, MP2_PONG_TEXT, MP2_SUBPROTOCOL,
+    Mp2Ack, Mp2Event, Mp2EventKind, Mp2Hello, Mp2Member, Mp2RoomEvent, Mp2RoomSocket, Mp2SelfInfo,
+    Mp2Sender, Mp2WsError, parse_mp2_server_text,
 };
 pub use tls::{
     DEFAULT_API_AUTHORITY, build_tls13_client_config_with_roots, default_tls13_client_config,

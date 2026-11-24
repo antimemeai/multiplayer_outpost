@@ -27,6 +27,7 @@ use crate::tls::{
     DEFAULT_API_AUTHORITY, canonicalize_authority, connect_tls13, default_tls13_client_config,
     parse_authority,
 };
+use crate::mp2::Mp2RoomSocket;
 use crate::ws::{Mp1WsClient, Mp1WsTarget, WsConnectError};
 
 /// Hard cap on inbound HTTP response bodies (`16 KiB`).
@@ -499,6 +500,52 @@ impl ControlClient {
         }
     }
 
+    /// Connects an RFC 6455 `mp2` Room WebSocket (`GET /v1/parties/<party_id>/ws`,
+    /// `Sec-WebSocket-Protocol: mp2`) with automatic single `401 clock_skew` retry.
+    pub async fn connect_mp2_room(&self, party_id: PartyId) -> Result<Mp2RoomSocket, WsConnectError> {
+        let signer = self
+            .device_signer
+            .as_ref()
+            .ok_or(WsConnectError::MissingSigner)?;
+        self.connect_mp2_room_with_signer(signer, party_id).await
+    }
+
+    /// Connects an `mp2` Room WebSocket to an explicit `ws_path` (e.g. `"/v1/parties/12345/ws"`)
+    /// with automatic single `401 clock_skew` retry.
+    pub async fn connect_mp2_room_path(&self, path: &str) -> Result<Mp2RoomSocket, WsConnectError> {
+        let signer = self
+            .device_signer
+            .as_ref()
+            .ok_or(WsConnectError::MissingSigner)?;
+        match Mp2RoomSocket::connect_path(&self.config, signer, self.clock_offset_ms(), path).await
+        {
+            Err(WsConnectError::ClockSkew { server_now_ms }) => {
+                let _ = self.record_server_clock_ms(server_now_ms);
+                Mp2RoomSocket::connect_path(&self.config, signer, self.clock_offset_ms(), path)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    /// Connects an `mp2` Room WebSocket with an explicit signer and automatic single `clock_skew` retry.
+    pub async fn connect_mp2_room_with_signer(
+        &self,
+        signer: &RequestSigner,
+        party_id: PartyId,
+    ) -> Result<Mp2RoomSocket, WsConnectError> {
+        match Mp2RoomSocket::connect_party(&self.config, signer, self.clock_offset_ms(), party_id)
+            .await
+        {
+            Err(WsConnectError::ClockSkew { server_now_ms }) => {
+                let _ = self.record_server_clock_ms(server_now_ms);
+                Mp2RoomSocket::connect_party(&self.config, signer, self.clock_offset_ms(), party_id)
+                    .await
+            }
+            other => other,
+        }
+    }
+
     fn require_device_signer(&self) -> Result<&RequestSigner, ControlError> {
         self.device_signer
             .as_ref()
@@ -509,6 +556,17 @@ impl ControlClient {
     async fn execute_unsigned_get(&self, path: &str) -> Result<RawHttpResponse, ControlError> {
         validate_path_and_query(HttpMethod::Get, path, "?")?;
         self.send_http1_once(HttpMethod::Get, path, "?", Bytes::new(), None, None)
+            .await
+    }
+
+    /// Executes an unsigned HTTP/1.1 JSON POST request (used for `/v1/auth/session/start` & `poll`).
+    async fn execute_unsigned_post(
+        &self,
+        path: &str,
+        body: Bytes,
+    ) -> Result<RawHttpResponse, ControlError> {
+        validate_path_and_query(HttpMethod::Post, path, "?")?;
+        self.send_http1_once(HttpMethod::Post, path, "?", body, None, None)
             .await
     }
 
@@ -1341,6 +1399,152 @@ impl ControlClient {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Room Protocol v2 (`mp2`) & Cloud Auth REST Endpoints
+    // -----------------------------------------------------------------------
+
+    /// `POST /v1/rooms/invite` (device-authenticated).
+    ///
+    /// Creates a room automatically if `party_id` is omitted, puts the caller in it,
+    /// and optionally pushes a live invite to `@handle` over `AccountDO` `/v1/ws`.
+    pub async fn room_invite(
+        &self,
+        req: &RoomInviteRequest,
+    ) -> Result<RoomInviteResponse, ControlError> {
+        let signer = self.require_device_signer()?;
+        let body = encode_json(req)?;
+        let resp = self
+            .execute_signed(signer, HttpMethod::Post, "/v1/rooms/invite", "?", body, None)
+            .await?;
+        let decoded: RoomInviteResponse = Self::decode_json_response(resp, &[200, 201])?;
+        PartyId::new(decoded.party_id).map_err(|_| {
+            ControlError::Protocol(format!(
+                "invalid party_id ({}) in room_invite response",
+                decoded.party_id
+            ))
+        })?;
+        Ok(decoded)
+    }
+
+    /// `POST /v1/rooms/enter` (device-authenticated).
+    ///
+    /// Universal idempotent resolver: joins a party by `@handle`, 4-char `room_code`,
+    /// URL, legacy `mppi1_...` token, numeric `party_id`, or `""` (latest pending invite).
+    pub async fn room_enter(
+        &self,
+        req: &RoomEnterRequest,
+    ) -> Result<RoomEnterResponse, ControlError> {
+        let signer = self.require_device_signer()?;
+        let body = encode_json(req)?;
+        let resp = self
+            .execute_signed(signer, HttpMethod::Post, "/v1/rooms/enter", "?", body, None)
+            .await?;
+        let decoded: RoomEnterResponse = Self::decode_json_response(resp, &[200, 201])?;
+        PartyId::new(decoded.party_id).map_err(|_| {
+            ControlError::Protocol(format!(
+                "invalid party_id ({}) in room_enter response",
+                decoded.party_id
+            ))
+        })?;
+        Ok(decoded)
+    }
+
+    /// `POST /v1/rooms/leave` (device-authenticated).
+    pub async fn room_leave(&self, party_id: PartyId) -> Result<RoomLeaveResponse, ControlError> {
+        let signer = self.require_device_signer()?;
+        let body = encode_json(&RoomLeaveWire {
+            party_id: party_id.get(),
+        })?;
+        let resp = self
+            .execute_signed(signer, HttpMethod::Post, "/v1/rooms/leave", "?", body, None)
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
+    /// `GET /v1/friends/live` (device-authenticated).
+    pub async fn friends_live(&self) -> Result<LiveFriendsResponse, ControlError> {
+        let signer = self.require_device_signer()?;
+        let resp = self
+            .execute_signed(
+                signer,
+                HttpMethod::Get,
+                "/v1/friends/live",
+                "?",
+                Bytes::new(),
+                None,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
+    /// `POST /v1/auth/session/start` (unauthenticated browser-first CLI login).
+    pub async fn auth_session_start(
+        &self,
+        req: &AuthSessionStartRequest,
+    ) -> Result<AuthSessionStartResponse, ControlError> {
+        let wire = AuthSessionStartWire {
+            device_pubkey_b64: B64_STD.encode(req.device_pubkey),
+            device_label: &req.device_label,
+            client: &req.client,
+        };
+        let body = encode_json(&wire)?;
+        let resp = self
+            .execute_unsigned_post("/v1/auth/session/start", body)
+            .await?;
+        let decoded: AuthSessionStartResponse = Self::decode_json_response(resp, &[200, 201])?;
+        if decoded.flow_id.is_empty() || decoded.poll_token.is_empty() {
+            return Err(ControlError::Protocol(
+                "auth_session_start response missing flow_id or poll_token".to_owned(),
+            ));
+        }
+        Ok(decoded)
+    }
+
+    /// `POST /v1/auth/session/poll` (unauthenticated browser-first CLI login poll).
+    pub async fn auth_session_poll(
+        &self,
+        flow_id: &str,
+        poll_token: &str,
+    ) -> Result<AuthSessionPollResponse, ControlError> {
+        let body = encode_json(&AuthSessionPollWire {
+            flow_id,
+            poll_token,
+        })?;
+        let resp = self
+            .execute_unsigned_post("/v1/auth/session/poll", body)
+            .await?;
+        let decoded: AuthSessionPollResponse = Self::decode_json_response(resp, &[200, 202])?;
+        if let AuthSessionPollResponse::Approved {
+            account_id,
+            device_id,
+            ..
+        } = &decoded
+        {
+            validate_account_id(*account_id, "auth_session_poll")?;
+            validate_device_id(*device_id, "auth_session_poll")?;
+        }
+        Ok(decoded)
+    }
+
+    /// `POST /v1/devices/me/renew` (RFC 9421 device-key authenticated silent auto-renewal).
+    pub async fn renew_my_device(&self) -> Result<RenewMyDeviceResponse, ControlError> {
+        let signer = self.require_device_signer()?;
+        let body = Bytes::from_static(b"{}");
+        let resp = self
+            .execute_signed(
+                signer,
+                HttpMethod::Post,
+                "/v1/devices/me/renew",
+                "?",
+                body,
+                None,
+            )
+            .await?;
+        let decoded: RenewMyDeviceResponse = Self::decode_json_response(resp, &[200])?;
+        validate_device_id(decoded.device_id, "renew_my_device")?;
+        Ok(decoded)
+    }
+
     /// Downloads bounded bytes over TLS 1.3 + HTTP/1.1 with strict host-allowlisted
     /// HTTPS-only redirect following (at most 3 redirects, 60-second overall deadline).
     ///
@@ -1801,6 +2005,8 @@ async fn send_http1_raw(
                     })?,
                 );
             }
+        } else if method.requires_body_headers() {
+            req_builder = req_builder.header(http::header::CONTENT_TYPE, "application/json");
         }
 
         if let Some(idem) = idempotency_key {
@@ -2711,5 +2917,329 @@ impl fmt::Debug for DeviceLinkPollResponse {
                 .field("safety_number", safety_number)
                 .finish(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Flexible numeric-or-string u64 deserializers (`ROOM_PROTOCOL_V2.md`)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn deserialize_u64_or_string<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct U64OrStringVisitor;
+
+    impl serde::de::Visitor<'_> for U64OrStringVisitor {
+        type Value = u64;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a u64 integer or decimal string")
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<u64, E> {
+            Ok(v)
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<u64, E> {
+            u64::try_from(v).map_err(|_| E::custom("negative integer for u64"))
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<u64, E> {
+            v.trim()
+                .parse::<u64>()
+                .map_err(|_| E::custom("invalid decimal string for u64"))
+        }
+    }
+
+    deserializer.deserialize_any(U64OrStringVisitor)
+}
+
+pub(crate) fn deserialize_u64_or_string_opt<'de, D>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for OptVisitor {
+        type Value = Option<u64>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("null, a u64 integer, or a decimal string")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Option<u64>, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Option<u64>, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(
+            self,
+            d: D2,
+        ) -> Result<Option<u64>, D2::Error> {
+            deserialize_u64_or_string(d).map(Some)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Option<u64>, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Option<u64>, E> {
+            u64::try_from(v)
+                .map(Some)
+                .map_err(|_| E::custom("negative integer for u64"))
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Option<u64>, E> {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            trimmed
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|_| E::custom("invalid decimal string for u64"))
+        }
+    }
+
+    deserializer.deserialize_any(OptVisitor)
+}
+
+// ---------------------------------------------------------------------------
+// Room Protocol v2 (`mp2`) & Cloud Auth Models (`docs/ROOM_PROTOCOL_V2.md`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct RoomInviteRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub party_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RoomInviteResponse {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub party_id: u64,
+    #[serde(default)]
+    pub room_code: String,
+    #[serde(default)]
+    pub share_url: String,
+    #[serde(default)]
+    pub handle_url: String,
+    #[serde(default)]
+    pub ws_path: String,
+    #[serde(default)]
+    pub invited_handle: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RoomEnterRequest {
+    pub target: String,
+    pub client: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RoomMemberSummary {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub account_id: u64,
+    #[serde(default)]
+    pub handle: String,
+    #[serde(default)]
+    pub client: String,
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    #[serde(default)]
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RoomEnterResponse {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub party_id: u64,
+    #[serde(default)]
+    pub room_code: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub share_url: String,
+    #[serde(default)]
+    pub ws_path: String,
+    #[serde(default)]
+    pub members: Vec<RoomMemberSummary>,
+}
+
+#[derive(Serialize)]
+struct RoomLeaveWire {
+    party_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RoomLeaveResponse {
+    pub left: bool,
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub party_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct LiveFriendItem {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub account_id: u64,
+    #[serde(default)]
+    pub handle: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub presence: String,
+    #[serde(default)]
+    pub client: Option<String>,
+    #[serde(default)]
+    pub party_room_code: Option<String>,
+    #[serde(default)]
+    pub joinable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PendingRoomInvite {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub party_id: u64,
+    #[serde(default)]
+    pub room_code: String,
+    #[serde(default)]
+    pub from_handle: String,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct LiveFriendsResponse {
+    #[serde(default)]
+    pub friends: Vec<LiveFriendItem>,
+    #[serde(default)]
+    pub pending_invites: Vec<PendingRoomInvite>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthSessionStartRequest {
+    pub device_pubkey: [u8; 32],
+    pub device_label: String,
+    pub client: String,
+}
+
+#[derive(Serialize)]
+struct AuthSessionStartWire<'a> {
+    device_pubkey_b64: String,
+    device_label: &'a str,
+    client: &'a str,
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct AuthSessionStartResponse {
+    pub flow_id: String,
+    pub poll_token: String,
+    pub user_code: String,
+    pub verify_url: String,
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub expires_at_ms: u64,
+}
+
+impl fmt::Debug for AuthSessionStartResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthSessionStartResponse")
+            .field("flow_id", &self.flow_id)
+            .field("poll_token", &"[REDACTED]")
+            .field("user_code", &self.user_code)
+            .field("verify_url", &self.verify_url)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+#[derive(Serialize)]
+struct AuthSessionPollWire<'a> {
+    flow_id: &'a str,
+    poll_token: &'a str,
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AuthSessionPollResponse {
+    Pending {
+        #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+        expires_at_ms: Option<u64>,
+    },
+    Approved {
+        #[serde(deserialize_with = "deserialize_u64_or_string")]
+        account_id: u64,
+        handle: String,
+        #[serde(deserialize_with = "deserialize_u64_or_string")]
+        device_id: u64,
+        root_pubkey_b64: String,
+        device_cwt_b64: String,
+        #[serde(deserialize_with = "deserialize_u64_or_string")]
+        cwt_expires_ms: u64,
+        #[serde(default)]
+        session_token: Option<String>,
+    },
+    Expired,
+    Denied,
+}
+
+impl fmt::Debug for AuthSessionPollResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending { expires_at_ms } => f
+                .debug_struct("Pending")
+                .field("expires_at_ms", expires_at_ms)
+                .finish(),
+            Self::Approved {
+                account_id,
+                handle,
+                device_id,
+                root_pubkey_b64,
+                device_cwt_b64: _,
+                cwt_expires_ms,
+                session_token: _,
+            } => f
+                .debug_struct("Approved")
+                .field("account_id", account_id)
+                .field("handle", handle)
+                .field("device_id", device_id)
+                .field("root_pubkey_b64", root_pubkey_b64)
+                .field("device_cwt_b64", &"[REDACTED]")
+                .field("cwt_expires_ms", cwt_expires_ms)
+                .field("session_token", &"[REDACTED]")
+                .finish(),
+            Self::Expired => write!(f, "Expired"),
+            Self::Denied => write!(f, "Denied"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct RenewMyDeviceResponse {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub device_id: u64,
+    pub device_cwt_b64: String,
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub cwt_expires_ms: u64,
+}
+
+impl fmt::Debug for RenewMyDeviceResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RenewMyDeviceResponse")
+            .field("device_id", &self.device_id)
+            .field("device_cwt_b64", &"[REDACTED]")
+            .field("cwt_expires_ms", &self.cwt_expires_ms)
+            .finish()
     }
 }

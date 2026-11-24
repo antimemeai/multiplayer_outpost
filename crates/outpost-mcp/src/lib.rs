@@ -21,8 +21,9 @@ pub mod tools;
 
 pub use backend::{
     BackendError, BoardEnvelopeEvent, BoardPostReq, BoardReadResp, BoxFuture, CancellationToken,
-    McpOutpostBackend, McpPartyEvent, McpPartyEventKind, PartyPollReq, PartyPollResp,
-    PartySendReq, PartyWaitReq, PeerProvenance, ProgressSender, ProgressUpdate,
+    FriendAddReq, McpOutpostBackend, McpPartyEvent, McpPartyEventKind, PartyInviteReq,
+    PartyJoinReq, PartyLeaveReq, PartyPollReq, PartyPollResp, PartySendReq, PartyWaitReq,
+    PeerProvenance, ProgressSender, ProgressUpdate,
 };
 pub use stdio::{
     DEFAULT_PROGRESS_INTERVAL, MAX_LINE_BYTES, McpServerConfig, SUPPORTED_PROTOCOL_VERSIONS,

@@ -140,6 +140,31 @@ pub struct PartyWaitReq {
     pub timeout_ms: u32,
 }
 
+/// Request payload for `party_invite` (creates a room if not in one and optionally rings `@handle`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PartyInviteReq {
+    pub handle: Option<String>,
+    pub name: Option<String>,
+}
+
+/// Request payload for `party_join` (joins by `@handle`, 4-char code, URL, or empty for latest invite).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PartyJoinReq {
+    pub target: Option<String>,
+}
+
+/// Request payload for `party_leave` (leaves the active party or explicit `party_id`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PartyLeaveReq {
+    pub party_id: Option<u64>,
+}
+
+/// Request payload for `friend_add` (sends or accepts a friend request by `@handle`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FriendAddReq {
+    pub handle: String,
+}
+
 /// Cryptographically authenticated peer provenance resolved by the daemon (never from untrusted wire hints).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerProvenance {
@@ -277,4 +302,8 @@ pub trait McpOutpostBackend: Send + Sync + 'static {
         progress: Option<ProgressSender>,
     ) -> BoxFuture<'_, Result<PartyPollResp, BackendError>>;
     fn party_friends(&self) -> BoxFuture<'_, Result<Value, BackendError>>;
+    fn party_invite(&self, req: PartyInviteReq) -> BoxFuture<'_, Result<Value, BackendError>>;
+    fn party_join(&self, req: PartyJoinReq) -> BoxFuture<'_, Result<Value, BackendError>>;
+    fn party_leave(&self, req: PartyLeaveReq) -> BoxFuture<'_, Result<Value, BackendError>>;
+    fn friend_add(&self, req: FriendAddReq) -> BoxFuture<'_, Result<Value, BackendError>>;
 }

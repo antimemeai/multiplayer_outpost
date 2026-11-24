@@ -957,6 +957,38 @@ async fn execute_tool_call<B: McpOutpostBackend>(
             let res = call_idempotent_read(&cancel, || backend.party_friends()).await;
             map_value_result(res, include_structured)
         }
+        ParsedToolCall::PartyInvite(req) => {
+            let res = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return CallOutcome::Cancelled,
+                r = backend.party_invite(req) => r,
+            };
+            map_value_result(res, include_structured)
+        }
+        ParsedToolCall::PartyJoin(req) => {
+            let res = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return CallOutcome::Cancelled,
+                r = backend.party_join(req) => r,
+            };
+            map_value_result(res, include_structured)
+        }
+        ParsedToolCall::PartyLeave(req) => {
+            let res = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return CallOutcome::Cancelled,
+                r = backend.party_leave(req) => r,
+            };
+            map_value_result(res, include_structured)
+        }
+        ParsedToolCall::FriendAdd(req) => {
+            let res = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return CallOutcome::Cancelled,
+                r = backend.friend_add(req) => r,
+            };
+            map_value_result(res, include_structured)
+        }
         ParsedToolCall::PartySend(req) => {
             let client_msg_id = req.client_msg_id;
             let res = tokio::select! {

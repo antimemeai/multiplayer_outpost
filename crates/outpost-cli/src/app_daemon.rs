@@ -11,7 +11,7 @@
 //!   - Authenticated `peer_pubkey` attribution into `PartyEventRing` + `Notify` waiters
 //!   - Outbound `scan_outbound_secrets` + `DedupeCache` + `plan_send_recipients`
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -27,8 +27,9 @@ use mp_protocol::{
 use outpost_control::{
     ApprovePartyRequest, ChurnStatus, ControlClient, ControlError, CreatePartyRequest,
     EndpointUpdateCoalescer, EvictionChurnDetector, JoinPartyRequest, JoinPartyResponse,
-    MintPartyInviteRequest, Mp1WsEvent, Mp1WsTarget, RequestSigner, WsConnectError,
-    sleep_aware_now_ms, wall_now_ms, wall_now_secs,
+    MAX_MP2_BODY_BYTES, MintPartyInviteRequest, Mp1WsEvent, Mp1WsTarget, Mp2Ack, Mp2Event,
+    Mp2EventKind, Mp2Member, Mp2RoomEvent, RequestSigner, RoomEnterRequest, RoomInviteRequest,
+    WsConnectError, sleep_aware_now_ms, wall_now_ms, wall_now_secs,
 };
 use outpost_core::fence::scan_outbound_secrets;
 use outpost_core::ipc_wire::IpcOpcode;
@@ -38,7 +39,8 @@ use outpost_core::p2p_wire::{
 };
 use outpost_core::party_state::{
     DEFAULT_POLL_MAX_BYTES, DedupeCache, DedupeLookup, EpochFloorStore, PartyEventBody,
-    PartyEventRing, PeerSendCandidate, SendPlanError, SendTarget, plan_send_recipients,
+    PartyEventRing, PeerSendCandidate, SendPlanError, SendTarget, SendTrustPolicy,
+    plan_send_recipients_with_policy,
 };
 use outpost_core::storage_codec::{DeviceRecord, PeerRecord, PeersStoreRecord, TrustState};
 use outpost_core::trust::{
@@ -50,39 +52,49 @@ use outpost_p2p::{
     CLOSE_PEER_REVOKED, CLOSE_UNAUTHORIZED, P2pEventStream, P2pTransportEvent, PartyP2pConfig,
     PartyP2pHandle, PartyP2pTransport, PeerDialTarget, Watcher as _,
 };
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
 use crate::build_info::{build_digest, build_order};
 use crate::ipc_payloads::{
     ActivePartySummary, ERR_CANCELLED, ERR_CONFLICT, ERR_CONTROL_PLANE, ERR_IDEMPOTENCY_CONFLICT,
-    ERR_INTERNAL, ERR_INVALID_PARAMS, ERR_NOT_FOUND, FriendItem, FriendsListResp, IpcPartyEvent,
-    IpcPartyEventKind, IpcProvenance, JoinRequestItem, KeyMismatchAlert, MemberInfo,
-    PartyCreateResp, PartyEpochResp, PartyInviteMintResp, PartyJoinResp, PartyListResp,
-    PartyMembersResp, PartyPollIpcResp, PartyRequestApproveResp, PartyRequestsListResp,
-    ReloadDeviceResp, ResolveHandleResp, SendResultResp, StatusResp, UnpinnedPeerAlert,
-    decode_control_notice_req, decode_party_create_req, decode_party_epoch_op_req,
-    decode_party_invite_mint_req, decode_party_invite_revoke_req, decode_party_join_req,
-    decode_party_kick_req, decode_party_poll_req, decode_party_post_board_req,
-    decode_party_promote_req, decode_party_request_approve_req, decode_party_request_reject_req,
+    ERR_INTERNAL, ERR_INVALID_PARAMS, ERR_NOT_FOUND, FriendItem, FriendsListResp,
+    FriendsLiveIpcResp, IpcPartyEvent, IpcPartyEventKind, IpcProvenance, JoinRequestItem,
+    KeyMismatchAlert, LiveFriendIpc, MemberInfo, PartyCreateResp, PartyEpochResp,
+    PartyInviteMintResp, PartyJoinResp, PartyListResp, PartyMembersResp, PartyPollIpcResp,
+    PartyRequestApproveResp, PartyRequestsListResp, PendingInviteIpc, ReloadDeviceResp,
+    ResolveHandleResp, RoomEnterIpcResp, RoomInviteIpcResp, RoomLeaveIpcResp, RoomMemberIpc,
+    SendResultResp, StatusResp, UnpinnedPeerAlert, decode_control_notice_req,
+    decode_party_create_req, decode_party_epoch_op_req, decode_party_invite_mint_req,
+    decode_party_invite_revoke_req, decode_party_join_req, decode_party_kick_req,
+    decode_party_poll_req, decode_party_post_board_req, decode_party_promote_req,
+    decode_party_request_approve_req, decode_party_request_reject_req,
     decode_party_requests_list_req, decode_party_send_chat_req, decode_party_wait_req,
-    decode_resolve_handle_req, decode_u64_req, encode_bool_resp, encode_friend_edge_resp,
-    encode_friends_list_resp, encode_party_create_resp, encode_party_epoch_resp,
-    encode_party_invite_mint_resp, encode_party_join_resp, encode_party_list_resp,
-    encode_party_members_resp, encode_party_poll_resp, encode_party_request_approve_resp,
-    encode_party_requests_list_resp, encode_reload_resp, encode_resolve_handle_resp,
-    encode_send_result_resp, encode_status_resp, secret_kind_to_error_code, trust_state_to_u8,
+    decode_resolve_handle_req, decode_room_enter_req, decode_room_invite_req,
+    decode_room_leave_req, decode_u64_req, encode_bool_resp, encode_friend_edge_resp,
+    encode_friends_list_resp, encode_friends_live_resp, encode_party_create_resp,
+    encode_party_epoch_resp, encode_party_invite_mint_resp, encode_party_join_resp,
+    encode_party_list_resp, encode_party_members_resp, encode_party_poll_resp,
+    encode_party_request_approve_resp, encode_party_requests_list_resp, encode_reload_resp,
+    encode_resolve_handle_resp, encode_room_enter_resp, encode_room_invite_resp,
+    encode_room_leave_resp, encode_send_result_resp, encode_status_resp, secret_kind_to_error_code,
+    trust_state_to_u8,
 };
 use crate::storage::{
     build_control_client_config, load_device_record, load_epochs_store, load_peers_store,
-    lock_state, open_state_dir, pubkey_fingerprint_hex, save_epochs_store, save_peers_store,
+    lock_state, open_state_dir, pubkey_fingerprint_hex, save_device_record, save_epochs_store,
+    save_peers_store,
 };
 
 const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
 const WS_RECONNECT_SILENCE_MS: u64 = 45_000;
 const WS_P2P_REVOKE_SILENCE_MS: u64 = 60_000;
 const CWT_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+const CWT_AUTO_RENEW_THRESHOLD_MS: u64 = 3 * 24 * 3600 * 1000;
+const CWT_AUTO_RENEW_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
+const MP2_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_TRACKED_MP2_MSG_IDS: usize = 256;
 const MAX_WAIT_TIMEOUT_MS: u32 = 45_000;
 const P2P_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 const UNATTENDED_DETACH_MS: u64 = 30 * 60 * 1000;
@@ -132,6 +144,17 @@ struct CachedAccountProvenance {
     safety_number: String,
 }
 
+enum Mp2OutboundCmd {
+    Send {
+        client_msg_id: String,
+        kind: Mp2EventKind,
+        target: String,
+        body_encoding: String,
+        body: String,
+        ack_tx: oneshot::Sender<Result<Mp2Ack, String>>,
+    },
+}
+
 struct ActivePartySession {
     party_id: u64,
     party_epoch: u64,
@@ -143,14 +166,24 @@ struct ActivePartySession {
     effective_relay_policy: RelayPolicy,
     max_members: u8,
     pinned_relay_url: String,
+    room_code: String,
+    room_name: String,
+    share_url: String,
+    ws_path: String,
     members: HashMap<u64, PartyMemberState>,
+    mp2_members: Vec<Mp2Member>,
+    mp2_connected: bool,
+    mp2_last_seq: u64,
+    mp2_seen_seqs: VecDeque<u64>,
+    sent_mp2_msg_ids: VecDeque<String>,
+    mp2_tx: Option<mpsc::Sender<Mp2OutboundCmd>>,
     pubkey_to_device: HashMap<[u8; 32], u64>,
     provenance_by_account: HashMap<u64, CachedAccountProvenance>,
     unpinned_alerts: HashMap<u64, UnpinnedPeerAlert>,
     key_mismatch_alerts: HashMap<u64, KeyMismatchAlert>,
     ring: PartyEventRing,
     wait_notify: Arc<Notify>,
-    p2p: Arc<PartyP2pHandle>,
+    p2p: Option<Arc<PartyP2pHandle>>,
     p2p_event_task: Option<JoinHandle<()>>,
     ws_stop: CancellationToken,
     ws_task: Option<JoinHandle<()>>,
@@ -159,6 +192,7 @@ struct ActivePartySession {
 
 impl ActivePartySession {
     fn summary(&self) -> ActivePartySummary {
+        let member_count = self.members.len().max(self.mp2_members.len());
         ActivePartySummary {
             party_id: self.party_id,
             party_epoch: self.party_epoch,
@@ -170,9 +204,12 @@ impl ActivePartySession {
             effective_relay_policy: self.effective_relay_policy as u8,
             pinned_relay_url: self.pinned_relay_url.clone(),
             max_members: self.max_members,
-            member_count: u8::try_from(self.members.len()).unwrap_or(u8::MAX),
+            member_count: u8::try_from(member_count).unwrap_or(u8::MAX),
             next_seq: self.ring.latest_seq(),
             daemon_epoch: self.ring.daemon_epoch,
+            room_code: self.room_code.clone(),
+            room_name: self.room_name.clone(),
+            share_url: self.share_url.clone(),
         }
     }
 
@@ -180,6 +217,27 @@ impl ActivePartySession {
         let seq = self.ring.push(body);
         self.wait_notify.notify_waiters();
         seq
+    }
+
+    fn record_sent_mp2_msg_id(&mut self, id: String) {
+        while self.sent_mp2_msg_ids.len() >= MAX_TRACKED_MP2_MSG_IDS {
+            let _ = self.sent_mp2_msg_ids.pop_front();
+        }
+        self.sent_mp2_msg_ids.push_back(id);
+    }
+
+    fn mark_mp2_seq_seen(&mut self, seq: u64) -> bool {
+        if self.mp2_seen_seqs.iter().any(|&seen| seen == seq) {
+            return false;
+        }
+        while self.mp2_seen_seqs.len() >= MAX_TRACKED_MP2_MSG_IDS {
+            let _ = self.mp2_seen_seqs.pop_front();
+        }
+        self.mp2_seen_seqs.push_back(seq);
+        if seq > self.mp2_last_seq {
+            self.mp2_last_seq = seq;
+        }
+        true
     }
 }
 
@@ -202,6 +260,7 @@ struct DaemonRuntimeState {
 pub struct AppDaemon {
     state_dir_path: PathBuf,
     device_id: u64,
+    strict_pins: bool,
     exe_path: String,
     cached_daemon_epoch: AtomicU64,
     active_party_atomic: AtomicU64,
@@ -214,11 +273,28 @@ pub struct AppDaemon {
 }
 
 impl AppDaemon {
+    #[cfg(test)]
     pub fn load(
+        state_dir_path: PathBuf,
+        runtime_dir_override: Option<PathBuf>,
+        device_id: u64,
+    ) -> Result<Arc<Self>, String> {
+        let env_strict = std::env::var("OUTPOST_STRICT_PINS")
+            .ok()
+            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"));
+        Self::load_with_options(state_dir_path, runtime_dir_override, device_id, env_strict)
+    }
+
+    pub fn load_with_options(
         state_dir_path: PathBuf,
         _runtime_dir_override: Option<PathBuf>,
         device_id: u64,
+        strict_pins: bool,
     ) -> Result<Arc<Self>, String> {
+        let env_strict = std::env::var("OUTPOST_STRICT_PINS")
+            .ok()
+            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"));
+        let effective_strict = strict_pins || env_strict;
         let state_dir = open_state_dir(&state_dir_path)?;
         let _lock = lock_state(&state_dir)?;
         let device = load_device_record(&state_dir_path, device_id)?;
@@ -259,6 +335,7 @@ impl AppDaemon {
         let daemon = Arc::new(Self {
             state_dir_path,
             device_id,
+            strict_pins: effective_strict,
             exe_path,
             cached_daemon_epoch: AtomicU64::new(0),
             active_party_atomic: AtomicU64::new(0),
@@ -273,7 +350,15 @@ impl AppDaemon {
         Ok(daemon)
     }
 
-    /// Starts background control-plane Account WS & account identity fetch once after
+    const fn send_trust_policy(&self) -> SendTrustPolicy {
+        if self.strict_pins {
+            SendTrustPolicy::StrictManualPins
+        } else {
+            SendTrustPolicy::AllowUnpinnedAuthenticated
+        }
+    }
+
+    /// Starts background control-plane Account WS & silent CWT auto-renewal once after
     /// `daemon.lock` is held and `daemon_epoch` is assigned (never before!).
     pub fn start_background_tasks(self: &Arc<Self>) {
         if self.bg_started.swap(true, Ordering::AcqRel) {
@@ -283,6 +368,87 @@ impl AppDaemon {
         tokio::spawn(async move {
             this.run_account_ws_loop().await;
         });
+        let this_renew = Arc::clone(self);
+        tokio::spawn(async move {
+            this_renew.run_cwt_auto_renew_loop().await;
+        });
+    }
+
+    async fn run_cwt_auto_renew_loop(self: Arc<Self>) {
+        let _ = self.maybe_renew_cwt_silently().await;
+        let mut iv = tokio::time::interval(CWT_AUTO_RENEW_CHECK_INTERVAL);
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        iv.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => return,
+                _ = iv.tick() => {
+                    let _ = self.maybe_renew_cwt_silently().await;
+                }
+            }
+        }
+    }
+
+    /// Silently renews the local ephemeral device CWT via `POST /v1/devices/me/renew`
+    /// whenever `< 3` days remain (`ROOM_PROTOCOL_V2.md` §4.3).
+    pub(crate) async fn maybe_renew_cwt_silently(&self) -> bool {
+        let now_ms = wall_now_ms();
+        let (control, root_pubkey, device_pubkey, needs_renew) = {
+            let st = self.inner.lock().await;
+            let remaining = st.cwt_expires_ms.saturating_sub(now_ms);
+            (
+                st.control.clone(),
+                st.device.root_pubkey,
+                st.device.device_pubkey,
+                remaining < CWT_AUTO_RENEW_THRESHOLD_MS,
+            )
+        };
+        if !needs_renew {
+            return false;
+        }
+
+        let Ok(resp) = control.renew_my_device().await else {
+            return false;
+        };
+        let Ok(new_cwt) = B64.decode(resp.device_cwt_b64.as_bytes()) else {
+            return false;
+        };
+        let Ok(claims) = verify_device_cwt(
+            &new_cwt,
+            &root_pubkey,
+            Some(&device_pubkey),
+            wall_now_secs(),
+        ) else {
+            log_line("ignoring invalid device_cwt returned by /v1/devices/me/renew");
+            return false;
+        };
+
+        let new_exp_ms = u64::try_from(claims.exp.max(0))
+            .unwrap_or(0)
+            .saturating_mul(1000)
+            .max(resp.cwt_expires_ms);
+
+        let updated_dev = {
+            let mut st = self.inner.lock().await;
+            st.device.device_cwt = new_cwt;
+            st.cwt_expires_ms = new_exp_ms;
+            st.device.clone()
+        };
+
+        let state_dir_path = self.state_dir_path.clone();
+        let persist = tokio::task::spawn_blocking(move || {
+            let state_dir = open_state_dir(&state_dir_path)?;
+            let lock = lock_state(&state_dir)?;
+            save_device_record(&state_dir_path, &lock, &updated_dev)
+        })
+        .await;
+        if let Ok(Ok(())) = persist {
+            log_line("silently renewed device CWT via /v1/devices/me/renew");
+            true
+        } else {
+            false
+        }
     }
 
     fn daemon_epoch(&self) -> u64 {
@@ -331,24 +497,25 @@ impl AppDaemon {
         let this = Arc::clone(self);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                // 1. Immediately send Lane 2 Idle pulse to all connected admitted peers.
+                // 1. Immediately send Lane 2 Idle pulse to all connected admitted P2P peers (if P2P active).
                 let pulse_targets: Option<(Arc<PartyP2pHandle>, Vec<[u8; 32]>)> = {
                     let st = this.inner.lock().await;
                     st.active_party
                         .as_ref()
                         .filter(|s| s.party_id == active_pid)
-                        .map(|sess| {
+                        .and_then(|sess| {
+                            let p2p = sess.p2p.as_ref()?;
                             let pks: Vec<[u8; 32]> = sess
                                 .members
                                 .values()
                                 .filter(|m| {
                                     m.record.device_id.get() != this.device_id
                                         && m.admitted
-                                        && sess.p2p.is_peer_connected(&m.record.device_pubkey)
+                                        && p2p.is_peer_connected(&m.record.device_pubkey)
                                 })
                                 .map(|m| m.record.device_pubkey)
                                 .collect();
-                            (Arc::clone(&sess.p2p), pks)
+                            Some((Arc::clone(p2p), pks))
                         })
                 };
                 if let Some((p2p, pks)) = pulse_targets {
@@ -558,7 +725,9 @@ impl AppDaemon {
                     let p2p = {
                         let mut st = self.inner.lock().await;
                         st.dual_host_churn_alert = true;
-                        st.active_party.as_ref().map(|s| Arc::clone(&s.p2p))
+                        st.active_party
+                            .as_ref()
+                            .and_then(|s| s.p2p.as_ref().map(Arc::clone))
                     };
                     if let Some(p) = p2p {
                         p.set_allowed_peers_with_close_code(HashSet::new(), CLOSE_UNAUTHORIZED);
@@ -674,23 +843,34 @@ impl AppDaemon {
             return;
         }
         // Strictly attribute exclusively from authenticated TLS 1.3 RPK `peer_pubkey`
-        // bound through CWT + pinned root_pubkey!
+        // bound through CWT!
         let Some(&dev_id) = session.pubkey_to_device.get(&peer_pubkey) else {
-            let p2p = Arc::clone(&session.p2p);
+            let p2p = session.p2p.as_ref().map(Arc::clone);
             drop(st);
-            p2p.revoke_peer(peer_pubkey, CLOSE_UNAUTHORIZED);
+            if let Some(p) = p2p {
+                p.revoke_peer(peer_pubkey, CLOSE_UNAUTHORIZED);
+            }
             return;
         };
         let Some(member) = session.members.get(&dev_id) else {
-            let p2p = Arc::clone(&session.p2p);
+            let p2p = session.p2p.as_ref().map(Arc::clone);
             drop(st);
-            p2p.revoke_peer(peer_pubkey, CLOSE_UNAUTHORIZED);
+            if let Some(p) = p2p {
+                p.revoke_peer(peer_pubkey, CLOSE_UNAUTHORIZED);
+            }
             return;
         };
-        if !member.admitted || member.trust_state != TrustState::PinnedTrusted || member.key_mismatch {
-            let p2p = Arc::clone(&session.p2p);
+        let trust_ok = if self.strict_pins {
+            member.trust_state == TrustState::PinnedTrusted
+        } else {
+            member.trust_state != TrustState::RevokedBlocked
+        };
+        if !member.admitted || !trust_ok || member.key_mismatch {
+            let p2p = session.p2p.as_ref().map(Arc::clone);
             drop(st);
-            p2p.revoke_peer(peer_pubkey, CLOSE_UNAUTHORIZED);
+            if let Some(p) = p2p {
+                p.revoke_peer(peer_pubkey, CLOSE_UNAUTHORIZED);
+            }
             return;
         }
 
@@ -742,11 +922,12 @@ impl AppDaemon {
         self: &Arc<Self>,
         party_id: u64,
         ws_stop: CancellationToken,
+        mp2_rx: mpsc::Receiver<Mp2OutboundCmd>,
     ) -> (JoinHandle<()>, JoinHandle<()>) {
         let this_ws = Arc::clone(self);
         let stop_ws = ws_stop.clone();
         let ws_task = tokio::spawn(async move {
-            this_ws.run_party_ws_loop(party_id, stop_ws).await;
+            this_ws.run_party_ws_loop(party_id, stop_ws, mp2_rx).await;
         });
 
         let this_cwt = Arc::clone(self);
@@ -786,7 +967,7 @@ impl AppDaemon {
             if let Some(session) = st.active_party.as_mut()
                 && session.party_id == party_id
             {
-                p2p_opt = Some(Arc::clone(&session.p2p));
+                p2p_opt = session.p2p.as_ref().map(Arc::clone);
                 let mut any_expired = false;
                 for m in session.members.values_mut() {
                     if m.record.device_id.get() != local_dev_id
@@ -799,7 +980,12 @@ impl AppDaemon {
                     }
                 }
                 if any_expired {
-                    let dup_pks = rebuild_pubkey_to_device(session, local_dev_id, local_dev_pk);
+                    let dup_pks = rebuild_pubkey_to_device(
+                        session,
+                        local_dev_id,
+                        local_dev_pk,
+                        self.strict_pins,
+                    );
                     to_revoke.extend(dup_pks);
                 }
             }
@@ -822,10 +1008,305 @@ impl AppDaemon {
         }
     }
 
-    async fn run_party_ws_loop(self: Arc<Self>, party_id: u64, stop: CancellationToken) {
+    async fn run_party_ws_loop(
+        self: Arc<Self>,
+        party_id: u64,
+        stop: CancellationToken,
+        mut mp2_rx: mpsc::Receiver<Mp2OutboundCmd>,
+    ) {
         let Ok(pid) = PartyId::new(party_id) else {
             return;
         };
+        let mut backoff_ms: u64 = 250;
+
+        loop {
+            if stop.is_cancelled() || self.shutdown.is_cancelled() {
+                return;
+            }
+
+            let (control, ws_path, has_p2p) = {
+                let st = self.inner.lock().await;
+                let Some(sess) = st.active_party.as_ref() else {
+                    return;
+                };
+                if sess.party_id != party_id {
+                    return;
+                }
+                let path = if sess.ws_path.is_empty() {
+                    format!("/v1/parties/{party_id}/ws")
+                } else {
+                    sess.ws_path.clone()
+                };
+                (st.control.clone(), path, sess.p2p.is_some())
+            };
+
+            match control.connect_mp2_room_path(&ws_path).await {
+                Ok(mut ws) => {
+                    backoff_ms = 250;
+                    {
+                        let mut st = self.inner.lock().await;
+                        if let Some(sess) = st.active_party.as_mut()
+                            && sess.party_id == party_id
+                        {
+                            sess.mp2_connected = true;
+                        }
+                    }
+
+                    let mut ping_iv = tokio::time::interval(WS_PING_INTERVAL);
+                    ping_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    ping_iv.tick().await;
+                    let mut ack_waiters: HashMap<String, oneshot::Sender<Result<Mp2Ack, String>>> =
+                        HashMap::new();
+
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = stop.cancelled() => {
+                                let _ = ws.close(1000, "party_stop").await;
+                                return;
+                            }
+                            _ = self.shutdown.cancelled() => {
+                                let _ = ws.close(1000, "daemon_shutdown").await;
+                                return;
+                            }
+                            maybe_cmd = mp2_rx.recv() => {
+                                let Some(cmd) = maybe_cmd else {
+                                    let _ = ws.close(1000, "channel_closed").await;
+                                    return;
+                                };
+                                match cmd {
+                                    Mp2OutboundCmd::Send {
+                                        client_msg_id,
+                                        kind,
+                                        target,
+                                        body_encoding,
+                                        body,
+                                        ack_tx,
+                                    } => {
+                                        match ws
+                                            .send_event(
+                                                &client_msg_id,
+                                                kind,
+                                                &target,
+                                                &body_encoding,
+                                                &body,
+                                            )
+                                            .await
+                                        {
+                                            Ok(()) => {
+                                                ack_waiters.insert(client_msg_id, ack_tx);
+                                            }
+                                            Err(e) => {
+                                                let _ = ack_tx.send(Err(e.to_string()));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ = ping_iv.tick() => {
+                                if ws.silence_ms() > WS_RECONNECT_SILENCE_MS {
+                                    let _ = ws.close(1000, "ping_timeout").await;
+                                    break;
+                                }
+                                if ws.send_ping().await.is_err() {
+                                    break;
+                                }
+                            }
+                            ev = ws.next_event() => {
+                                match ev {
+                                    Ok(Some(Mp2RoomEvent::Pong)) => {}
+                                    Ok(Some(Mp2RoomEvent::Hello(hello))) => {
+                                        let resume_seq = self.handle_mp2_hello(party_id, hello).await;
+                                        if let Some(seq) = resume_seq
+                                            && ws.send_resume(seq).await.is_err()
+                                        {
+                                            break;
+                                        }
+                                        let _ = ws
+                                            .send_status("outpost", "Outpost", "idle", None)
+                                            .await;
+                                    }
+                                    Ok(Some(Mp2RoomEvent::Event(room_ev))) => {
+                                        self.handle_mp2_event(party_id, room_ev).await;
+                                    }
+                                    Ok(Some(Mp2RoomEvent::Ack(ack))) => {
+                                        if let Some(tx) = ack_waiters.remove(&ack.client_msg_id) {
+                                            let _ = tx.send(Ok(ack));
+                                        }
+                                    }
+                                    Ok(Some(Mp2RoomEvent::Presence { members })) => {
+                                        self.handle_mp2_presence(party_id, members).await;
+                                    }
+                                    Ok(Some(Mp2RoomEvent::Error { code, message, .. })) => {
+                                        log_line(&format!(
+                                            "Party {party_id} mp2 room error ({code}): {message}"
+                                        ));
+                                    }
+                                    Ok(Some(Mp2RoomEvent::Closed { code, .. })) => {
+                                        if matches!(code, Some(4401) | Some(4403)) {
+                                            self.teardown_active_party(
+                                                party_id,
+                                                "mp2_ws_closed_unauthorized",
+                                            )
+                                            .await;
+                                            return;
+                                        }
+                                        break;
+                                    }
+                                    Ok(None) | Err(_) => {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    for (_, tx) in ack_waiters.drain() {
+                        let _ = tx.send(Err("mp2 WebSocket disconnected before ack".to_string()));
+                    }
+                    {
+                        let mut st = self.inner.lock().await;
+                        if let Some(sess) = st.active_party.as_mut()
+                            && sess.party_id == party_id
+                        {
+                            sess.mp2_connected = false;
+                        }
+                    }
+                }
+                Err(WsConnectError::MissingSubprotocol { .. }) if has_p2p => {
+                    // Server speaks legacy `mp1` only (no `mp2` support); fall back cleanly.
+                    self.run_legacy_mp1_party_ws_loop(pid, stop).await;
+                    return;
+                }
+                Err(WsConnectError::Terminal(code)) => {
+                    log_line(&format!(
+                        "Party {party_id} mp2 WS terminal HTTP {code}; tearing down party"
+                    ));
+                    self.teardown_active_party(party_id, &format!("ws_terminal_http_{code}"))
+                        .await;
+                    return;
+                }
+                Err(_) => {
+                    // Drain any waiting outbound sends so callers fail fast instead of hanging.
+                    while let Ok(cmd) = mp2_rx.try_recv() {
+                        let Mp2OutboundCmd::Send { ack_tx, .. } = cmd;
+                        let _ = ack_tx.send(Err("reconnecting to party room...".to_string()));
+                    }
+                }
+            }
+
+            tokio::select! {
+                _ = stop.cancelled() => return,
+                _ = self.shutdown.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+            }
+            backoff_ms = (backoff_ms.saturating_mul(2)).min(5_000);
+        }
+    }
+
+    async fn handle_mp2_hello(
+        &self,
+        party_id: u64,
+        hello: outpost_control::Mp2Hello,
+    ) -> Option<u64> {
+        let mut st = self.inner.lock().await;
+        if !hello.self_info.handle.is_empty() {
+            st.own_handle = hello.self_info.handle.clone();
+        }
+        let prev_seq = st
+            .active_party
+            .as_ref()
+            .filter(|s| s.party_id == party_id)
+            .map_or(0, |s| s.mp2_last_seq);
+
+        for m in &hello.members {
+            if m.account_id > 0 && !m.handle.is_empty() {
+                st.handle_cache.insert(m.account_id, m.handle.clone());
+            }
+        }
+        let peers_clone = st.peers.clone();
+        let auth_hash = api_authority_hash(&st.device.api_authority);
+
+        if let Some(sess) = st.active_party.as_mut()
+            && sess.party_id == party_id
+        {
+            if !hello.room_code.is_empty() {
+                sess.room_code = hello.room_code;
+            }
+            if !hello.name.is_empty() {
+                sess.room_name = hello.name;
+            }
+            sess.mp2_connected = true;
+            sess.mp2_members = hello.members.clone();
+            update_mp2_provenance_cache(sess, &hello.members, auth_hash, &peers_clone);
+
+            let earliest_history_seq = hello.history.first().map(|e| e.seq);
+            let history_was_empty = hello.history.is_empty();
+            for ev in hello.history {
+                ingest_mp2_event_into_session(sess, ev);
+            }
+            // If we reconnected after having seen `prev_seq > 0`, check whether `hello.history`
+            // left a gap between `prev_seq` and the earliest history event (or was empty while
+            // `latest_seq > prev_seq`). Resume from `prev_seq` so no missed messages are dropped.
+            if prev_seq > 0 {
+                let has_gap_before_history =
+                    earliest_history_seq.is_some_and(|first| first > prev_seq.saturating_add(1));
+                if has_gap_before_history || (history_was_empty && hello.latest_seq > prev_seq) {
+                    return Some(prev_seq);
+                }
+                if hello.latest_seq > sess.mp2_last_seq {
+                    return Some(sess.mp2_last_seq);
+                }
+            } else if sess.mp2_last_seq < hello.latest_seq {
+                sess.mp2_last_seq = hello.latest_seq;
+            }
+        }
+        None
+    }
+
+    async fn handle_mp2_event(&self, party_id: u64, ev: Mp2Event) {
+        let mut st = self.inner.lock().await;
+        if !ev.sender.handle.is_empty() && ev.sender.account_id > 0 {
+            st.handle_cache
+                .insert(ev.sender.account_id, ev.sender.handle.clone());
+        }
+        if let Some(sess) = st.active_party.as_mut()
+            && sess.party_id == party_id
+        {
+            if !ev.sender.handle.is_empty() && ev.sender.account_id > 0 {
+                sess.provenance_by_account
+                    .entry(ev.sender.account_id)
+                    .and_modify(|p| p.handle = ev.sender.handle.clone())
+                    .or_insert_with(|| CachedAccountProvenance {
+                        handle: ev.sender.handle.clone(),
+                        fingerprint: String::new(),
+                        safety_number: String::new(),
+                    });
+            }
+            ingest_mp2_event_into_session(sess, ev);
+        }
+    }
+
+    async fn handle_mp2_presence(&self, party_id: u64, members: Vec<Mp2Member>) {
+        let mut st = self.inner.lock().await;
+        for m in &members {
+            if m.account_id > 0 && !m.handle.is_empty() {
+                st.handle_cache.insert(m.account_id, m.handle.clone());
+            }
+        }
+        let peers_clone = st.peers.clone();
+        let auth_hash = api_authority_hash(&st.device.api_authority);
+        if let Some(sess) = st.active_party.as_mut()
+            && sess.party_id == party_id
+        {
+            sess.mp2_members = members.clone();
+            update_mp2_provenance_cache(sess, &members, auth_hash, &peers_clone);
+        }
+    }
+
+    async fn run_legacy_mp1_party_ws_loop(self: Arc<Self>, pid: PartyId, stop: CancellationToken) {
+        let party_id = pid.get();
         let mut churn = EvictionChurnDetector::new();
         let mut backoff_ms: u64 = 250;
         let mut had_session = false;
@@ -845,11 +1326,14 @@ impl AppDaemon {
                 if sess.party_id != party_id {
                     return;
                 }
+                let Some(p2p) = sess.p2p.as_ref() else {
+                    return;
+                };
                 (
                     st.control.clone(),
                     sess.effective_relay_policy,
                     sess.pinned_relay_url.clone(),
-                    Arc::clone(&sess.p2p),
+                    Arc::clone(p2p),
                 )
             };
 
@@ -1010,7 +1494,9 @@ impl AppDaemon {
                     let p2p = {
                         let mut st = self.inner.lock().await;
                         st.dual_host_churn_alert = true;
-                        st.active_party.as_ref().map(|s| Arc::clone(&s.p2p))
+                        st.active_party
+                            .as_ref()
+                            .and_then(|s| s.p2p.as_ref().map(Arc::clone))
                     };
                     if let Some(p) = p2p {
                         p.set_allowed_peers_with_close_code(HashSet::new(), CLOSE_UNAUTHORIZED);
@@ -1312,7 +1798,7 @@ impl AppDaemon {
             }
 
             if policy_violation_reason.is_some() {
-                p2p_opt = Some(Arc::clone(&sess.p2p));
+                p2p_opt = sess.p2p.as_ref().map(Arc::clone);
             } else {
                 sess.party_epoch = snapshot.party_epoch;
                 sess.leader_account_id = snapshot.leader_account_id.get();
@@ -1332,7 +1818,7 @@ impl AppDaemon {
                 let eff_policy = sess.effective_relay_policy;
                 let party_relay = sess.relay_policy;
                 let pinned_relay = sess.pinned_relay_url.clone();
-                p2p_opt = Some(Arc::clone(&sess.p2p));
+                p2p_opt = sess.p2p.as_ref().map(Arc::clone);
 
                 for member in snapshot.members {
                     let dev_id = member.device_id.get();
@@ -1352,6 +1838,7 @@ impl AppDaemon {
                         &peers_clone,
                         now_s,
                         cached_handle,
+                        self.strict_pins,
                         &mut sess.unpinned_alerts,
                         &mut sess.key_mismatch_alerts,
                     );
@@ -1388,7 +1875,8 @@ impl AppDaemon {
                     .collect();
 
                 // L4-6: Rebuild `pubkey_to_device` strictly from admitted non-duplicate remote peers.
-                let dup_pks = rebuild_pubkey_to_device(sess, local_dev_id, local_dev_pk);
+                let dup_pks =
+                    rebuild_pubkey_to_device(sess, local_dev_id, local_dev_pk, self.strict_pins);
                 revoke_4401.extend(dup_pks);
 
                 for (&dev_id, m) in &sess.members {
@@ -1485,7 +1973,7 @@ impl AppDaemon {
             let eff_policy = sess.effective_relay_policy;
             let party_relay = sess.relay_policy;
             let pinned_relay = sess.pinned_relay_url.clone();
-            p2p_opt = Some(Arc::clone(&sess.p2p));
+            p2p_opt = sess.p2p.as_ref().map(Arc::clone);
 
             let m_state = evaluate_member_state(
                 &member,
@@ -1497,6 +1985,7 @@ impl AppDaemon {
                 &peers_clone,
                 now_s,
                 cached_handle,
+                self.strict_pins,
                 &mut sess.unpinned_alerts,
                 &mut sess.key_mismatch_alerts,
             );
@@ -1527,7 +2016,8 @@ impl AppDaemon {
                 }
             }
 
-            let dup_pks = rebuild_pubkey_to_device(sess, local_dev_id, local_dev_pk);
+            let dup_pks =
+                rebuild_pubkey_to_device(sess, local_dev_id, local_dev_pk, self.strict_pins);
             revoke_4401.extend(dup_pks);
 
             if let Some(m) = sess.members.get(&dev_id)
@@ -1606,7 +2096,7 @@ impl AppDaemon {
             let eff_policy = sess.effective_relay_policy;
             let party_relay = sess.relay_policy;
             let pinned_relay = sess.pinned_relay_url.clone();
-            p2p_opt = Some(Arc::clone(&sess.p2p));
+            p2p_opt = sess.p2p.as_ref().map(Arc::clone);
 
             if let Some(existing) = sess.members.get(&device_id).cloned() {
                 let acc_id = existing.record.account_id.get();
@@ -1626,6 +2116,7 @@ impl AppDaemon {
                     &peers_clone,
                     now_s,
                     existing.server_handle,
+                    self.strict_pins,
                     &mut sess.unpinned_alerts,
                     &mut sess.key_mismatch_alerts,
                 );
@@ -1648,7 +2139,8 @@ impl AppDaemon {
                 }
             }
 
-            let dup_pks = rebuild_pubkey_to_device(sess, local_dev_id, local_dev_pk);
+            let dup_pks =
+                rebuild_pubkey_to_device(sess, local_dev_id, local_dev_pk, self.strict_pins);
             revoke_4401.extend(dup_pks);
 
             if let Some(m) = sess.members.get(&device_id)
@@ -1703,7 +2195,7 @@ impl AppDaemon {
             sess.party_epoch = party_epoch;
             let removed = sess.members.remove(&device_id);
             let pk = removed.map(|m| m.record.device_pubkey);
-            let _ = rebuild_pubkey_to_device(sess, local_dev_id, local_dev_pk);
+            let _ = rebuild_pubkey_to_device(sess, local_dev_id, local_dev_pk, self.strict_pins);
             // Remove account alerts if no other devices of that account remain.
             if !sess
                 .members
@@ -1719,7 +2211,7 @@ impl AppDaemon {
                     "member_left: account={account_id} device={device_id} reason={reason:?}"
                 ),
             });
-            (Some(Arc::clone(&sess.p2p)), pk)
+            (sess.p2p.as_ref().map(Arc::clone), pk)
         };
 
         if let (Some(p2p), Some(pk)) = (p2p_opt, revoked_pk) {
@@ -1752,7 +2244,7 @@ impl AppDaemon {
             let eff_policy = sess.effective_relay_policy;
             let party_relay = sess.relay_policy;
             let pinned_relay = sess.pinned_relay_url.clone();
-            p2p_opt = Some(Arc::clone(&sess.p2p));
+            p2p_opt = sess.p2p.as_ref().map(Arc::clone);
             sess.unpinned_alerts.clear();
             sess.key_mismatch_alerts.clear();
 
@@ -1768,6 +2260,7 @@ impl AppDaemon {
                     &peers_clone,
                     now_s,
                     existing.server_handle,
+                    self.strict_pins,
                     &mut sess.unpinned_alerts,
                     &mut sess.key_mismatch_alerts,
                 );
@@ -1803,13 +2296,17 @@ impl AppDaemon {
                 .cloned()
                 .collect();
 
-            let dup_pks = rebuild_pubkey_to_device(sess, local_dev_id, local_dev_pk);
+            let dup_pks =
+                rebuild_pubkey_to_device(sess, local_dev_id, local_dev_pk, self.strict_pins);
             to_revoke_4401.extend(dup_pks);
 
             for (&did, m) in &sess.members {
                 if did != local_dev_id && m.admitted {
                     allowed.insert(m.record.device_pubkey);
-                    if !sess.p2p.is_peer_connected(&m.record.device_pubkey)
+                    if sess
+                        .p2p
+                        .as_ref()
+                        .is_some_and(|p| !p.is_peer_connected(&m.record.device_pubkey))
                         && m.record.connected
                         && let Some(target) = prepare_peer_dial_target(
                             eff_policy,
@@ -1964,6 +2461,7 @@ impl AppDaemon {
         let join_mode = PartyJoinMode::from_u8(summary.join_mode).unwrap_or(PartyJoinMode::InviteOnly);
         let ws_stop = CancellationToken::new();
         let daemon_epoch = self.daemon_epoch();
+        let (mp2_tx, mp2_rx) = mpsc::channel(64);
 
         // Install ActivePartySession BEFORE spawning any driver tasks!
         {
@@ -1984,14 +2482,24 @@ impl AppDaemon {
                 effective_relay_policy: eff_policy,
                 max_members: summary.max_members,
                 pinned_relay_url: relay_for_p2p.unwrap_or_default(),
+                room_code: String::new(),
+                room_name: String::new(),
+                share_url: String::new(),
+                ws_path: format!("/v1/parties/{party_id}/ws"),
                 members: HashMap::new(),
+                mp2_members: Vec::new(),
+                mp2_connected: false,
+                mp2_last_seq: 0,
+                mp2_seen_seqs: VecDeque::new(),
+                sent_mp2_msg_ids: VecDeque::new(),
+                mp2_tx: Some(mp2_tx),
                 pubkey_to_device: HashMap::new(),
                 provenance_by_account: HashMap::new(),
                 unpinned_alerts: HashMap::new(),
                 key_mismatch_alerts: HashMap::new(),
                 ring: PartyEventRing::new(party_id, daemon_epoch),
                 wait_notify: Arc::new(Notify::new()),
-                p2p: Arc::clone(&p2p),
+                p2p: Some(Arc::clone(&p2p)),
                 p2p_event_task: None,
                 ws_stop: ws_stop.clone(),
                 ws_task: None,
@@ -2001,8 +2509,8 @@ impl AppDaemon {
         }
 
         let p2p_event_task = self.spawn_p2p_event_loop(party_id, event_stream, ws_stop.clone());
-        let (ws_task, cwt_task) = self.spawn_party_drivers(party_id, ws_stop);
-        self.attach_party_tasks(party_id, p2p_event_task, ws_task, cwt_task)
+        let (ws_task, cwt_task) = self.spawn_party_drivers(party_id, ws_stop, mp2_rx);
+        self.attach_party_tasks(party_id, Some(p2p_event_task), ws_task, cwt_task)
             .await;
         log_line(&format!("reattached active party {party_id} on daemon startup"));
     }
@@ -2010,7 +2518,7 @@ impl AppDaemon {
     async fn attach_party_tasks(
         &self,
         party_id: u64,
-        p2p_event_task: JoinHandle<()>,
+        p2p_event_task: Option<JoinHandle<()>>,
         ws_task: JoinHandle<()>,
         cwt_task: JoinHandle<()>,
     ) {
@@ -2018,11 +2526,13 @@ impl AppDaemon {
         if let Some(sess) = st.active_party.as_mut()
             && sess.party_id == party_id
         {
-            sess.p2p_event_task = Some(p2p_event_task);
+            sess.p2p_event_task = p2p_event_task;
             sess.ws_task = Some(ws_task);
             sess.cwt_task = Some(cwt_task);
         } else {
-            p2p_event_task.abort();
+            if let Some(t) = p2p_event_task {
+                t.abort();
+            }
             ws_task.abort();
             cwt_task.abort();
         }
@@ -2053,6 +2563,7 @@ impl AppDaemon {
 
         if let Some(mut sess) = removed {
             sess.ws_stop.cancel();
+            sess.mp2_tx = None;
             if let Some(t) = sess.p2p_event_task.take() {
                 t.abort();
             }
@@ -2062,7 +2573,9 @@ impl AppDaemon {
             if let Some(t) = sess.cwt_task.take() {
                 t.abort();
             }
-            sess.p2p.close().await;
+            if let Some(p2p) = sess.p2p.take() {
+                p2p.close().await;
+            }
         }
     }
 
@@ -2171,23 +2684,61 @@ impl AppDaemon {
             ));
         }
 
-        let mut members: Vec<MemberInfo> = sess
-            .members
-            .values()
-            .map(|m| MemberInfo {
-                device_id: m.record.device_id.get(),
-                account_id: m.record.account_id.get(),
-                server_handle: m.server_handle.clone(),
-                root_pubkey: m.record.root_pubkey,
-                trust_state: trust_state_to_u8(m.trust_state),
-                safety_number: m.safety_number.clone(),
-                connected_mp1: m.record.connected,
-                connected_p2p: m.record.device_id.get() == self.device_id
-                    || sess.p2p.is_peer_connected(&m.record.device_pubkey),
-                joined_seq: m.record.joined_seq,
-                key_mismatch: m.key_mismatch,
-            })
-            .collect();
+        let mut members: Vec<MemberInfo> = if !sess.members.is_empty() {
+            sess.members
+                .values()
+                .map(|m| MemberInfo {
+                    device_id: m.record.device_id.get(),
+                    account_id: m.record.account_id.get(),
+                    server_handle: m.server_handle.clone(),
+                    root_pubkey: m.record.root_pubkey,
+                    trust_state: trust_state_to_u8(m.trust_state),
+                    safety_number: m.safety_number.clone(),
+                    connected_mp1: m.record.connected,
+                    connected_p2p: m.record.device_id.get() == self.device_id
+                        || sess.mp2_connected
+                        || sess
+                            .p2p
+                            .as_ref()
+                            .is_some_and(|p| p.is_peer_connected(&m.record.device_pubkey)),
+                    joined_seq: m.record.joined_seq,
+                    key_mismatch: m.key_mismatch,
+                })
+                .collect()
+        } else {
+            let auth_hash = api_authority_hash(&st.device.api_authority);
+            sess.mp2_members
+                .iter()
+                .enumerate()
+                .map(|(idx, m)| {
+                    let (ts, root_pk, sn) = lookup_mp2_member_trust(
+                        auth_hash,
+                        m.account_id,
+                        st.device.account_id,
+                        st.device.root_pubkey,
+                        &st.peers,
+                    );
+                    let dev_id = if m.account_id == st.device.account_id {
+                        m.device_id.unwrap_or(self.device_id)
+                    } else {
+                        m.device_id.unwrap_or(m.account_id)
+                    };
+                    let is_live = m.status.is_empty() || m.status == "live";
+                    MemberInfo {
+                        device_id: dev_id,
+                        account_id: m.account_id,
+                        server_handle: m.handle.clone(),
+                        root_pubkey: root_pk,
+                        trust_state: trust_state_to_u8(ts),
+                        safety_number: sn,
+                        connected_mp1: is_live,
+                        connected_p2p: is_live,
+                        joined_seq: (idx as u64).saturating_add(1),
+                        key_mismatch: false,
+                    }
+                })
+                .collect()
+        };
         members.sort_by_key(|m| (m.joined_seq, m.device_id));
 
         encode_party_members_resp(&PartyMembersResp {
@@ -2237,8 +2788,25 @@ impl AppDaemon {
             }
         }
 
-        let (p2p, target_pks, plan, frame) = {
-            let st = self.inner.lock().await;
+        enum ChatDispatch {
+            Mp2 {
+                tx: mpsc::Sender<Mp2OutboundCmd>,
+                mp2_msg_id: String,
+                target: String,
+                body: String,
+                delivered_preview: Vec<u64>,
+                withheld_unpinned: Vec<u64>,
+            },
+            P2p {
+                p2p: Arc<PartyP2pHandle>,
+                target_pks: Vec<(u64, [u8; 32])>,
+                plan: outpost_core::party_state::SendPlan,
+                frame: P2pPartyFrame,
+            },
+        }
+
+        let dispatch = {
+            let mut st = self.inner.lock().await;
 
             // 2. Live per-connection idempotency dedupe check (read-only until send succeeds!).
             match st.dedupe.check(
@@ -2266,8 +2834,12 @@ impl AppDaemon {
             } else {
                 st.own_handle.clone()
             };
+            let local_acc_id = st.device.account_id;
+            let local_root_pk = st.device.root_pubkey;
+            let auth_hash = api_authority_hash(&st.device.api_authority);
+            let peers_clone = st.peers.clone();
 
-            let Some(sess) = st.active_party.as_ref() else {
+            let Some(sess) = st.active_party.as_mut() else {
                 return Err(ipc_err(ERR_NOT_FOUND, false, "no active party"));
             };
             if sess.party_id != party_id {
@@ -2278,61 +2850,165 @@ impl AppDaemon {
                 ));
             }
 
-            let candidates = build_send_candidates(sess, self.device_id);
-            let target = match req.target_device_id {
-                Some(did) => SendTarget::Device(did),
-                None => SendTarget::Broadcast,
-            };
-            let plan = plan_send_recipients(&candidates, target).map_err(map_send_plan_err)?;
+            // Any key_mismatch ALWAYS fails closed hard.
+            if let Some(&bad_acc) = sess.key_mismatch_alerts.keys().next() {
+                return Err(map_send_plan_err(SendPlanError::KeyMismatchPresent {
+                    account_id: bad_acc,
+                }));
+            }
 
-            let mut pks = Vec::with_capacity(plan.deliver_to.len());
-            for &did in &plan.deliver_to {
-                if let Some(m) = sess.members.get(&did) {
-                    pks.push((did, m.record.device_pubkey));
+            if let Some(tx) = sess.mp2_tx.clone()
+                && (sess.mp2_connected || sess.p2p.is_none())
+            {
+                let (delivered_preview, withheld_unpinned) = plan_mp2_recipients(
+                    sess,
+                    local_acc_id,
+                    self.device_id,
+                    local_root_pk,
+                    auth_hash,
+                    &peers_clone,
+                    self.strict_pins,
+                    req.target_device_id,
+                )?;
+                let target = resolve_mp2_target_selector(sess, req.target_device_id);
+                let mp2_msg_id = format!("mp2-{}-{client_msg_id}", self.device_id);
+                sess.record_sent_mp2_msg_id(mp2_msg_id.clone());
+                ChatDispatch::Mp2 {
+                    tx,
+                    mp2_msg_id,
+                    target,
+                    body: req.body,
+                    delivered_preview,
+                    withheld_unpinned,
+                }
+            } else {
+                let Some(p2p) = sess.p2p.as_ref().map(Arc::clone) else {
+                    return Err(ipc_err(
+                        ERR_CONFLICT,
+                        true,
+                        "party room connection is reconnecting; retry shortly",
+                    ));
+                };
+                let candidates = build_send_candidates(sess, self.device_id);
+                let target = match req.target_device_id {
+                    Some(did) => SendTarget::Device(did),
+                    None => SendTarget::Broadcast,
+                };
+                let plan = plan_send_recipients_with_policy(
+                    &candidates,
+                    target,
+                    self.send_trust_policy(),
+                )
+                .map_err(map_send_plan_err)?;
+
+                let mut pks = Vec::with_capacity(plan.deliver_to.len());
+                for &did in &plan.deliver_to {
+                    if let Some(m) = sess.members.get(&did) {
+                        pks.push((did, m.record.device_pubkey));
+                    }
+                }
+
+                let target_selector = match req.target_device_id {
+                    Some(did) => format!("device:{did}"),
+                    None => "@all".to_string(),
+                };
+                let room_scope = if req.room_scope.is_empty() {
+                    "party/main".to_string()
+                } else {
+                    req.room_scope.clone()
+                };
+
+                let frame = P2pPartyFrame::ChatMessage(P2pChatMessage {
+                    room_scope,
+                    target_selector,
+                    sender_handle: own_handle,
+                    timestamp_ns: now_unix_ns(),
+                    body: req.body,
+                });
+                ChatDispatch::P2p {
+                    p2p,
+                    target_pks: pks,
+                    plan,
+                    frame,
                 }
             }
-
-            let target_selector = match req.target_device_id {
-                Some(did) => format!("device:{did}"),
-                None => "@all".to_string(),
-            };
-            let room_scope = if req.room_scope.is_empty() {
-                "party/main".to_string()
-            } else {
-                req.room_scope.clone()
-            };
-
-            let frame = P2pPartyFrame::ChatMessage(P2pChatMessage {
-                room_scope,
-                target_selector,
-                sender_handle: own_handle,
-                timestamp_ns: now_unix_ns(),
-                body: req.body,
-            });
-            (Arc::clone(&sess.p2p), pks, plan, frame)
         };
 
-        let mut delivered = Vec::new();
-        let mut disconnected = plan.disconnected;
-        for (did, pk) in target_pks {
-            match p2p.send_frame(pk, &frame).await {
-                Ok(()) => delivered.push(did),
-                Err(_) => disconnected.push(did),
+        let (delivered, withheld_unpinned, disconnected) = match dispatch {
+            ChatDispatch::Mp2 {
+                tx,
+                mp2_msg_id,
+                target,
+                body,
+                delivered_preview,
+                withheld_unpinned,
+            } => {
+                let (ack_tx, ack_rx) = oneshot::channel();
+                tx.send(Mp2OutboundCmd::Send {
+                    client_msg_id: mp2_msg_id,
+                    kind: Mp2EventKind::Chat,
+                    target,
+                    body_encoding: "utf8".to_string(),
+                    body,
+                    ack_tx,
+                })
+                .await
+                .map_err(|_| {
+                    ipc_err(
+                        ERR_CONFLICT,
+                        true,
+                        "party room socket is not active; reconnect or rejoin",
+                    )
+                })?;
+                let _ack = tokio::time::timeout(MP2_ACK_TIMEOUT, ack_rx)
+                    .await
+                    .map_err(|_| {
+                        ipc_err(
+                            ERR_CONFLICT,
+                            true,
+                            "timed out waiting for room acknowledgement",
+                        )
+                    })?
+                    .map_err(|_| {
+                        ipc_err(
+                            ERR_CONFLICT,
+                            true,
+                            "party room socket closed before acknowledgement",
+                        )
+                    })?
+                    .map_err(|msg| ipc_err(ERR_CONFLICT, true, msg))?;
+                (delivered_preview, withheld_unpinned, Vec::new())
             }
-        }
-        if delivered.is_empty() {
-            return Err(ipc_err(
-                ERR_CONFLICT,
-                true,
-                "failed to deliver chat message to any pinned connected peer",
-            ));
-        }
+            ChatDispatch::P2p {
+                p2p,
+                target_pks,
+                plan,
+                frame,
+            } => {
+                let mut delivered = Vec::new();
+                let mut disconnected = plan.disconnected;
+                for (did, pk) in target_pks {
+                    match p2p.send_frame(pk, &frame).await {
+                        Ok(()) => delivered.push(did),
+                        Err(_) => disconnected.push(did),
+                    }
+                }
+                if delivered.is_empty() {
+                    return Err(ipc_err(
+                        ERR_CONFLICT,
+                        true,
+                        "failed to deliver chat message to any connected peer",
+                    ));
+                }
+                (delivered, plan.withheld_unpinned, disconnected)
+            }
+        };
 
         let resp_bytes = encode_send_result_resp(&SendResultResp {
             party_id,
             client_msg_id,
             delivered_to: delivered,
-            withheld_unpinned: plan.withheld_unpinned,
+            withheld_unpinned,
             disconnected,
         })
         .map_err(|e| ipc_err(ERR_INTERNAL, false, e.to_string()))?;
@@ -2383,8 +3059,25 @@ impl AppDaemon {
             }
         }
 
-        let (p2p, target_pks, plan, frame) = {
-            let st = self.inner.lock().await;
+        enum BoardDispatch {
+            Mp2 {
+                tx: mpsc::Sender<Mp2OutboundCmd>,
+                mp2_msg_id: String,
+                body_encoding: String,
+                body: String,
+                delivered_preview: Vec<u64>,
+                withheld_unpinned: Vec<u64>,
+            },
+            P2p {
+                p2p: Arc<PartyP2pHandle>,
+                target_pks: Vec<(u64, [u8; 32])>,
+                plan: outpost_core::party_state::SendPlan,
+                frame: P2pPartyFrame,
+            },
+        }
+
+        let dispatch = {
+            let mut st = self.inner.lock().await;
 
             match st.dedupe.check(
                 conn_id,
@@ -2406,7 +3099,12 @@ impl AppDaemon {
                 }
             }
 
-            let Some(sess) = st.active_party.as_ref() else {
+            let local_acc_id = st.device.account_id;
+            let local_root_pk = st.device.root_pubkey;
+            let auth_hash = api_authority_hash(&st.device.api_authority);
+            let peers_clone = st.peers.clone();
+
+            let Some(sess) = st.active_party.as_mut() else {
                 return Err(ipc_err(ERR_NOT_FOUND, false, "no active party"));
             };
             if sess.party_id != party_id {
@@ -2416,46 +3114,165 @@ impl AppDaemon {
                     format!("party {party_id} is not active"),
                 ));
             }
+            if let Some(&bad_acc) = sess.key_mismatch_alerts.keys().next() {
+                return Err(map_send_plan_err(SendPlanError::KeyMismatchPresent {
+                    account_id: bad_acc,
+                }));
+            }
 
-            let candidates = build_send_candidates(sess, self.device_id);
-            let plan = plan_send_recipients(&candidates, SendTarget::Broadcast)
+            if let Some(tx) = sess.mp2_tx.clone()
+                && (sess.mp2_connected || sess.p2p.is_none())
+            {
+                let (delivered_preview, withheld_unpinned) = plan_mp2_recipients(
+                    sess,
+                    local_acc_id,
+                    self.device_id,
+                    local_root_pk,
+                    auth_hash,
+                    &peers_clone,
+                    self.strict_pins,
+                    None,
+                )?;
+                let (body_encoding, body) = match std::str::from_utf8(&req.payload) {
+                    Ok(text) if text.len() <= MAX_MP2_BODY_BYTES => {
+                        ("utf8".to_string(), text.to_string())
+                    }
+                    _ => {
+                        let enc = B64.encode(&req.payload);
+                        if enc.len() > MAX_MP2_BODY_BYTES {
+                            return Err(ipc_err(
+                                ERR_INVALID_PARAMS,
+                                false,
+                                format!(
+                                    "agent_card payload exceeds mp2 32 KiB body limit ({} bytes)",
+                                    enc.len()
+                                ),
+                            ));
+                        }
+                        ("opaque_b64".to_string(), enc)
+                    }
+                };
+                let mp2_msg_id = format!("mp2-card-{}-{client_msg_id}", self.device_id);
+                sess.record_sent_mp2_msg_id(mp2_msg_id.clone());
+                BoardDispatch::Mp2 {
+                    tx,
+                    mp2_msg_id,
+                    body_encoding,
+                    body,
+                    delivered_preview,
+                    withheld_unpinned,
+                }
+            } else {
+                let Some(p2p) = sess.p2p.as_ref().map(Arc::clone) else {
+                    return Err(ipc_err(
+                        ERR_CONFLICT,
+                        true,
+                        "party room connection is reconnecting; retry shortly",
+                    ));
+                };
+                let candidates = build_send_candidates(sess, self.device_id);
+                let plan = plan_send_recipients_with_policy(
+                    &candidates,
+                    SendTarget::Broadcast,
+                    self.send_trust_policy(),
+                )
                 .map_err(map_send_plan_err)?;
 
-            let mut pks = Vec::with_capacity(plan.deliver_to.len());
-            for &did in &plan.deliver_to {
-                if let Some(m) = sess.members.get(&did) {
-                    pks.push((did, m.record.device_pubkey));
+                let mut pks = Vec::with_capacity(plan.deliver_to.len());
+                for &did in &plan.deliver_to {
+                    if let Some(m) = sess.members.get(&did) {
+                        pks.push((did, m.record.device_pubkey));
+                    }
+                }
+
+                let frame = P2pPartyFrame::BridgeEnvelope(P2pBridgeEnvelope {
+                    room_scope: req.room_scope,
+                    payload: req.payload,
+                });
+                BoardDispatch::P2p {
+                    p2p,
+                    target_pks: pks,
+                    plan,
+                    frame,
                 }
             }
-
-            let frame = P2pPartyFrame::BridgeEnvelope(P2pBridgeEnvelope {
-                room_scope: req.room_scope,
-                payload: req.payload,
-            });
-            (Arc::clone(&sess.p2p), pks, plan, frame)
         };
 
-        let mut delivered = Vec::new();
-        let mut disconnected = plan.disconnected;
-        for (did, pk) in target_pks {
-            match p2p.send_frame(pk, &frame).await {
-                Ok(()) => delivered.push(did),
-                Err(_) => disconnected.push(did),
+        let (delivered, withheld_unpinned, disconnected) = match dispatch {
+            BoardDispatch::Mp2 {
+                tx,
+                mp2_msg_id,
+                body_encoding,
+                body,
+                delivered_preview,
+                withheld_unpinned,
+            } => {
+                let (ack_tx, ack_rx) = oneshot::channel();
+                tx.send(Mp2OutboundCmd::Send {
+                    client_msg_id: mp2_msg_id,
+                    kind: Mp2EventKind::AgentCard,
+                    target: "@all".to_string(),
+                    body_encoding,
+                    body,
+                    ack_tx,
+                })
+                .await
+                .map_err(|_| {
+                    ipc_err(
+                        ERR_CONFLICT,
+                        true,
+                        "party room socket is not active; reconnect or rejoin",
+                    )
+                })?;
+                let _ack = tokio::time::timeout(MP2_ACK_TIMEOUT, ack_rx)
+                    .await
+                    .map_err(|_| {
+                        ipc_err(
+                            ERR_CONFLICT,
+                            true,
+                            "timed out waiting for room acknowledgement",
+                        )
+                    })?
+                    .map_err(|_| {
+                        ipc_err(
+                            ERR_CONFLICT,
+                            true,
+                            "party room socket closed before acknowledgement",
+                        )
+                    })?
+                    .map_err(|msg| ipc_err(ERR_CONFLICT, true, msg))?;
+                (delivered_preview, withheld_unpinned, Vec::new())
             }
-        }
-        if delivered.is_empty() {
-            return Err(ipc_err(
-                ERR_CONFLICT,
-                true,
-                "failed to deliver board envelope to any pinned connected peer",
-            ));
-        }
+            BoardDispatch::P2p {
+                p2p,
+                target_pks,
+                plan,
+                frame,
+            } => {
+                let mut delivered = Vec::new();
+                let mut disconnected = plan.disconnected;
+                for (did, pk) in target_pks {
+                    match p2p.send_frame(pk, &frame).await {
+                        Ok(()) => delivered.push(did),
+                        Err(_) => disconnected.push(did),
+                    }
+                }
+                if delivered.is_empty() {
+                    return Err(ipc_err(
+                        ERR_CONFLICT,
+                        true,
+                        "failed to deliver board envelope to any connected peer",
+                    ));
+                }
+                (delivered, plan.withheld_unpinned, disconnected)
+            }
+        };
 
         let resp_bytes = encode_send_result_resp(&SendResultResp {
             party_id,
             client_msg_id,
             delivered_to: delivered,
-            withheld_unpinned: plan.withheld_unpinned,
+            withheld_unpinned,
             disconnected,
         })
         .map_err(|e| ipc_err(ERR_INTERNAL, false, e.to_string()))?;
@@ -2505,9 +3322,20 @@ impl AppDaemon {
             if sess.party_id != req.party_id {
                 return Err(ipc_err(ERR_NOT_FOUND, false, "party is not active"));
             }
+            let Some(p2p) = sess.p2p.as_ref().map(Arc::clone) else {
+                return Err(ipc_err(
+                    ERR_CONFLICT,
+                    false,
+                    "control notices require P2P transport",
+                ));
+            };
             let candidates = build_send_candidates(sess, self.device_id);
-            let plan = plan_send_recipients(&candidates, SendTarget::Broadcast)
-                .map_err(map_send_plan_err)?;
+            let plan = plan_send_recipients_with_policy(
+                &candidates,
+                SendTarget::Broadcast,
+                self.send_trust_policy(),
+            )
+            .map_err(map_send_plan_err)?;
             let mut pks = Vec::with_capacity(plan.deliver_to.len());
             for &did in &plan.deliver_to {
                 if let Some(m) = sess.members.get(&did) {
@@ -2524,7 +3352,7 @@ impl AppDaemon {
                 party_epoch: epoch,
                 text: req.text,
             });
-            (Arc::clone(&sess.p2p), pks, plan, frame)
+            (p2p, pks, plan, frame)
         };
 
         let mut delivered = Vec::new();
@@ -2872,6 +3700,7 @@ impl AppDaemon {
 
         let daemon_epoch = self.daemon_epoch();
         let ws_stop = CancellationToken::new();
+        let (mp2_tx, mp2_rx) = mpsc::channel(64);
 
         // Install ActivePartySession BEFORE spawning driver tasks (zero startup race!).
         {
@@ -2898,14 +3727,24 @@ impl AppDaemon {
                 effective_relay_policy: eff_policy,
                 max_members: req.max_members.clamp(2, 12),
                 pinned_relay_url: create_resp.pinned_relay_url.clone(),
+                room_code: String::new(),
+                room_name: String::new(),
+                share_url: String::new(),
+                ws_path: format!("/v1/parties/{party_id}/ws"),
                 members: HashMap::new(),
+                mp2_members: Vec::new(),
+                mp2_connected: false,
+                mp2_last_seq: 0,
+                mp2_seen_seqs: VecDeque::new(),
+                sent_mp2_msg_ids: VecDeque::new(),
+                mp2_tx: Some(mp2_tx),
                 pubkey_to_device: HashMap::new(),
                 provenance_by_account: HashMap::new(),
                 unpinned_alerts: HashMap::new(),
                 key_mismatch_alerts: HashMap::new(),
                 ring: PartyEventRing::new(party_id, daemon_epoch),
                 wait_notify: Arc::new(Notify::new()),
-                p2p: Arc::clone(&p2p),
+                p2p: Some(Arc::clone(&p2p)),
                 p2p_event_task: None,
                 ws_stop: ws_stop.clone(),
                 ws_task: None,
@@ -2915,8 +3754,8 @@ impl AppDaemon {
         }
 
         let p2p_event_task = self.spawn_p2p_event_loop(party_id, event_stream, ws_stop.clone());
-        let (ws_task, cwt_task) = self.spawn_party_drivers(party_id, ws_stop);
-        self.attach_party_tasks(party_id, p2p_event_task, ws_task, cwt_task)
+        let (ws_task, cwt_task) = self.spawn_party_drivers(party_id, ws_stop, mp2_rx);
+        self.attach_party_tasks(party_id, Some(p2p_event_task), ws_task, cwt_task)
             .await;
 
         encode_party_create_resp(&PartyCreateResp {
@@ -3130,6 +3969,7 @@ impl AppDaemon {
                 }
                 let daemon_epoch = self.daemon_epoch();
                 let ws_stop = CancellationToken::new();
+                let (mp2_tx, mp2_rx) = mpsc::channel(64);
 
                 // Install ActivePartySession BEFORE spawning driver tasks (zero startup race!).
                 {
@@ -3154,14 +3994,24 @@ impl AppDaemon {
                         effective_relay_policy: eff_policy,
                         max_members,
                         pinned_relay_url: relay_for_p2p.unwrap_or_default(),
+                        room_code: String::new(),
+                        room_name: String::new(),
+                        share_url: String::new(),
+                        ws_path: format!("/v1/parties/{}/ws", req.party_id),
                         members: HashMap::new(),
+                        mp2_members: Vec::new(),
+                        mp2_connected: false,
+                        mp2_last_seq: 0,
+                        mp2_seen_seqs: VecDeque::new(),
+                        sent_mp2_msg_ids: VecDeque::new(),
+                        mp2_tx: Some(mp2_tx),
                         pubkey_to_device: HashMap::new(),
                         provenance_by_account: HashMap::new(),
                         unpinned_alerts: HashMap::new(),
                         key_mismatch_alerts: HashMap::new(),
                         ring: PartyEventRing::new(req.party_id, daemon_epoch),
                         wait_notify: Arc::new(Notify::new()),
-                        p2p: Arc::clone(&p2p),
+                        p2p: Some(Arc::clone(&p2p)),
                         p2p_event_task: None,
                         ws_stop: ws_stop.clone(),
                         ws_task: None,
@@ -3173,8 +4023,8 @@ impl AppDaemon {
 
                 let p2p_event_task =
                     self.spawn_p2p_event_loop(req.party_id, event_stream, ws_stop.clone());
-                let (ws_task, cwt_task) = self.spawn_party_drivers(req.party_id, ws_stop);
-                self.attach_party_tasks(req.party_id, p2p_event_task, ws_task, cwt_task)
+                let (ws_task, cwt_task) = self.spawn_party_drivers(req.party_id, ws_stop, mp2_rx);
+                self.attach_party_tasks(req.party_id, Some(p2p_event_task), ws_task, cwt_task)
                     .await;
 
                 Ok(encode_party_join_resp(&PartyJoinResp {
@@ -3519,6 +4369,329 @@ impl AppDaemon {
         })
         .map_err(|e| ipc_err(ERR_INTERNAL, false, e.to_string()))
     }
+
+    /// Attaches (or updates) an `mp2`-only active party session without spawning `iroh` P2P.
+    async fn attach_mp2_room_session(
+        self: &Arc<Self>,
+        party_id: u64,
+        room_code: String,
+        room_name: String,
+        share_url: String,
+        ws_path: String,
+        initial_members: Vec<Mp2Member>,
+    ) {
+        let existing_pid = {
+            let mut st = self.inner.lock().await;
+            if let Some(sess) = st.active_party.as_mut() {
+                if sess.party_id == party_id {
+                    if !room_code.is_empty() {
+                        sess.room_code = room_code;
+                    }
+                    if !room_name.is_empty() {
+                        sess.room_name = room_name;
+                    }
+                    if !share_url.is_empty() {
+                        sess.share_url = share_url;
+                    }
+                    if !initial_members.is_empty() {
+                        sess.mp2_members = initial_members;
+                    }
+                    return;
+                }
+                Some(sess.party_id)
+            } else {
+                None
+            }
+        };
+
+        if let Some(old_pid) = existing_pid {
+            self.teardown_active_party(old_pid, "switched_room").await;
+        }
+
+        let daemon_epoch = self.daemon_epoch();
+        let ws_stop = CancellationToken::new();
+        let (mp2_tx, mp2_rx) = mpsc::channel(64);
+        let eff_ws_path = if ws_path.is_empty() {
+            format!("/v1/parties/{party_id}/ws")
+        } else {
+            ws_path
+        };
+
+        {
+            let mut st = self.inner.lock().await;
+            let acc_id = st.device.account_id;
+            let dev_id = st.device.device_id;
+            let auth_hash = api_authority_hash(&st.device.api_authority);
+            let peers_clone = st.peers.clone();
+            for m in &initial_members {
+                if !m.handle.is_empty() {
+                    st.handle_cache.insert(m.account_id, m.handle.clone());
+                }
+            }
+            let mut sess = ActivePartySession {
+                party_id,
+                party_epoch: 1,
+                leader_account_id: acc_id,
+                leader_device_id: dev_id,
+                visibility: PartyVisibility::Friends,
+                join_mode: PartyJoinMode::InviteOnly,
+                relay_policy: RelayPolicy::AllowRelays,
+                effective_relay_policy: RelayPolicy::AllowRelays,
+                max_members: 12,
+                pinned_relay_url: String::new(),
+                room_code,
+                room_name,
+                share_url,
+                ws_path: eff_ws_path,
+                members: HashMap::new(),
+                mp2_members: initial_members.clone(),
+                mp2_connected: false,
+                mp2_last_seq: 0,
+                mp2_seen_seqs: VecDeque::new(),
+                sent_mp2_msg_ids: VecDeque::new(),
+                mp2_tx: Some(mp2_tx),
+                pubkey_to_device: HashMap::new(),
+                provenance_by_account: HashMap::new(),
+                unpinned_alerts: HashMap::new(),
+                key_mismatch_alerts: HashMap::new(),
+                ring: PartyEventRing::new(party_id, daemon_epoch),
+                wait_notify: Arc::new(Notify::new()),
+                p2p: None,
+                p2p_event_task: None,
+                ws_stop: ws_stop.clone(),
+                ws_task: None,
+                cwt_task: None,
+            };
+            update_mp2_provenance_cache(&mut sess, &initial_members, auth_hash, &peers_clone);
+            st.active_party = Some(sess);
+            self.active_party_atomic.store(party_id, Ordering::Release);
+        }
+
+        let (ws_task, cwt_task) = self.spawn_party_drivers(party_id, ws_stop, mp2_rx);
+        self.attach_party_tasks(party_id, None, ws_task, cwt_task)
+            .await;
+    }
+
+    async fn op_room_invite(self: &Arc<Self>, payload: &[u8]) -> Result<Vec<u8>, IpcErr> {
+        let _tx_guard = self.party_transition.lock().await;
+        let req = decode_room_invite_req(payload)
+            .map_err(|e| ipc_err(ERR_INVALID_PARAMS, false, e.to_string()))?;
+
+        let (control, active_pid) = {
+            let st = self.inner.lock().await;
+            (st.control.clone(), st.active_party.as_ref().map(|s| s.party_id))
+        };
+
+        let clean_handle = req
+            .handle
+            .as_deref()
+            .map(|h| h.trim().trim_start_matches('@').to_string())
+            .filter(|h| !h.is_empty());
+
+        let rest_req = RoomInviteRequest {
+            handle: clean_handle,
+            party_id: req.party_id.or(active_pid),
+            name: req.name.clone(),
+        };
+        let resp = control
+            .room_invite(&rest_req)
+            .await
+            .map_err(|e| ipc_err(ERR_CONTROL_PLANE, true, e.to_string()))?;
+
+        self.attach_mp2_room_session(
+            resp.party_id,
+            resp.room_code.clone(),
+            req.name.unwrap_or_default(),
+            resp.share_url.clone(),
+            resp.ws_path.clone(),
+            Vec::new(),
+        )
+        .await;
+
+        encode_room_invite_resp(&RoomInviteIpcResp {
+            party_id: resp.party_id,
+            room_code: resp.room_code,
+            share_url: resp.share_url,
+            handle_url: resp.handle_url,
+            ws_path: resp.ws_path,
+            invited_handle: resp.invited_handle,
+        })
+        .map_err(|e| ipc_err(ERR_INTERNAL, false, e.to_string()))
+    }
+
+    async fn op_room_enter(self: &Arc<Self>, payload: &[u8]) -> Result<Vec<u8>, IpcErr> {
+        let _tx_guard = self.party_transition.lock().await;
+        let req = decode_room_enter_req(payload)
+            .map_err(|e| ipc_err(ERR_INVALID_PARAMS, false, e.to_string()))?;
+
+        let control = self.inner.lock().await.control.clone();
+        let rest_req = RoomEnterRequest {
+            target: req.target.trim().to_string(),
+            client: "outpost".to_string(),
+            agent_name: req.agent_name.or_else(|| Some("Outpost".to_string())),
+        };
+        let resp = control
+            .room_enter(&rest_req)
+            .await
+            .map_err(|e| ipc_err(ERR_CONTROL_PLANE, true, e.to_string()))?;
+
+        let mp2_members: Vec<Mp2Member> = resp
+            .members
+            .iter()
+            .map(|m| Mp2Member {
+                account_id: m.account_id,
+                handle: m.handle.clone(),
+                client: m.client.clone(),
+                is_guest: m.account_id == 0,
+                agent_name: m.agent_name.clone(),
+                agent_state: None,
+                agent_summary: None,
+                status: m.status.clone(),
+                device_id: None,
+            })
+            .collect();
+
+        self.attach_mp2_room_session(
+            resp.party_id,
+            resp.room_code.clone(),
+            resp.name.clone(),
+            resp.share_url.clone(),
+            resp.ws_path.clone(),
+            mp2_members,
+        )
+        .await;
+
+        let ipc_members: Vec<RoomMemberIpc> = resp
+            .members
+            .into_iter()
+            .map(|m| RoomMemberIpc {
+                account_id: m.account_id,
+                handle: m.handle,
+                client: m.client,
+                agent_name: m.agent_name,
+                status: m.status,
+            })
+            .collect();
+
+        encode_room_enter_resp(&RoomEnterIpcResp {
+            party_id: resp.party_id,
+            room_code: resp.room_code,
+            name: resp.name,
+            share_url: resp.share_url,
+            ws_path: resp.ws_path,
+            members: ipc_members,
+        })
+        .map_err(|e| ipc_err(ERR_INTERNAL, false, e.to_string()))
+    }
+
+    async fn op_room_leave(&self, payload: &[u8]) -> Result<Vec<u8>, IpcErr> {
+        let _tx_guard = self.party_transition.lock().await;
+        let req = decode_room_leave_req(payload)
+            .map_err(|e| ipc_err(ERR_INVALID_PARAMS, false, e.to_string()))?;
+
+        let (control, target_pid) = {
+            let st = self.inner.lock().await;
+            let pid = req
+                .party_id
+                .or_else(|| st.active_party.as_ref().map(|s| s.party_id));
+            (st.control.clone(), pid)
+        };
+        let Some(party_id) = target_pid else {
+            return Err(ipc_err(ERR_NOT_FOUND, false, "not currently in a party"));
+        };
+        let pid = PartyId::new(party_id)
+            .map_err(|e| ipc_err(ERR_INVALID_PARAMS, false, e.to_string()))?;
+
+        let left = match control.room_leave(pid).await {
+            Ok(resp) => resp.left,
+            Err(ControlError::Api { status: 404, .. }) => control
+                .leave_party(pid)
+                .await
+                .map(|r| r.left)
+                .map_err(|e| ipc_err(ERR_CONTROL_PLANE, true, e.to_string()))?,
+            Err(e) => return Err(ipc_err(ERR_CONTROL_PLANE, true, e.to_string())),
+        };
+        self.teardown_active_party(party_id, "operator_leave").await;
+        Ok(encode_room_leave_resp(&RoomLeaveIpcResp { left, party_id }))
+    }
+
+    async fn op_friends_live(&self) -> Result<Vec<u8>, IpcErr> {
+        let control = self.inner.lock().await.control.clone();
+        match control.friends_live().await {
+            Ok(live) => {
+                {
+                    let mut st = self.inner.lock().await;
+                    for f in &live.friends {
+                        if !f.handle.is_empty() {
+                            st.handle_cache.insert(f.account_id, f.handle.clone());
+                        }
+                    }
+                }
+                let resp = FriendsLiveIpcResp {
+                    friends: live
+                        .friends
+                        .into_iter()
+                        .map(|f| LiveFriendIpc {
+                            account_id: f.account_id,
+                            handle: f.handle,
+                            state: f.state,
+                            presence: f.presence,
+                            client: f.client,
+                            party_room_code: f.party_room_code,
+                            joinable: f.joinable,
+                        })
+                        .collect(),
+                    pending_invites: live
+                        .pending_invites
+                        .into_iter()
+                        .map(|inv| PendingInviteIpc {
+                            party_id: inv.party_id,
+                            room_code: inv.room_code,
+                            from_handle: inv.from_handle,
+                            created_at_ms: inv.created_at_ms,
+                        })
+                        .collect(),
+                };
+                encode_friends_live_resp(&resp)
+                    .map_err(|e| ipc_err(ERR_INTERNAL, false, e.to_string()))
+            }
+            Err(ControlError::Api { status: 404, .. }) => {
+                let _ = self.op_friends_list().await;
+                let st = self.inner.lock().await;
+                let friends = st
+                    .friends
+                    .values()
+                    .map(|f| LiveFriendIpc {
+                        account_id: f.account_id,
+                        handle: f.handle.clone(),
+                        state: match f.state {
+                            0 => "friend",
+                            1 => "pending_out",
+                            2 => "pending_in",
+                            3 => "blocked",
+                            _ => "unknown",
+                        }
+                        .to_string(),
+                        presence: match f.presence_status {
+                            1 => "online",
+                            2 => "in_party",
+                            _ => "offline",
+                        }
+                        .to_string(),
+                        client: None,
+                        party_room_code: None,
+                        joinable: f.joinable_party_id.is_some(),
+                    })
+                    .collect();
+                encode_friends_live_resp(&FriendsLiveIpcResp {
+                    friends,
+                    pending_invites: Vec::new(),
+                })
+                .map_err(|e| ipc_err(ERR_INTERNAL, false, e.to_string()))
+            }
+            Err(e) => Err(ipc_err(ERR_CONTROL_PLANE, true, e.to_string())),
+        }
+    }
 }
 
 impl DaemonHandler for AppDaemon {
@@ -3594,6 +4767,10 @@ impl DaemonHandler for AppDaemonHandler {
             IpcOpcode::FriendRemove => self.daemon.op_friend_remove(&payload).await,
             IpcOpcode::FriendBlock => self.daemon.op_friend_block(&payload).await,
             IpcOpcode::ResolveHandle => self.daemon.op_resolve_handle(&payload).await,
+            IpcOpcode::RoomInvite => self.daemon.op_room_invite(&payload).await,
+            IpcOpcode::RoomEnter => self.daemon.op_room_enter(&payload).await,
+            IpcOpcode::RoomLeave => self.daemon.op_room_leave(&payload).await,
+            IpcOpcode::FriendsLive => self.daemon.op_friends_live().await,
             _ => Err(ipc_err(
                 ERR_INVALID_PARAMS,
                 false,
@@ -3875,6 +5052,7 @@ fn rebuild_pubkey_to_device(
     sess: &mut ActivePartySession,
     local_device_id: u64,
     local_device_pubkey: [u8; 32],
+    strict_pins: bool,
 ) -> Vec<[u8; 32]> {
     let mut counts: HashMap<[u8; 32], usize> = HashMap::new();
     for (&did, m) in &sess.members {
@@ -3899,11 +5077,12 @@ fn rebuild_pubkey_to_device(
 
     sess.pubkey_to_device.clear();
     for (&did, m) in &sess.members {
-        if did != local_device_id
-            && m.admitted
-            && m.trust_state == TrustState::PinnedTrusted
-            && !m.key_mismatch
-        {
+        let trust_ok = if strict_pins {
+            m.trust_state == TrustState::PinnedTrusted
+        } else {
+            m.trust_state != TrustState::RevokedBlocked
+        };
+        if did != local_device_id && m.admitted && trust_ok && !m.key_mismatch {
             sess.pubkey_to_device.insert(m.record.device_pubkey, did);
         }
     }
@@ -3917,6 +5096,10 @@ fn lookup_peer_trust(
     local_root_pubkey: [u8; 32],
     peers: &PeersStoreRecord,
 ) -> PeerTrustLookup {
+    // Anonymous browser guests carry `account_id == 0`; never match local or pinned accounts.
+    if account_id == 0 {
+        return PeerTrustLookup::Unpinned;
+    }
     // Operator's own (account_id, root_pubkey) is implicitly pinned_trusted.
     if account_id == local_account_id {
         return PeerTrustLookup::PinnedTrusted {
@@ -3937,6 +5120,218 @@ fn lookup_peer_trust(
     PeerTrustLookup::Unpinned
 }
 
+fn lookup_mp2_member_trust(
+    auth_hash: [u8; 8],
+    account_id: u64,
+    local_account_id: u64,
+    local_root_pubkey: [u8; 32],
+    peers: &PeersStoreRecord,
+) -> (TrustState, [u8; 32], String) {
+    match lookup_peer_trust(
+        auth_hash,
+        account_id,
+        local_account_id,
+        local_root_pubkey,
+        peers,
+    ) {
+        PeerTrustLookup::PinnedTrusted { root_pubkey } => (
+            TrustState::PinnedTrusted,
+            root_pubkey,
+            compute_safety_number(account_id, &root_pubkey),
+        ),
+        PeerTrustLookup::Revoked => (TrustState::RevokedBlocked, [0u8; 32], String::new()),
+        PeerTrustLookup::Unpinned => (TrustState::Unpinned, [0u8; 32], String::new()),
+    }
+}
+
+fn update_mp2_provenance_cache(
+    sess: &mut ActivePartySession,
+    members: &[Mp2Member],
+    auth_hash: [u8; 8],
+    peers: &PeersStoreRecord,
+) {
+    for m in members {
+        if m.account_id == 0 {
+            continue;
+        }
+        let (fp, sn) = peers
+            .peers
+            .iter()
+            .find(|p| p.api_authority_hash == auth_hash && p.account_id == m.account_id)
+            .map(|p| {
+                (
+                    pubkey_fingerprint_hex(&p.root_pubkey),
+                    compute_safety_number(m.account_id, &p.root_pubkey),
+                )
+            })
+            .unwrap_or_default();
+        sess.provenance_by_account
+            .entry(m.account_id)
+            .and_modify(|prov| {
+                if !m.handle.is_empty() {
+                    prov.handle = m.handle.clone();
+                }
+                if !fp.is_empty() {
+                    prov.fingerprint = fp.clone();
+                    prov.safety_number = sn.clone();
+                }
+            })
+            .or_insert_with(|| CachedAccountProvenance {
+                handle: m.handle.clone(),
+                fingerprint: fp,
+                safety_number: sn,
+            });
+    }
+}
+
+fn ingest_mp2_event_into_session(sess: &mut ActivePartySession, ev: Mp2Event) {
+    if !sess.mark_mp2_seq_seen(ev.seq) {
+        return;
+    }
+
+    if let Some(ref cid) = ev.client_msg_id
+        && sess.sent_mp2_msg_ids.iter().any(|seen| seen == cid)
+    {
+        return;
+    }
+
+    let sender_account_id = ev.sender.account_id;
+    let sender_device_id = ev.sender.device_id.unwrap_or(sender_account_id);
+    let sender_handle = if !ev.sender.handle.is_empty() {
+        ev.sender.handle
+    } else {
+        format!("account-{sender_account_id}")
+    };
+
+    let body = match ev.kind {
+        Mp2EventKind::Chat => PartyEventBody::Chat {
+            sender_account_id,
+            sender_device_id,
+            sender_handle,
+            room_scope: "party/main".to_string(),
+            target_selector: ev.target,
+            timestamp_ns: i64::try_from(ev.ts_ms)
+                .unwrap_or(0)
+                .saturating_mul(1_000_000),
+            body: ev.body,
+        },
+        Mp2EventKind::AgentCard => {
+            let payload = if ev.body_encoding == "opaque_b64" {
+                B64.decode(ev.body.as_bytes())
+                    .unwrap_or_else(|_| ev.body.into_bytes())
+            } else {
+                ev.body.into_bytes()
+            };
+            PartyEventBody::BridgeEnvelope {
+                sender_account_id,
+                sender_device_id,
+                sender_handle,
+                room_scope: "party/main".to_string(),
+                payload,
+            }
+        }
+        Mp2EventKind::System => PartyEventBody::MembershipChanged {
+            party_epoch: sess.party_epoch,
+            summary: ev.body,
+        },
+    };
+
+    let _ = sess.push_event(body);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_mp2_recipients(
+    sess: &ActivePartySession,
+    local_account_id: u64,
+    local_device_id: u64,
+    local_root_pubkey: [u8; 32],
+    auth_hash: [u8; 8],
+    peers: &PeersStoreRecord,
+    strict_pins: bool,
+    target_device_id: Option<u64>,
+) -> Result<(Vec<u64>, Vec<u64>), IpcErr> {
+    let mut delivered = Vec::new();
+    let mut withheld_unpinned = Vec::new();
+
+    if !sess.mp2_members.is_empty() {
+        for m in &sess.mp2_members {
+            if m.account_id == local_account_id {
+                continue;
+            }
+            let dev_id = m.device_id.unwrap_or(m.account_id);
+            if let Some(target) = target_device_id
+                && dev_id != target
+                && m.account_id != target
+            {
+                continue;
+            }
+            let (ts, _, _) = lookup_mp2_member_trust(
+                auth_hash,
+                m.account_id,
+                local_account_id,
+                local_root_pubkey,
+                peers,
+            );
+            match ts {
+                TrustState::RevokedBlocked => {
+                    if target_device_id.is_some() {
+                        return Err(map_send_plan_err(SendPlanError::TargetRevoked {
+                            account_id: m.account_id,
+                        }));
+                    }
+                }
+                TrustState::Unpinned if strict_pins => {
+                    if target_device_id.is_some() {
+                        return Err(map_send_plan_err(SendPlanError::TargetNotPinned {
+                            account_id: m.account_id,
+                        }));
+                    }
+                    if !withheld_unpinned.contains(&m.account_id) {
+                        withheld_unpinned.push(m.account_id);
+                    }
+                }
+                TrustState::PinnedTrusted | TrustState::Unpinned => {
+                    delivered.push(dev_id);
+                }
+            }
+        }
+        if strict_pins && delivered.is_empty() && !withheld_unpinned.is_empty() {
+            return Err(map_send_plan_err(SendPlanError::NoPinnedConnectedRecipients));
+        }
+    }
+
+    if delivered.is_empty() {
+        if let Some(target) = target_device_id {
+            delivered.push(target);
+        } else {
+            // Room is server-hosted and persistent: PartyDO accepts and persists events
+            // even while peers are reconnecting or joining asynchronously.
+            delivered.push(local_device_id);
+        }
+    }
+    Ok((delivered, withheld_unpinned))
+}
+
+fn resolve_mp2_target_selector(sess: &ActivePartySession, target_device_id: Option<u64>) -> String {
+    let Some(did) = target_device_id else {
+        return "@all".to_string();
+    };
+    if let Some(m) = sess
+        .mp2_members
+        .iter()
+        .find(|m| m.device_id == Some(did) || m.account_id == did)
+        && !m.handle.is_empty()
+    {
+        return format!("@{}", m.handle.trim_start_matches('@'));
+    }
+    if let Some(m) = sess.members.get(&did)
+        && !m.server_handle.is_empty()
+    {
+        return format!("@{}", m.server_handle.trim_start_matches('@'));
+    }
+    format!("device:{did}")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_member_state(
     member: &PartyMemberRecord,
@@ -3948,6 +5343,7 @@ fn evaluate_member_state(
     peers: &PeersStoreRecord,
     now_local_s: i64,
     server_handle: String,
+    strict_pins: bool,
     unpinned_alerts: &mut HashMap<u64, UnpinnedPeerAlert>,
     key_mismatch_alerts: &mut HashMap<u64, KeyMismatchAlert>,
 ) -> PartyMemberState {
@@ -4011,22 +5407,25 @@ fn evaluate_member_state(
             account_id,
             root_pubkey,
             safety_number,
+            cwt_exp_s,
         } => {
-            unpinned_alerts.insert(
-                account_id.get(),
-                UnpinnedPeerAlert {
-                    account_id: account_id.get(),
-                    root_pubkey,
-                    safety_number: safety_number.clone(),
-                    server_handle: server_handle.clone(),
-                },
-            );
+            if strict_pins {
+                unpinned_alerts.insert(
+                    account_id.get(),
+                    UnpinnedPeerAlert {
+                        account_id: account_id.get(),
+                        root_pubkey,
+                        safety_number: safety_number.clone(),
+                        server_handle: server_handle.clone(),
+                    },
+                );
+            }
             PartyMemberState {
                 record: member.clone(),
                 trust_state: TrustState::Unpinned,
-                admitted: false,
+                admitted: !strict_pins,
                 key_mismatch: false,
-                cwt_exp_s: 0,
+                cwt_exp_s,
                 safety_number,
                 server_handle,
             }
@@ -4090,7 +5489,12 @@ fn build_send_candidates(sess: &ActivePartySession, local_device_id: u64) -> Vec
             account_id: m.record.account_id.get(),
             device_id: m.record.device_id.get(),
             trust: m.trust_state,
-            connected_p2p: m.admitted && sess.p2p.is_peer_connected(&m.record.device_pubkey),
+            connected_p2p: m.admitted
+                && (sess.mp2_connected
+                    || sess
+                        .p2p
+                        .as_ref()
+                        .is_some_and(|p| p.is_peer_connected(&m.record.device_pubkey))),
             key_mismatch: m.key_mismatch,
         })
         .collect()
@@ -4111,17 +5515,24 @@ fn map_send_plan_err(err: SendPlanError) -> IpcErr {
         SendPlanError::TargetNotPinned { account_id } => ipc_err(
             ERR_CONFLICT,
             false,
-            format!("target account {account_id} is not pinned_trusted; run `mp-outpost peer trust {account_id}`"),
+            format!(
+                "strict_pins: target account {account_id} is not pinned_trusted; run `mp-outpost peers verify {account_id}`"
+            ),
+        ),
+        SendPlanError::TargetRevoked { account_id } => ipc_err(
+            ERR_CONFLICT,
+            false,
+            format!("target account {account_id} is revoked/blocked"),
         ),
         SendPlanError::TargetDisconnected { device_id } => ipc_err(
             ERR_CONFLICT,
             true,
-            format!("target device {device_id} is not currently connected over P2P"),
+            format!("target device {device_id} is not currently connected"),
         ),
         SendPlanError::NoPinnedConnectedRecipients => ipc_err(
             ERR_CONFLICT,
             true,
-            "no pinned_trusted peers currently connected over P2P",
+            "no eligible connected recipients in party",
         ),
     }
 }

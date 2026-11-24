@@ -4244,6 +4244,8 @@ mod tests {
             runtime_dir: Some(tmp.join("runtime")),
             device_id: None,
             json: false,
+            debug: false,
+            strict_pins: false,
         }
     }
 

@@ -471,22 +471,47 @@ pub struct SendPlan {
     pub disconnected: Vec<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SendTrustPolicy {
+    /// Default Signal/WhatsApp/Xbox Live model: authenticated party members can exchange
+    /// messages without manual safety-number pinning. Revoked/blocked peers and any
+    /// `key_mismatch` anomaly still fail closed.
+    #[default]
+    AllowUnpinnedAuthenticated,
+    /// Opt-in strict manual safety-number pinning (`--strict-pins` / enterprise policy).
+    StrictManualPins,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendPlanError {
     KeyMismatchPresent { account_id: u64 },
     TargetNotFound { device_id: u64 },
     TargetNotPinned { account_id: u64 },
+    TargetRevoked { account_id: u64 },
     TargetDisconnected { device_id: u64 },
     NoPinnedConnectedRecipients,
 }
 
-/// Unified per-destination send planner for `party_send` and `board_post`:
-/// - Any `key_mismatch` in the party fails closed hard (critical MitM alert).
-/// - Targeted send checks only the selected recipient (never frozen by an unrelated unpinned joiner).
-/// - Broadcast sends to all `PinnedTrusted` connected peers and reports `withheld_unpinned` & `disconnected`.
+/// Unified per-destination send planner for `party_send` and `board_post` using the
+/// default policy ([`SendTrustPolicy::AllowUnpinnedAuthenticated`]).
 pub fn plan_send_recipients(
     candidates: &[PeerSendCandidate],
     target: SendTarget,
+) -> Result<SendPlan, SendPlanError> {
+    plan_send_recipients_with_policy(candidates, target, SendTrustPolicy::AllowUnpinnedAuthenticated)
+}
+
+/// Unified per-destination send planner for `party_send` and `board_post` with explicit trust policy:
+/// - Any `key_mismatch` in the party ALWAYS fails closed hard (critical MitM alert).
+/// - `RevokedBlocked` peers are ALWAYS excluded/refused.
+/// - Under [`SendTrustPolicy::AllowUnpinnedAuthenticated`] (default), both `PinnedTrusted` and
+///   `Unpinned` authenticated party members may receive messages without manual pinning.
+/// - Under [`SendTrustPolicy::StrictManualPins`] (`--strict-pins`), only `PinnedTrusted` peers
+///   receive messages and `Unpinned` peers are withheld/rejected.
+pub fn plan_send_recipients_with_policy(
+    candidates: &[PeerSendCandidate],
+    target: SendTarget,
+    policy: SendTrustPolicy,
 ) -> Result<SendPlan, SendPlanError> {
     for c in candidates {
         if c.key_mismatch {
@@ -503,10 +528,18 @@ pub fn plan_send_recipients(
                     device_id: target_dev,
                 });
             };
-            if peer.trust != TrustState::PinnedTrusted {
-                return Err(SendPlanError::TargetNotPinned {
-                    account_id: peer.account_id,
-                });
+            match peer.trust {
+                TrustState::RevokedBlocked => {
+                    return Err(SendPlanError::TargetRevoked {
+                        account_id: peer.account_id,
+                    });
+                }
+                TrustState::Unpinned if policy == SendTrustPolicy::StrictManualPins => {
+                    return Err(SendPlanError::TargetNotPinned {
+                        account_id: peer.account_id,
+                    });
+                }
+                TrustState::PinnedTrusted | TrustState::Unpinned => {}
             }
             if !peer.connected_p2p {
                 return Err(SendPlanError::TargetDisconnected {
@@ -532,11 +565,20 @@ pub fn plan_send_recipients(
                             disconnected.push(c.device_id);
                         }
                     }
-                    TrustState::Unpinned => {
-                        if !withheld_unpinned.contains(&c.account_id) {
-                            withheld_unpinned.push(c.account_id);
+                    TrustState::Unpinned => match policy {
+                        SendTrustPolicy::AllowUnpinnedAuthenticated => {
+                            if c.connected_p2p {
+                                deliver_to.push(c.device_id);
+                            } else {
+                                disconnected.push(c.device_id);
+                            }
                         }
-                    }
+                        SendTrustPolicy::StrictManualPins => {
+                            if !withheld_unpinned.contains(&c.account_id) {
+                                withheld_unpinned.push(c.account_id);
+                            }
+                        }
+                    },
                     TrustState::RevokedBlocked => {}
                 }
             }

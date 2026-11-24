@@ -127,6 +127,7 @@ pub enum AdmissionDecision {
         account_id: AccountId,
         root_pubkey: Ed25519PubKey,
         safety_number: String,
+        cwt_exp_s: i64,
     },
     KeyMismatch {
         account_id: AccountId,
@@ -203,6 +204,7 @@ pub fn evaluate_peer_admission(
                 account_id: member.account_id,
                 root_pubkey: member.root_pubkey,
                 safety_number,
+                cwt_exp_s: claims.exp,
             }
         }
     }

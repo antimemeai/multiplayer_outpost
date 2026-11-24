@@ -120,8 +120,12 @@ fn run_daemon_entrypoint(daemon_args: DaemonSubcommandArgs) {
     let runtime_override = resolve_effective_runtime_override(daemon_args.runtime_dir.as_deref());
 
     // 3. Load enrolled device, peers.bin, and epochs.bin BEFORE starting Tokio/publishing readiness.
-    let app = match AppDaemon::load(state_dir_path, runtime_override.clone(), daemon_args.device_id)
-    {
+    let app = match AppDaemon::load_with_options(
+        state_dir_path,
+        runtime_override.clone(),
+        daemon_args.device_id,
+        daemon_args.strict_pins,
+    ) {
         Ok(a) => a,
         Err(e) => {
             if let Some(fd) = daemon_args.ready_fd {
