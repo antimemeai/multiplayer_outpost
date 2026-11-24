@@ -411,14 +411,23 @@ impl AppDaemon {
         let Ok(resp) = control.renew_my_device().await else {
             return false;
         };
+        if resp.device_id != self.device_id {
+            log_line("ignoring /v1/devices/me/renew response with mismatched device_id");
+            return false;
+        }
         let Ok(new_cwt) = B64.decode(resp.device_cwt_b64.as_bytes()) else {
             return false;
         };
+        let adjusted_now_ms = i128::from(wall_now_ms())
+            .saturating_add(i128::from(control.clock_offset_ms()))
+            .max(0);
+        let adjusted_now_s =
+            i64::try_from(adjusted_now_ms / 1000).unwrap_or_else(|_| wall_now_secs());
         let Ok(claims) = verify_device_cwt(
             &new_cwt,
             &root_pubkey,
             Some(&device_pubkey),
-            wall_now_secs(),
+            adjusted_now_s,
         ) else {
             log_line("ignoring invalid device_cwt returned by /v1/devices/me/renew");
             return false;
@@ -1032,10 +1041,14 @@ impl AppDaemon {
                 if sess.party_id != party_id {
                     return;
                 }
-                let path = if sess.ws_path.is_empty() {
-                    format!("/v1/parties/{party_id}/ws")
+                let expected_path = format!("/v1/parties/{party_id}/ws");
+                let path = if sess.ws_path.is_empty() || sess.ws_path == expected_path {
+                    expected_path
                 } else {
-                    sess.ws_path.clone()
+                    log_line(&format!(
+                        "Party {party_id} rejecting unexpected mp2 ws_path; tearing down party"
+                    ));
+                    return;
                 };
                 (st.control.clone(), path, sess.p2p.is_some())
             };
@@ -1055,8 +1068,10 @@ impl AppDaemon {
                     let mut ping_iv = tokio::time::interval(WS_PING_INTERVAL);
                     ping_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     ping_iv.tick().await;
-                    let mut ack_waiters: HashMap<String, oneshot::Sender<Result<Mp2Ack, String>>> =
-                        HashMap::new();
+                    let mut ack_waiters: VecDeque<(
+                        String,
+                        oneshot::Sender<Result<Mp2Ack, String>>,
+                    )> = VecDeque::new();
 
                     loop {
                         tokio::select! {
@@ -1074,6 +1089,7 @@ impl AppDaemon {
                                     let _ = ws.close(1000, "channel_closed").await;
                                     return;
                                 };
+                                ack_waiters.retain(|(_, tx)| !tx.is_closed());
                                 match cmd {
                                     Mp2OutboundCmd::Send {
                                         client_msg_id,
@@ -1094,7 +1110,7 @@ impl AppDaemon {
                                             .await
                                         {
                                             Ok(()) => {
-                                                ack_waiters.insert(client_msg_id, ack_tx);
+                                                ack_waiters.push_back((client_msg_id, ack_tx));
                                             }
                                             Err(e) => {
                                                 let _ = ack_tx.send(Err(e.to_string()));
@@ -1105,6 +1121,7 @@ impl AppDaemon {
                                 }
                             }
                             _ = ping_iv.tick() => {
+                                ack_waiters.retain(|(_, tx)| !tx.is_closed());
                                 if ws.silence_ms() > WS_RECONNECT_SILENCE_MS {
                                     let _ = ws.close(1000, "ping_timeout").await;
                                     break;
@@ -1131,17 +1148,46 @@ impl AppDaemon {
                                         self.handle_mp2_event(party_id, room_ev).await;
                                     }
                                     Ok(Some(Mp2RoomEvent::Ack(ack))) => {
-                                        if let Some(tx) = ack_waiters.remove(&ack.client_msg_id) {
+                                        ack_waiters.retain(|(_, tx)| !tx.is_closed());
+                                        if let Some(pos) = ack_waiters
+                                            .iter()
+                                            .position(|(id, _)| id == &ack.client_msg_id)
+                                            && let Some((_, tx)) = ack_waiters.remove(pos)
+                                        {
                                             let _ = tx.send(Ok(ack));
                                         }
                                     }
                                     Ok(Some(Mp2RoomEvent::Presence { members })) => {
                                         self.handle_mp2_presence(party_id, members).await;
                                     }
-                                    Ok(Some(Mp2RoomEvent::Error { code, message, .. })) => {
-                                        log_line(&format!(
-                                            "Party {party_id} mp2 room error ({code}): {message}"
-                                        ));
+                                    Ok(Some(Mp2RoomEvent::Error {
+                                        code,
+                                        message,
+                                        retry_ms,
+                                    })) => {
+                                        ack_waiters.retain(|(_, tx)| !tx.is_closed());
+                                        let err_text = if let Some(ms) = retry_ms {
+                                            format!("mp2 room error ({code}, retry_ms={ms}): {message}")
+                                        } else {
+                                            format!("mp2 room error ({code}): {message}")
+                                        };
+                                        log_line(&format!("Party {party_id} {err_text}"));
+                                        let is_room_fatal = matches!(
+                                            code.as_str(),
+                                            "party_closed"
+                                                | "room_closed"
+                                                | "forbidden"
+                                                | "unauthorized"
+                                                | "banned"
+                                                | "not_member"
+                                        );
+                                        if is_room_fatal {
+                                            for (_, tx) in ack_waiters.drain(..) {
+                                                let _ = tx.send(Err(err_text.clone()));
+                                            }
+                                        } else if let Some((_, tx)) = ack_waiters.pop_front() {
+                                            let _ = tx.send(Err(err_text));
+                                        }
                                     }
                                     Ok(Some(Mp2RoomEvent::Closed { code, .. })) => {
                                         if matches!(code, Some(4401) | Some(4403)) {
@@ -1162,7 +1208,7 @@ impl AppDaemon {
                         }
                     }
 
-                    for (_, tx) in ack_waiters.drain() {
+                    for (_, tx) in ack_waiters.drain(..) {
                         let _ = tx.send(Err("mp2 WebSocket disconnected before ack".to_string()));
                     }
                     {
@@ -1221,7 +1267,7 @@ impl AppDaemon {
             .map_or(0, |s| s.mp2_last_seq);
 
         for m in &hello.members {
-            if m.account_id > 0 && !m.handle.is_empty() {
+            if m.account_id > 0 && !m.is_guest && !m.handle.is_empty() {
                 st.handle_cache.insert(m.account_id, m.handle.clone());
             }
         }
@@ -1267,14 +1313,14 @@ impl AppDaemon {
 
     async fn handle_mp2_event(&self, party_id: u64, ev: Mp2Event) {
         let mut st = self.inner.lock().await;
-        if !ev.sender.handle.is_empty() && ev.sender.account_id > 0 {
+        if !ev.sender.is_guest && !ev.sender.handle.is_empty() && ev.sender.account_id > 0 {
             st.handle_cache
                 .insert(ev.sender.account_id, ev.sender.handle.clone());
         }
         if let Some(sess) = st.active_party.as_mut()
             && sess.party_id == party_id
         {
-            if !ev.sender.handle.is_empty() && ev.sender.account_id > 0 {
+            if !ev.sender.is_guest && !ev.sender.handle.is_empty() && ev.sender.account_id > 0 {
                 sess.provenance_by_account
                     .entry(ev.sender.account_id)
                     .and_modify(|p| p.handle = ev.sender.handle.clone())
@@ -1291,7 +1337,7 @@ impl AppDaemon {
     async fn handle_mp2_presence(&self, party_id: u64, members: Vec<Mp2Member>) {
         let mut st = self.inner.lock().await;
         for m in &members {
-            if m.account_id > 0 && !m.handle.is_empty() {
+            if m.account_id > 0 && !m.is_guest && !m.handle.is_empty() {
                 st.handle_cache.insert(m.account_id, m.handle.clone());
             }
         }
@@ -2711,14 +2757,21 @@ impl AppDaemon {
                 .iter()
                 .enumerate()
                 .map(|(idx, m)| {
-                    let (ts, root_pk, sn) = lookup_mp2_member_trust(
-                        auth_hash,
-                        m.account_id,
-                        st.device.account_id,
-                        st.device.root_pubkey,
-                        &st.peers,
-                    );
-                    let dev_id = if m.account_id == st.device.account_id {
+                    let is_guest = m.is_guest || m.account_id == 0;
+                    let (ts, root_pk, sn) = if is_guest {
+                        (TrustState::Unpinned, [0u8; 32], String::new())
+                    } else {
+                        lookup_mp2_member_trust(
+                            auth_hash,
+                            m.account_id,
+                            st.device.account_id,
+                            st.device.root_pubkey,
+                            &st.peers,
+                        )
+                    };
+                    let dev_id = if is_guest {
+                        0
+                    } else if m.account_id == st.device.account_id {
                         m.device_id.unwrap_or(self.device_id)
                     } else {
                         m.device_id.unwrap_or(m.account_id)
@@ -2726,8 +2779,12 @@ impl AppDaemon {
                     let is_live = m.status.is_empty() || m.status == "live";
                     MemberInfo {
                         device_id: dev_id,
-                        account_id: m.account_id,
-                        server_handle: m.handle.clone(),
+                        account_id: if is_guest { 0 } else { m.account_id },
+                        server_handle: if is_guest {
+                            format_guest_display_name(&m.handle)
+                        } else {
+                            m.handle.clone()
+                        },
                         root_pubkey: root_pk,
                         trust_state: trust_state_to_u8(ts),
                         safety_number: sn,
@@ -4411,8 +4468,9 @@ impl AppDaemon {
         let daemon_epoch = self.daemon_epoch();
         let ws_stop = CancellationToken::new();
         let (mp2_tx, mp2_rx) = mpsc::channel(64);
+        let expected_ws_path = format!("/v1/parties/{party_id}/ws");
         let eff_ws_path = if ws_path.is_empty() {
-            format!("/v1/parties/{party_id}/ws")
+            expected_ws_path
         } else {
             ws_path
         };
@@ -4424,7 +4482,7 @@ impl AppDaemon {
             let auth_hash = api_authority_hash(&st.device.api_authority);
             let peers_clone = st.peers.clone();
             for m in &initial_members {
-                if !m.handle.is_empty() {
+                if m.account_id > 0 && !m.is_guest && !m.handle.is_empty() {
                     st.handle_cache.insert(m.account_id, m.handle.clone());
                 }
             }
@@ -4498,12 +4556,14 @@ impl AppDaemon {
             .await
             .map_err(|e| ipc_err(ERR_CONTROL_PLANE, true, e.to_string()))?;
 
+        let validated_ws_path = validate_party_ws_path(resp.party_id, &resp.ws_path)?;
+
         self.attach_mp2_room_session(
             resp.party_id,
             resp.room_code.clone(),
             req.name.unwrap_or_default(),
             resp.share_url.clone(),
-            resp.ws_path.clone(),
+            validated_ws_path.clone(),
             Vec::new(),
         )
         .await;
@@ -4513,7 +4573,7 @@ impl AppDaemon {
             room_code: resp.room_code,
             share_url: resp.share_url,
             handle_url: resp.handle_url,
-            ws_path: resp.ws_path,
+            ws_path: validated_ws_path,
             invited_handle: resp.invited_handle,
         })
         .map_err(|e| ipc_err(ERR_INTERNAL, false, e.to_string()))
@@ -4526,7 +4586,7 @@ impl AppDaemon {
 
         let control = self.inner.lock().await.control.clone();
         let rest_req = RoomEnterRequest {
-            target: req.target.trim().to_string(),
+            target: normalize_room_enter_target(&req.target),
             client: "outpost".to_string(),
             agent_name: req.agent_name.or_else(|| Some("Outpost".to_string())),
         };
@@ -4535,19 +4595,24 @@ impl AppDaemon {
             .await
             .map_err(|e| ipc_err(ERR_CONTROL_PLANE, true, e.to_string()))?;
 
+        let validated_ws_path = validate_party_ws_path(resp.party_id, &resp.ws_path)?;
+
         let mp2_members: Vec<Mp2Member> = resp
             .members
             .iter()
-            .map(|m| Mp2Member {
-                account_id: m.account_id,
-                handle: m.handle.clone(),
-                client: m.client.clone(),
-                is_guest: m.account_id == 0,
-                agent_name: m.agent_name.clone(),
-                agent_state: None,
-                agent_summary: None,
-                status: m.status.clone(),
-                device_id: None,
+            .map(|m| {
+                let is_guest = m.is_guest || m.account_id == 0;
+                Mp2Member {
+                    account_id: if is_guest { 0 } else { m.account_id },
+                    handle: m.handle.clone(),
+                    client: m.client.clone(),
+                    is_guest,
+                    agent_name: m.agent_name.clone(),
+                    agent_state: None,
+                    agent_summary: None,
+                    status: m.status.clone(),
+                    device_id: None,
+                }
             })
             .collect();
 
@@ -4556,7 +4621,7 @@ impl AppDaemon {
             resp.room_code.clone(),
             resp.name.clone(),
             resp.share_url.clone(),
-            resp.ws_path.clone(),
+            validated_ws_path.clone(),
             mp2_members,
         )
         .await;
@@ -4564,12 +4629,19 @@ impl AppDaemon {
         let ipc_members: Vec<RoomMemberIpc> = resp
             .members
             .into_iter()
-            .map(|m| RoomMemberIpc {
-                account_id: m.account_id,
-                handle: m.handle,
-                client: m.client,
-                agent_name: m.agent_name,
-                status: m.status,
+            .map(|m| {
+                let is_guest = m.is_guest || m.account_id == 0;
+                RoomMemberIpc {
+                    account_id: if is_guest { 0 } else { m.account_id },
+                    handle: if is_guest {
+                        format_guest_display_name(&m.handle)
+                    } else {
+                        m.handle
+                    },
+                    client: m.client,
+                    agent_name: m.agent_name,
+                    status: m.status,
+                }
             })
             .collect();
 
@@ -4578,7 +4650,7 @@ impl AppDaemon {
             room_code: resp.room_code,
             name: resp.name,
             share_url: resp.share_url,
-            ws_path: resp.ws_path,
+            ws_path: validated_ws_path,
             members: ipc_members,
         })
         .map_err(|e| ipc_err(ERR_INTERNAL, false, e.to_string()))
@@ -5144,6 +5216,85 @@ fn lookup_mp2_member_trust(
     }
 }
 
+fn validate_party_ws_path(party_id: u64, ws_path: &str) -> Result<String, IpcErr> {
+    let canonical = format!("/v1/parties/{party_id}/ws");
+    if ws_path.is_empty() {
+        return Ok(canonical);
+    }
+    if ws_path != canonical {
+        return Err(ipc_err(
+            ERR_CONTROL_PLANE,
+            false,
+            format!("server returned unexpected mp2 ws_path for party {party_id}"),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn format_guest_display_name(raw: &str) -> String {
+    let trimmed = raw.trim().trim_start_matches('@').trim();
+    let base = trimmed.strip_suffix(" (guest)").unwrap_or(trimmed).trim();
+    if base.is_empty() {
+        "guest".to_string()
+    } else {
+        format!("{base} (guest)")
+    }
+}
+
+/// Normalizes room join targets including short invite domains (`multiplayer.tech`, `mp.gg`,
+/// and `clank.party`) into canonical `@handle` or 4-char room code tokens.
+fn normalize_room_enter_target(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let Some((host_raw, path_raw)) = without_scheme.split_once('/') else {
+        return trimmed.to_string();
+    };
+    let host = host_raw
+        .split(':')
+        .next()
+        .unwrap_or(host_raw)
+        .to_ascii_lowercase();
+    let is_known_invite_host = matches!(
+        host.as_str(),
+        "multiplayer.tech"
+            | "www.multiplayer.tech"
+            | "mp.gg"
+            | "www.mp.gg"
+            | "clank.party"
+            | "www.clank.party"
+    );
+    if !is_known_invite_host {
+        return trimmed.to_string();
+    }
+    let path = path_raw
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(path_raw)
+        .trim_matches('/');
+    if let Some(handle) = path.strip_prefix('@') {
+        let clean = handle.split('/').next().unwrap_or(handle).trim();
+        if !clean.is_empty() {
+            return format!("@{clean}");
+        }
+    }
+    if let Some(code) = path.strip_prefix("p/").or_else(|| path.strip_prefix("P/")) {
+        let clean = code.split('/').next().unwrap_or(code).trim();
+        if !clean.is_empty() {
+            return clean.to_ascii_uppercase();
+        }
+    }
+    if path.len() == 4 && path.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return path.to_ascii_uppercase();
+    }
+    trimmed.to_string()
+}
+
 fn update_mp2_provenance_cache(
     sess: &mut ActivePartySession,
     members: &[Mp2Member],
@@ -5151,7 +5302,7 @@ fn update_mp2_provenance_cache(
     peers: &PeersStoreRecord,
 ) {
     for m in members {
-        if m.account_id == 0 {
+        if m.account_id == 0 || m.is_guest {
             continue;
         }
         let (fp, sn) = peers
@@ -5195,9 +5346,16 @@ fn ingest_mp2_event_into_session(sess: &mut ActivePartySession, ev: Mp2Event) {
         return;
     }
 
-    let sender_account_id = ev.sender.account_id;
-    let sender_device_id = ev.sender.device_id.unwrap_or(sender_account_id);
-    let sender_handle = if !ev.sender.handle.is_empty() {
+    let is_guest = ev.sender.is_guest || ev.sender.account_id == 0;
+    let sender_account_id = if is_guest { 0 } else { ev.sender.account_id };
+    let sender_device_id = if is_guest {
+        0
+    } else {
+        ev.sender.device_id.unwrap_or(sender_account_id)
+    };
+    let sender_handle = if is_guest {
+        format_guest_display_name(&ev.sender.handle)
+    } else if !ev.sender.handle.is_empty() {
         ev.sender.handle
     } else {
         format!("account-{sender_account_id}")
@@ -5252,55 +5410,77 @@ fn plan_mp2_recipients(
 ) -> Result<(Vec<u64>, Vec<u64>), IpcErr> {
     let mut delivered = Vec::new();
     let mut withheld_unpinned = Vec::new();
+    let mut target_matched = false;
 
-    if !sess.mp2_members.is_empty() {
-        for m in &sess.mp2_members {
-            if m.account_id == local_account_id {
-                continue;
-            }
-            let dev_id = m.device_id.unwrap_or(m.account_id);
-            if let Some(target) = target_device_id
-                && dev_id != target
-                && m.account_id != target
-            {
-                continue;
-            }
-            let (ts, _, _) = lookup_mp2_member_trust(
+    // `mp2` is a server-hosted room broadcast: every `send` is fanned out by `PartyDO` to all
+    // connected members in the room. Therefore trust checks MUST evaluate the full room roster,
+    // never allowing a broadcast into a room containing a `RevokedBlocked` member (or any
+    // unpinned/guest member when `--strict-pins` is enabled).
+    for m in &sess.mp2_members {
+        let is_guest = m.is_guest || m.account_id == 0;
+        if !is_guest && m.account_id == local_account_id {
+            continue;
+        }
+        let dev_id = if is_guest {
+            0
+        } else {
+            m.device_id.unwrap_or(m.account_id)
+        };
+        let is_explicit_target = target_device_id
+            .is_some_and(|target| !is_guest && (dev_id == target || m.account_id == target));
+        if is_explicit_target {
+            target_matched = true;
+        }
+        let (ts, _, _) = if is_guest {
+            (TrustState::Unpinned, [0u8; 32], String::new())
+        } else {
+            lookup_mp2_member_trust(
                 auth_hash,
                 m.account_id,
                 local_account_id,
                 local_root_pubkey,
                 peers,
-            );
-            match ts {
-                TrustState::RevokedBlocked => {
-                    if target_device_id.is_some() {
-                        return Err(map_send_plan_err(SendPlanError::TargetRevoked {
-                            account_id: m.account_id,
-                        }));
-                    }
+            )
+        };
+        match ts {
+            TrustState::RevokedBlocked => {
+                return Err(map_send_plan_err(SendPlanError::TargetRevoked {
+                    account_id: m.account_id,
+                }));
+            }
+            TrustState::Unpinned if strict_pins => {
+                if is_explicit_target {
+                    return Err(map_send_plan_err(SendPlanError::TargetNotPinned {
+                        account_id: m.account_id,
+                    }));
                 }
-                TrustState::Unpinned if strict_pins => {
-                    if target_device_id.is_some() {
-                        return Err(map_send_plan_err(SendPlanError::TargetNotPinned {
-                            account_id: m.account_id,
-                        }));
-                    }
-                    if !withheld_unpinned.contains(&m.account_id) {
-                        withheld_unpinned.push(m.account_id);
-                    }
+                if !withheld_unpinned.contains(&m.account_id) {
+                    withheld_unpinned.push(m.account_id);
                 }
-                TrustState::PinnedTrusted | TrustState::Unpinned => {
+            }
+            TrustState::PinnedTrusted | TrustState::Unpinned => {
+                if target_device_id.is_none() || is_explicit_target {
                     delivered.push(dev_id);
                 }
             }
         }
-        if strict_pins && delivered.is_empty() && !withheld_unpinned.is_empty() {
-            return Err(map_send_plan_err(SendPlanError::NoPinnedConnectedRecipients));
-        }
     }
 
-    if delivered.is_empty() {
+    if strict_pins {
+        if !withheld_unpinned.is_empty() {
+            return Err(ipc_err(
+                ERR_CONFLICT,
+                false,
+                "cannot broadcast to mp2 room under --strict-pins while unpinned or guest members are present; pin all members via `mp-outpost peers verify` first",
+            ));
+        }
+        if target_device_id.is_some() && !target_matched {
+            return Err(map_send_plan_err(SendPlanError::NoPinnedConnectedRecipients));
+        }
+        if delivered.is_empty() {
+            return Err(map_send_plan_err(SendPlanError::NoPinnedConnectedRecipients));
+        }
+    } else if delivered.is_empty() {
         if let Some(target) = target_device_id {
             delivered.push(target);
         } else {
@@ -5694,20 +5874,28 @@ fn build_ipc_poll_resp(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Arc;
+
     use ed25519_dalek::SigningKey;
     use mp_protocol::{
-        AccountId, DeviceId, DirectAddr, EndpointDescriptor, MAX_CWT_TTL_SECS, PartyMemberRecord,
-        RelayPolicy, TransportKind, encode_device_cwt,
+        AccountId, DeviceId, DirectAddr, EndpointDescriptor, MAX_CWT_TTL_SECS, PartyJoinMode,
+        PartyMemberRecord, PartyVisibility, RelayPolicy, TransportKind, encode_device_cwt,
     };
-    use outpost_control::wall_now_secs;
-    use outpost_core::storage_codec::DeviceRecord;
+    use outpost_control::{Mp2Event, Mp2EventKind, Mp2Member, wall_now_secs};
+    use outpost_core::party_state::{PartyEventBody, PartyEventRing};
+    use outpost_core::storage_codec::{DeviceRecord, PeerRecord, PeersStoreRecord, TrustState};
+    use outpost_daemon::CancellationToken;
+    use tokio::sync::Notify;
 
     use super::{
-        AppDaemon, extract_cwt_expiry_ms, is_local_cwt_valid, prepare_peer_dial_target,
-        sanitize_endpoint_for_mp1,
+        ActivePartySession, AppDaemon, api_authority_hash, extract_cwt_expiry_ms,
+        ingest_mp2_event_into_session, is_local_cwt_valid, normalize_room_enter_target,
+        plan_mp2_recipients, prepare_peer_dial_target, sanitize_endpoint_for_mp1,
+        update_mp2_provenance_cache, validate_party_ws_path,
     };
     use crate::ipc_payloads::{
-        ERR_SECRET_INVITE_TOKEN, PartyControlNoticeReq, encode_control_notice_req,
+        ERR_CONFLICT, ERR_SECRET_INVITE_TOKEN, PartyControlNoticeReq, encode_control_notice_req,
     };
     use crate::storage::{lock_state, open_state_dir, save_device_record};
 
@@ -5901,5 +6089,297 @@ mod tests {
         };
         let err = daemon.op_party_send_control_notice(&encoded).await;
         assert!(matches!(err, Err((code, false, _)) if code == ERR_SECRET_INVITE_TOKEN));
+    }
+
+    fn make_mp2_test_session(members: Vec<Mp2Member>) -> ActivePartySession {
+        ActivePartySession {
+            party_id: 8801,
+            party_epoch: 1,
+            leader_account_id: 1001,
+            leader_device_id: 2001,
+            visibility: PartyVisibility::Friends,
+            join_mode: PartyJoinMode::InviteOnly,
+            relay_policy: RelayPolicy::AllowRelays,
+            effective_relay_policy: RelayPolicy::AllowRelays,
+            max_members: 12,
+            pinned_relay_url: String::new(),
+            room_code: "KAIH".to_string(),
+            room_name: "Squad".to_string(),
+            share_url: "https://clank.party/KAIH".to_string(),
+            ws_path: "/v1/parties/8801/ws".to_string(),
+            members: HashMap::new(),
+            mp2_members: members,
+            mp2_connected: true,
+            mp2_last_seq: 0,
+            mp2_seen_seqs: VecDeque::new(),
+            sent_mp2_msg_ids: VecDeque::new(),
+            mp2_tx: None,
+            pubkey_to_device: HashMap::new(),
+            provenance_by_account: HashMap::new(),
+            unpinned_alerts: HashMap::new(),
+            key_mismatch_alerts: HashMap::new(),
+            ring: PartyEventRing::new(8801, 1),
+            wait_notify: Arc::new(Notify::new()),
+            p2p: None,
+            p2p_event_task: None,
+            ws_stop: CancellationToken::new(),
+            ws_task: None,
+            cwt_task: None,
+        }
+    }
+
+    #[test]
+    fn plan_mp2_recipients_strict_pins_and_revoked_fail_closed() {
+        let auth_hash = api_authority_hash("api.multiplayer.tech");
+        let local_root = [0x11u8; 32];
+        let peers = PeersStoreRecord {
+            peers: vec![
+                PeerRecord {
+                    api_authority_hash: auth_hash,
+                    account_id: 1002,
+                    root_pubkey: [0x22u8; 32],
+                    trust_state: TrustState::PinnedTrusted,
+                    handle_prop: "bob".to_string(),
+                    handle_fetched_ms: 1_000,
+                    pinned_at_ms: 1_000,
+                },
+                PeerRecord {
+                    api_authority_hash: auth_hash,
+                    account_id: 1004,
+                    root_pubkey: [0x44u8; 32],
+                    trust_state: TrustState::RevokedBlocked,
+                    handle_prop: "mallory".to_string(),
+                    handle_fetched_ms: 2_000,
+                    pinned_at_ms: 0,
+                },
+            ],
+        };
+
+        let alice = Mp2Member {
+            account_id: 1001,
+            handle: "alice".to_string(),
+            client: "outpost".to_string(),
+            is_guest: false,
+            agent_name: None,
+            agent_state: None,
+            agent_summary: None,
+            status: "live".to_string(),
+            device_id: Some(2001),
+        };
+        let bob_pinned = Mp2Member {
+            account_id: 1002,
+            handle: "bob".to_string(),
+            client: "outpost".to_string(),
+            is_guest: false,
+            agent_name: None,
+            agent_state: None,
+            agent_summary: None,
+            status: "live".to_string(),
+            device_id: Some(2002),
+        };
+        let carol_unpinned = Mp2Member {
+            account_id: 1003,
+            handle: "carol".to_string(),
+            client: "blackbird".to_string(),
+            is_guest: false,
+            agent_name: None,
+            agent_state: None,
+            agent_summary: None,
+            status: "live".to_string(),
+            device_id: Some(2003),
+        };
+        let mallory_revoked = Mp2Member {
+            account_id: 1004,
+            handle: "mallory".to_string(),
+            client: "outpost".to_string(),
+            is_guest: false,
+            agent_name: None,
+            agent_state: None,
+            agent_summary: None,
+            status: "live".to_string(),
+            device_id: Some(2004),
+        };
+        let web_guest = Mp2Member {
+            account_id: 0,
+            handle: "phall".to_string(),
+            client: "web".to_string(),
+            is_guest: true,
+            agent_name: None,
+            agent_state: None,
+            agent_summary: None,
+            status: "live".to_string(),
+            device_id: None,
+        };
+
+        // 1. Mixed pinned + unpinned room: strict_pins MUST fail closed (no broadcast leak!)
+        let mixed_sess = make_mp2_test_session(vec![
+            alice.clone(),
+            bob_pinned.clone(),
+            carol_unpinned.clone(),
+        ]);
+        let strict_mixed = plan_mp2_recipients(
+            &mixed_sess,
+            1001,
+            2001,
+            local_root,
+            auth_hash,
+            &peers,
+            true,
+            None,
+        );
+        assert!(matches!(strict_mixed, Err((code, false, _)) if code == ERR_CONFLICT));
+        // Default policy allows authenticated unpinned peer in room.
+        let default_mixed = plan_mp2_recipients(
+            &mixed_sess,
+            1001,
+            2001,
+            local_root,
+            auth_hash,
+            &peers,
+            false,
+            None,
+        );
+        assert!(default_mixed.is_ok());
+
+        // 2. Mixed pinned + browser guest: strict_pins MUST fail closed!
+        let guest_sess =
+            make_mp2_test_session(vec![alice.clone(), bob_pinned.clone(), web_guest]);
+        let strict_guest = plan_mp2_recipients(
+            &guest_sess,
+            1001,
+            2001,
+            local_root,
+            auth_hash,
+            &peers,
+            true,
+            None,
+        );
+        assert!(matches!(strict_guest, Err((code, false, _)) if code == ERR_CONFLICT));
+
+        // 3. Empty roster / unknown target under strict_pins MUST fail closed!
+        let empty_sess = make_mp2_test_session(Vec::new());
+        assert!(matches!(
+            plan_mp2_recipients(&empty_sess, 1001, 2001, local_root, auth_hash, &peers, true, None),
+            Err((code, _, _)) if code == ERR_CONFLICT
+        ));
+        let pinned_only = make_mp2_test_session(vec![alice.clone(), bob_pinned.clone()]);
+        assert!(matches!(
+            plan_mp2_recipients(
+                &pinned_only,
+                1001,
+                2001,
+                local_root,
+                auth_hash,
+                &peers,
+                true,
+                Some(9999)
+            ),
+            Err((code, _, _)) if code == ERR_CONFLICT
+        ));
+        assert!(plan_mp2_recipients(
+            &pinned_only,
+            1001,
+            2001,
+            local_root,
+            auth_hash,
+            &peers,
+            true,
+            None
+        )
+        .is_ok());
+
+        // 4. RevokedBlocked peer in broadcast room MUST fail closed under BOTH policies!
+        let revoked_sess = make_mp2_test_session(vec![alice, bob_pinned, mallory_revoked]);
+        for strict in [false, true] {
+            let res = plan_mp2_recipients(
+                &revoked_sess,
+                1001,
+                2001,
+                local_root,
+                auth_hash,
+                &peers,
+                strict,
+                None,
+            );
+            assert!(matches!(res, Err((code, false, _)) if code == ERR_CONFLICT));
+        }
+    }
+
+    #[test]
+    fn guest_events_ws_path_validation_and_short_invite_domains() {
+        let auth_hash = api_authority_hash("api.multiplayer.tech");
+        let peers = PeersStoreRecord::default();
+        let guest = Mp2Member {
+            account_id: 0,
+            handle: "phall".to_string(),
+            client: "web".to_string(),
+            is_guest: true,
+            agent_name: None,
+            agent_state: None,
+            agent_summary: None,
+            status: "live".to_string(),
+            device_id: None,
+        };
+        let mut sess = make_mp2_test_session(vec![guest.clone()]);
+        update_mp2_provenance_cache(&mut sess, &[guest], auth_hash, &peers);
+        assert!(
+            !sess.provenance_by_account.contains_key(&0),
+            "guest account_id 0 must never pollute provenance_by_account"
+        );
+
+        ingest_mp2_event_into_session(
+            &mut sess,
+            Mp2Event {
+                seq: 1,
+                ts_ms: 1_700_000_000_000,
+                client_msg_id: None,
+                sender: outpost_control::Mp2Sender {
+                    account_id: 0,
+                    handle: "phall".to_string(),
+                    client: "web".to_string(),
+                    is_guest: true,
+                    agent_name: None,
+                    device_id: None,
+                },
+                target: "@all".to_string(),
+                kind: Mp2EventKind::Chat,
+                body_encoding: "utf8".to_string(),
+                body: "hello from browser guest".to_string(),
+            },
+        );
+        let polled = sess.ring.poll(None, 0, 10, 65_536);
+        assert_eq!(polled.events.len(), 1);
+        if let Some(ev) = polled.events.first() {
+            assert!(matches!(
+                &ev.body,
+                PartyEventBody::Chat {
+                    sender_account_id: 0,
+                    sender_handle,
+                    ..
+                } if sender_handle == "phall (guest)"
+            ));
+        }
+
+        // Server-supplied ws_path validation
+        assert_eq!(
+            validate_party_ws_path(8801, ""),
+            Ok("/v1/parties/8801/ws".to_string())
+        );
+        assert_eq!(
+            validate_party_ws_path(8801, "/v1/parties/8801/ws"),
+            Ok("/v1/parties/8801/ws".to_string())
+        );
+        assert!(validate_party_ws_path(8801, "/v1/parties/9999/ws").is_err());
+        assert!(validate_party_ws_path(8801, "/v1/parties/8801/ws?evil=1").is_err());
+
+        // Short invite domains (`clank.party`, `multiplayer.tech`, `mp.gg`)
+        assert_eq!(normalize_room_enter_target("https://clank.party/@phall"), "@phall");
+        assert_eq!(normalize_room_enter_target("clank.party/kaih"), "KAIH");
+        assert_eq!(normalize_room_enter_target("https://clank.party/p/kaih"), "KAIH");
+        assert_eq!(normalize_room_enter_target("https://multiplayer.tech/p/KAIH"), "KAIH");
+        assert_eq!(normalize_room_enter_target("https://mp.gg/KAIH"), "KAIH");
+        assert_eq!(normalize_room_enter_target("@phall"), "@phall");
+        assert_eq!(normalize_room_enter_target("KAIH"), "KAIH");
+        assert_eq!(normalize_room_enter_target(""), "");
     }
 }

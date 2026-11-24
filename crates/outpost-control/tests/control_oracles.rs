@@ -3804,4 +3804,35 @@ async fn oracle_mp2_ws_chat_ack_resume_dedup_agent_card_and_ping_pong() {
 
     sock.close(1000, "done").await.expect("close");
     srv.await.expect("server task");
+
+    // Verify invalid server-supplied `ws_path` is rejected strictly BEFORE signing/connecting.
+    for bad in [
+        "",
+        "/v1/parties/0/ws",
+        "/v1/parties/0123/ws",
+        "/v1/parties/8801/ws?foo=bar",
+        "/v1/parties/8801/ws#frag",
+        "/v1/parties/../admin/ws",
+        "/v1/parties/8801/ws\r\nX-Inject: 1",
+        "/v1/accounts/me",
+    ] {
+        assert!(
+            outpost_control::validate_mp2_ws_path(bad).is_err(),
+            "expected validate_mp2_ws_path to reject {bad:?}"
+        );
+        let connect_err = client.connect_mp2_room_path(bad).await;
+        assert!(
+            matches!(
+                connect_err,
+                Err(WsConnectError::Transport(ControlError::InvalidRequest(_)))
+            ),
+            "expected connect_mp2_room_path({bad:?}) to reject InvalidRequest before connect, got {connect_err:?}"
+        );
+    }
+    assert_eq!(
+        outpost_control::validate_mp2_ws_path("/v1/parties/8801/ws")
+            .expect("valid ws_path")
+            .get(),
+        8801
+    );
 }

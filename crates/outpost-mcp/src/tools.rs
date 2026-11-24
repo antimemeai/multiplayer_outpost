@@ -304,7 +304,7 @@ pub fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "party_join",
-            "description": "Join a party by @handle, 4-character room code, share URL, or omit target to accept your latest pending incoming invite.",
+            "description": "Join a party by @handle, 4-character room code, share URL (multiplayer.tech, mp.gg, clank.party), or omit target to accept your latest pending incoming invite.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

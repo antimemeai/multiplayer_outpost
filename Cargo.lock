@@ -2107,6 +2107,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-websockets",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]

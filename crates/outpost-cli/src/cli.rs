@@ -416,7 +416,7 @@ Usage:\n\
 Quick Start:\n\
   login [--no-open]                       Sign in via browser\n\
   invite [@handle] [--name <name>]        Invite a friend or get a share link & 4-char code\n\
-  join [@handle|CODE|url]                 Join a party (bare `join` accepts latest invite)\n\
+  join [@handle|CODE|url]                 Join a party (bare `join` accepts latest invite; supports multiplayer.tech, mp.gg, clank.party)\n\
   leave                                   Leave the current party\n\
   friends                                 Live friends roster & pending party invites\n\
   add @handle                             Add a friend or accept their request\n\n\
@@ -1064,6 +1064,12 @@ fn default_device_label() -> String {
     }
 }
 
+fn is_safe_browser_url(url: &str) -> bool {
+    url.starts_with("https://")
+        && url.len() <= 512
+        && url.bytes().all(|b| b > 0x20 && b < 0x7f)
+}
+
 fn try_open_browser(url: &str) -> bool {
     if std::env::var("OUTPOST_NO_BROWSER")
         .ok()
@@ -1071,7 +1077,7 @@ fn try_open_browser(url: &str) -> bool {
     {
         return false;
     }
-    if !url.starts_with("https://") {
+    if !is_safe_browser_url(url) {
         return false;
     }
     #[cfg(target_os = "macos")]
@@ -1218,11 +1224,13 @@ async fn cmd_login(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                 let device_cwt = B64
                     .decode(device_cwt_b64.as_bytes())
                     .map_err(|_| "server returned invalid device_cwt_b64".to_string())?;
+                let adjusted_now_s = i64::try_from(wall_now_ms_adjusted(&client) / 1000)
+                    .unwrap_or_else(|_| wall_now_secs());
                 verify_device_cwt(
                     &device_cwt,
                     &root_pubkey,
                     Some(&device_pubkey),
-                    wall_now_secs(),
+                    adjusted_now_s,
                 )
                 .map_err(|e| format!("server returned invalid device_cwt: {e}"))?;
 
@@ -1344,6 +1352,29 @@ async fn cmd_invite(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn format_member_display(account_id: u64, raw_handle: &str) -> String {
+    let trimmed = raw_handle.trim();
+    let is_guest = account_id == 0 || trimmed.ends_with(" (guest)");
+    let clean = sanitize_cli_meta(
+        trimmed
+            .trim_start_matches('@')
+            .strip_suffix(" (guest)")
+            .unwrap_or(trimmed.trim_start_matches('@'))
+            .trim(),
+    );
+    if is_guest {
+        if clean.is_empty() {
+            "guest".to_string()
+        } else {
+            format!("{clean} (guest)")
+        }
+    } else if clean.is_empty() {
+        "member".to_string()
+    } else {
+        format!("@{clean}")
+    }
+}
+
 async fn cmd_join(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     let mut target = String::new();
     let mut agent_name: Option<String> = None;
@@ -1409,7 +1440,7 @@ async fn cmd_join(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
         let code = sanitize_cli_meta(&resp.room_code);
         println!("Joined {name} (code {code}) · {} live", resp.members.len());
         for m in &resp.members {
-            let h = sanitize_cli_meta(m.handle.trim_start_matches('@'));
+            let display = format_member_display(m.account_id, &m.handle);
             let badge = if m.status == "live" || m.status.is_empty() {
                 "●"
             } else {
@@ -1420,7 +1451,7 @@ async fn cmd_join(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
             } else {
                 format!(" ({})", sanitize_cli_meta(&m.client))
             };
-            println!("  {badge} @{h}{client_tag}");
+            println!("  {badge} {display}{client_tag}");
         }
         if opts.debug {
             println!("debug: party_id={} ws_path={}", resp.party_id, resp.ws_path);
@@ -4951,12 +4982,7 @@ async fn cmd_party(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                         } else {
                             "○"
                         };
-                        let handle = sanitize_cli_meta(m.server_handle.trim_start_matches('@'));
-                        let display = if handle.is_empty() {
-                            "member".to_string()
-                        } else {
-                            format!("@{handle}")
-                        };
+                        let display = format_member_display(m.account_id, &m.server_handle);
                         let state = if m.connected_p2p || m.connected_mp1 {
                             "live"
                         } else {
@@ -7102,9 +7128,12 @@ fn print_poll_resp(
                         );
                     } else {
                         println!(
-                            "[#{} @{}]\n{}",
+                            "[#{} {}]\n{}",
                             ev.event_seq,
-                            sanitize_cli_meta(provenance.sender_handle.trim_start_matches('@')),
+                            format_member_display(
+                                provenance.sender_account_id,
+                                &provenance.sender_handle,
+                            ),
                             fence_peer_text(&payload, nonce)
                         );
                     }
@@ -7129,9 +7158,12 @@ fn print_poll_resp(
                         );
                     } else {
                         println!(
-                            "[#{} card @{}]\n{}",
+                            "[#{} card {}]\n{}",
                             ev.event_seq,
-                            sanitize_cli_meta(provenance.sender_handle.trim_start_matches('@')),
+                            format_member_display(
+                                provenance.sender_account_id,
+                                &provenance.sender_handle,
+                            ),
                             fence_peer_text(&fenced_body, nonce)
                         );
                     }
@@ -7315,5 +7347,27 @@ mod tests {
         assert!(friend_state_sort_key(2) < friend_state_sort_key(0));
         assert!(friend_state_sort_key(0) < friend_state_sort_key(1));
         assert!(friend_state_sort_key(1) < friend_state_sort_key(3));
+    }
+
+    #[test]
+    fn browser_url_and_guest_display_hardening() {
+        assert!(is_safe_browser_url(
+            "https://multiplayer.tech/login?code=ABCD-EFGH"
+        ));
+        assert!(!is_safe_browser_url("http://multiplayer.tech/login"));
+        assert!(!is_safe_browser_url("https://multiplayer.tech/login with space"));
+        assert!(!is_safe_browser_url("https://multiplayer.tech/login\r\n"));
+        assert!(!is_safe_browser_url("https://multiplayer.tech/l\u{0007}gin"));
+        assert!(!is_safe_browser_url("https://multiplayer.tech/café"));
+        let too_long = format!("https://multiplayer.tech/{}", "a".repeat(500));
+        assert!(!is_safe_browser_url(&too_long));
+
+        // Guests (`account_id == 0` or `" (guest)"`) NEVER render with `@` prefix!
+        assert_eq!(format_member_display(0, "phall"), "phall (guest)");
+        assert_eq!(format_member_display(0, "@phall"), "phall (guest)");
+        assert_eq!(format_member_display(0, "phall (guest)"), "phall (guest)");
+        assert_eq!(format_member_display(0, ""), "guest");
+        assert_eq!(format_member_display(1001, "phall"), "@phall");
+        assert_eq!(format_member_display(1001, "@phall"), "@phall");
     }
 }

@@ -21,6 +21,7 @@ use mp_protocol::{
     validate_path_and_query, validate_relay_url,
 };
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::clock::wall_now_ms;
 use crate::tls::{
@@ -3057,6 +3058,8 @@ pub struct RoomMemberSummary {
     #[serde(default)]
     pub client: String,
     #[serde(default)]
+    pub is_guest: bool,
+    #[serde(default)]
     pub agent_name: Option<String>,
     #[serde(default)]
     pub status: String,
@@ -3142,10 +3145,27 @@ struct AuthSessionStartWire<'a> {
     client: &'a str,
 }
 
+fn deserialize_zeroizing_string<'de, D>(deserializer: D) -> Result<Zeroizing<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Zeroizing::new)
+}
+
+fn deserialize_zeroizing_string_opt<'de, D>(
+    deserializer: D,
+) -> Result<Option<Zeroizing<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(|opt| opt.map(Zeroizing::new))
+}
+
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct AuthSessionStartResponse {
     pub flow_id: String,
-    pub poll_token: String,
+    #[serde(deserialize_with = "deserialize_zeroizing_string")]
+    pub poll_token: Zeroizing<String>,
     pub user_code: String,
     pub verify_url: String,
     #[serde(deserialize_with = "deserialize_u64_or_string")]
@@ -3187,8 +3207,8 @@ pub enum AuthSessionPollResponse {
         device_cwt_b64: String,
         #[serde(deserialize_with = "deserialize_u64_or_string")]
         cwt_expires_ms: u64,
-        #[serde(default)]
-        session_token: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_zeroizing_string_opt")]
+        session_token: Option<Zeroizing<String>>,
     },
     Expired,
     Denied,

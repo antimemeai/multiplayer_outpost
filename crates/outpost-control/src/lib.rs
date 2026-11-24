@@ -41,7 +41,7 @@ pub use http::{
 pub use mp2::{
     MAX_MP2_BODY_BYTES, MAX_MP2_FRAME_BYTES, MP2_PING_TEXT, MP2_PONG_TEXT, MP2_SUBPROTOCOL,
     Mp2Ack, Mp2Event, Mp2EventKind, Mp2Hello, Mp2Member, Mp2RoomEvent, Mp2RoomSocket, Mp2SelfInfo,
-    Mp2Sender, Mp2WsError, parse_mp2_server_text,
+    Mp2Sender, Mp2WsError, parse_mp2_server_text, validate_mp2_ws_path,
 };
 pub use tls::{
     DEFAULT_API_AUTHORITY, build_tls13_client_config_with_roots, default_tls13_client_config,

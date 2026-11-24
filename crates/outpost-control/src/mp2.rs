@@ -380,6 +380,33 @@ struct OutboundStatusFrame<'a> {
     agent_summary: Option<&'a str>,
 }
 
+/// Strictly validates a server-supplied `mp2` WebSocket path before RFC 9421 signing.
+///
+/// Only canonical `/v1/parties/<party_id>/ws` paths with a valid decimal `PartyId` (no query,
+/// fragment, traversal, whitespace, control characters, or extra segments) are accepted.
+pub fn validate_mp2_ws_path(path: &str) -> Result<PartyId, ControlError> {
+    let inner = path
+        .strip_prefix("/v1/parties/")
+        .and_then(|rest| rest.strip_suffix("/ws"))
+        .ok_or_else(|| {
+            ControlError::InvalidRequest("mp2 ws_path must match /v1/parties/<party_id>/ws".to_owned())
+        })?;
+    if inner.is_empty()
+        || !inner.bytes().all(|b| b.is_ascii_digit())
+        || (inner.len() > 1 && inner.starts_with('0'))
+    {
+        return Err(ControlError::InvalidRequest(
+            "mp2 ws_path contains invalid party_id segment".to_owned(),
+        ));
+    }
+    let id = inner.parse::<u64>().map_err(|_| {
+        ControlError::InvalidRequest("mp2 ws_path party_id overflows u64".to_owned())
+    })?;
+    PartyId::new(id).map_err(|_| {
+        ControlError::InvalidRequest("mp2 ws_path party_id out of valid range".to_owned())
+    })
+}
+
 /// Active TLS 1.3 + HTTP/1.1 ALPN RFC 6455 `mp2` Room WebSocket client.
 pub struct Mp2RoomSocket {
     stream: WebSocketStream<PrefixedIo<TlsStream<TcpStream>>>,
@@ -415,6 +442,7 @@ impl Mp2RoomSocket {
         clock_offset_ms: i64,
         path: &str,
     ) -> Result<Self, WsConnectError> {
+        let _party_id = validate_mp2_ws_path(path).map_err(WsConnectError::Transport)?;
         let canonical_authority =
             canonicalize_authority(&config.authority).map_err(WsConnectError::Transport)?;
         let signed = sign_request(

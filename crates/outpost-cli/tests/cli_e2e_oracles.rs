@@ -3791,6 +3791,20 @@ async fn handle_mock_mp2_conn<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
                                     let target = v.get("target").and_then(Value::as_str).unwrap_or("@all").to_string();
                                     let body_encoding = v.get("body_encoding").and_then(Value::as_str).unwrap_or("utf8").to_string();
                                     let body = v.get("body").and_then(Value::as_str).unwrap_or("").to_string();
+                                    if body == "__TRIGGER_RATE_LIMIT__" {
+                                        let err_frame = json!({
+                                            "v": 2,
+                                            "t": "error",
+                                            "code": "rate_limited",
+                                            "message": "slow down",
+                                            "retry_ms": 250
+                                        })
+                                        .to_string();
+                                        if write_ws_frame(&mut stream, 0x1, err_frame.as_bytes()).await.is_err() {
+                                            return;
+                                        }
+                                        continue;
+                                    }
                                     let (assigned_seq, ts_ms) = {
                                         let mut st = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                         let ts = outpost_control::wall_now_ms();
@@ -4408,13 +4422,37 @@ async fn oracle_8_xbox_live_mp2_unpinned_chat_login_renew_and_strict_pins() -> R
             "jsonrpc": "2.0",
             "id": 51,
             "method": "tools/call",
-            "params": { "name": "party_join", "arguments": { "target": "KAIH" } }
+            "params": { "name": "party_join", "arguments": { "target": "https://clank.party/KAIH" } }
         }))?;
         let join_mcp = bob_mcp.recv()?;
         if join_mcp.pointer("/result/structuredContent/room_code").and_then(Value::as_str)
             != Some("KAIH")
         {
             return Err(format!("MCP party_join failed: {join_mcp}"));
+        }
+
+        // Verify mp2 `{t:"error", code:"rate_limited"}` fails fast (< 1.5s, NOT 5s ACK timeout!)
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let t_rl = Instant::now();
+        alice_mcp.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 53,
+            "method": "tools/call",
+            "params": {
+                "name": "party_send",
+                "arguments": { "party_id": 8801, "body": "__TRIGGER_RATE_LIMIT__" }
+            }
+        }))?;
+        let rl_resp = alice_mcp.recv()?;
+        let rl_elapsed = t_rl.elapsed();
+        if rl_resp.pointer("/result/isError").and_then(Value::as_bool) != Some(true) {
+            return Err(format!("expected rate_limited error from party_send, got {rl_resp}"));
+        }
+        if rl_elapsed >= Duration::from_millis(1500) {
+            return Err(format!(
+                "mp2 error frame stalled party_send for {:?} (expected fast-fail < 1.5s)",
+                rl_elapsed
+            ));
         }
 
         bob_mcp.send(&json!({
