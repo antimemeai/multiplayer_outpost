@@ -23,8 +23,8 @@ use outpost_mcp::{
     BackendError, BoardEnvelopeEvent, BoardPostReq, BoardReadResp, BoxFuture, CancellationToken,
     DEFAULT_WAIT_TIMEOUT_MS, FriendAddReq, MAX_LINE_BYTES, MAX_WAIT_TIMEOUT_MS, McpOutpostBackend,
     McpPartyEvent, McpPartyEventKind, McpServerConfig, PartyInviteReq, PartyJoinReq, PartyLeaveReq,
-    PartyPollReq, PartyPollResp, PartySendReq, PartyWaitReq, PeerProvenance, ProgressSender,
-    SERVER_NAME, SERVER_VERSION, TOOL_NAMES, run_stdio_with_io,
+    PartyPollReq, PartyPollResp, PartyPostCardReq, PartySendReq, PartyWaitReq, PeerProvenance,
+    ProgressSender, SERVER_NAME, SERVER_VERSION, TOOL_NAMES, run_stdio_with_io,
 };
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -33,11 +33,13 @@ use tokio::sync::Notify;
 struct MockState {
     status_outcomes: VecDeque<Result<Value, BackendError>>,
     send_outcomes: VecDeque<Result<Value, BackendError>>,
+    card_outcomes: VecDeque<Result<Value, BackendError>>,
     board_post_outcomes: VecDeque<Result<Value, BackendError>>,
     poll_outcomes: VecDeque<Result<PartyPollResp, BackendError>>,
     board_read_outcomes: VecDeque<Result<BoardReadResp, BackendError>>,
     wait_outcomes: VecDeque<WaitBehavior>,
     recorded_sends: Vec<PartySendReq>,
+    recorded_cards: Vec<PartyPostCardReq>,
     recorded_board_posts: Vec<BoardPostReq>,
     recorded_waits: Vec<PartyWaitReq>,
     recorded_wait_had_progress: Vec<bool>,
@@ -137,6 +139,25 @@ impl McpOutpostBackend for MockBackend {
         })
     }
 
+    fn party_post_card(&self, req: PartyPostCardReq) -> BoxFuture<'_, Result<Value, BackendError>> {
+        Box::pin(async move {
+            self.total_calls.fetch_add(1, Ordering::SeqCst);
+            let mut st = self.lock_state();
+            let party_id = req.party_id.unwrap_or(7001);
+            let client_msg_id = req.client_msg_id;
+            st.recorded_cards.push(req);
+            st.card_outcomes.pop_front().unwrap_or_else(|| {
+                Ok(json!({
+                    "party_id": party_id,
+                    "client_msg_id": client_msg_id,
+                    "delivered_to": [2003],
+                    "withheld_unpinned": [],
+                    "disconnected": []
+                }))
+            })
+        })
+    }
+
     fn board_post(&self, req: BoardPostReq) -> BoxFuture<'_, Result<Value, BackendError>> {
         Box::pin(async move {
             self.total_calls.fetch_add(1, Ordering::SeqCst);
@@ -168,6 +189,8 @@ impl McpOutpostBackend for MockBackend {
                     cursor_reset: false,
                     gap_possible: false,
                     timed_out: false,
+                    self_account_id: None,
+                    self_handle: None,
                     events: Vec::new(),
                 })
             })
@@ -235,6 +258,8 @@ impl McpOutpostBackend for MockBackend {
                     cursor_reset: false,
                     gap_possible: false,
                     timed_out: true,
+                    self_account_id: None,
+                    self_handle: None,
                     events: Vec::new(),
                 }),
             }
@@ -444,12 +469,12 @@ async fn oracle_1_lazy_init_version_negotiation_and_structured_content_gating() 
             "instructions must warn host model about untrusted peer content"
         );
 
-        // Verify exact 13 tools and zero collision with sibling MCP servers.
+        // Verify exact 14 tools and zero collision with sibling MCP servers.
         let tools = ptr(&list_reply, "/result/tools")
             .as_array()
             .map(Vec::as_slice)
             .unwrap_or_default();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 14);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(Value::as_str))
@@ -630,6 +655,8 @@ async fn oracle_3_party_wait_cap_cancellation_and_progress_token_gating() {
             cursor_reset: false,
             gap_possible: false,
             timed_out: true,
+            self_account_id: None,
+            self_handle: None,
             events: Vec::new(),
         })));
         st.wait_outcomes.push_back(WaitBehavior::BlockUntilCancelOrDelay {
@@ -644,6 +671,8 @@ async fn oracle_3_party_wait_cap_cancellation_and_progress_token_gating() {
                 cursor_reset: false,
                 gap_possible: false,
                 timed_out: true,
+                self_account_id: None,
+                self_handle: None,
                 events: Vec::new(),
             }),
         });
@@ -710,6 +739,8 @@ async fn oracle_3_party_wait_cap_cancellation_and_progress_token_gating() {
                 cursor_reset: false,
                 gap_possible: false,
                 timed_out: false,
+                self_account_id: None,
+                self_handle: None,
                 events: Vec::new(),
             }),
         });
@@ -765,6 +796,8 @@ async fn oracle_3_party_wait_cap_cancellation_and_progress_token_gating() {
                 cursor_reset: false,
                 gap_possible: false,
                 timed_out: false,
+                self_account_id: None,
+                self_handle: None,
                 events: Vec::new(),
             }),
         });
@@ -780,6 +813,8 @@ async fn oracle_3_party_wait_cap_cancellation_and_progress_token_gating() {
                 cursor_reset: false,
                 gap_possible: false,
                 timed_out: false,
+                self_account_id: None,
+                self_handle: None,
                 events: Vec::new(),
             }),
         });
@@ -1046,6 +1081,8 @@ async fn oracle_5_decoded_layer_nonce_fencing_and_sub_50ms_eof_on_pipe_and_socke
         cursor_reset: false,
         gap_possible: false,
         timed_out: false,
+        self_account_id: None,
+        self_handle: None,
         events: vec![McpPartyEvent {
             event_seq: 1,
             party_id: 9,
@@ -1301,6 +1338,8 @@ async fn oracle_6_gate1_fence_scope_inside_block_and_blocked_stdout_sub_50ms_eof
             cursor_reset: false,
             gap_possible: false,
             timed_out: false,
+            self_account_id: None,
+            self_handle: None,
             events: vec![
                 McpPartyEvent {
                     event_seq: 1,
@@ -1712,6 +1751,227 @@ async fn oracle_10_xbox_live_party_lifecycle_and_friend_add_tools() {
         assert_eq!(st.recorded_leaves.len(), 1);
         assert_eq!(st.recorded_friend_adds.len(), 1);
     }
+
+    let _ = h.close_and_wait().await;
+}
+
+/// Test 11 (Phase 2 Multiplayer Magic): `party_post_card` argument validation, strict secret refusal,
+/// and `mentioned_self: bool` output on `party_poll` / `party_wait`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oracle_11_party_post_card_validation_secrets_and_mentioned_self() {
+    let backend = MockBackend::new();
+    let peer_prov = PeerProvenance {
+        sender_account_id: 1001,
+        sender_device_id: 2001,
+        sender_handle: "alice".to_string(),
+        root_pubkey_fingerprint: "abcd1234".to_string(),
+        safety_number: "0123-4567".to_string(),
+    };
+    let self_prov = PeerProvenance {
+        sender_account_id: 1002,
+        sender_device_id: 2002,
+        sender_handle: "bob".to_string(),
+        root_pubkey_fingerprint: "ef001122".to_string(),
+        safety_number: "89AB-CDEF".to_string(),
+    };
+
+    {
+        let mut st = backend.lock_state();
+        st.poll_outcomes.push_back(Ok(PartyPollResp {
+            party_id: 7001,
+            daemon_epoch: 12,
+            next_seq: 3,
+            dropped_before_seq: 0,
+            cursor_reset: false,
+            gap_possible: false,
+            timed_out: false,
+            self_account_id: Some(1002),
+            self_handle: Some("bob".to_string()),
+            events: vec![
+                McpPartyEvent {
+                    event_seq: 1,
+                    party_id: 7001,
+                    party_epoch: 1,
+                    kind: McpPartyEventKind::Chat {
+                        provenance: peer_prov.clone(),
+                        room_scope: "party/main".to_string(),
+                        target_selector: "@all".to_string(),
+                        timestamp_ns: 100,
+                        body: "hey @bob:agent please run tests".to_string(),
+                    },
+                },
+                McpPartyEvent {
+                    event_seq: 2,
+                    party_id: 7001,
+                    party_epoch: 1,
+                    kind: McpPartyEventKind::Chat {
+                        provenance: self_prov,
+                        room_scope: "party/main".to_string(),
+                        target_selector: "@all".to_string(),
+                        timestamp_ns: 101,
+                        body: "@bob self echo must not trigger".to_string(),
+                    },
+                },
+                McpPartyEvent {
+                    event_seq: 3,
+                    party_id: 7001,
+                    party_epoch: 1,
+                    kind: McpPartyEventKind::Chat {
+                        provenance: peer_prov.clone(),
+                        room_scope: "party/main".to_string(),
+                        target_selector: "@all".to_string(),
+                        timestamp_ns: 102,
+                        body: "email foo@bob.com is not a mention".to_string(),
+                    },
+                },
+            ],
+        }));
+        st.wait_outcomes.push_back(WaitBehavior::Immediate(Ok(PartyPollResp {
+            party_id: 7001,
+            daemon_epoch: 12,
+            next_seq: 4,
+            dropped_before_seq: 0,
+            cursor_reset: false,
+            gap_possible: false,
+            timed_out: false,
+            self_account_id: Some(1002),
+            self_handle: Some("bob".to_string()),
+            events: vec![McpPartyEvent {
+                event_seq: 4,
+                party_id: 7001,
+                party_epoch: 1,
+                kind: McpPartyEventKind::Chat {
+                    provenance: peer_prov,
+                    room_scope: "party/main".to_string(),
+                    target_selector: "@all".to_string(),
+                    timestamp_ns: 103,
+                    body: "asking @bob's agent for review".to_string(),
+                },
+            }],
+        })));
+    }
+
+    let mut h = PipeHarness::spawn(Arc::clone(&backend), McpServerConfig::default());
+    h.send_json(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": { "protocolVersion": "2025-06-18" }
+    }));
+    let _ = h.read_json_line();
+
+    // 1. Valid party_post_card (party_id omitted -> active party)
+    h.send_json(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "party_post_card",
+            "arguments": {
+                "title": "Shipped Phase 2",
+                "summary": "Added rich agent cards and mentions",
+                "status": "done",
+                "diff_stat": "+42 -12",
+                "files": ["src/chat.rs", "src/tools.rs"],
+                "agent_name": "Claude Code"
+            }
+        }
+    }));
+    let ok_card = h.read_json_line();
+    assert_eq!(ptr(&ok_card, "/result/isError"), false);
+    assert_eq!(ptr(&ok_card, "/result/structuredContent/party_id"), 7001);
+
+    // 2. Invalid params: bad status, >16 files, >2048 byte JSON
+    let too_many_files: Vec<String> = (0..17).map(|i| format!("file_{i}.rs")).collect();
+    let oversized_files: Vec<String> = (0..16).map(|i| format!("dir_{i}/{}", "x".repeat(170))).collect();
+    for (idx, bad_args) in [
+        json!({ "title": "t", "summary": "s", "status": "invalid_state" }),
+        json!({ "title": "t", "summary": "s", "files": too_many_files }),
+        json!({ "title": "t", "summary": "s", "files": oversized_files }),
+    ]
+    .iter()
+    .enumerate()
+    {
+        h.send_json(&json!({
+            "jsonrpc": "2.0",
+            "id": 10 + idx as i64,
+            "method": "tools/call",
+            "params": { "name": "party_post_card", "arguments": bad_args }
+        }));
+        let err = h.read_json_line();
+        assert_eq!(ptr(&err, "/error/code"), -32602);
+    }
+
+    // 3. Secret refusal across title/summary/diff_stat/files (never reaches backend, never echoes!)
+    for (idx, args) in [
+        json!({ "title": "mprk1_SECRET_KEY", "summary": "ok" }),
+        json!({ "title": "ok", "summary": "mpinv1_SECRET_INV" }),
+        json!({ "title": "ok", "summary": "mppi1_SECRET_PARTY" }),
+        json!({ "title": "ok", "summary": "mpdl1_SECRET_LINK" }),
+        json!({ "title": "ok", "summary": "mpcs1_SECRET_CLOUD" }),
+        json!({ "title": "ok", "summary": "ok", "diff_stat": "mpguest1_SECRET_GUEST" }),
+        json!({ "title": "ok", "summary": "ok", "files": ["-----BEGIN PRIVATE KEY-----"] }),
+    ]
+    .iter()
+    .enumerate()
+    {
+        h.send_json(&json!({
+            "jsonrpc": "2.0",
+            "id": 20 + idx as i64,
+            "method": "tools/call",
+            "params": { "name": "party_post_card", "arguments": args }
+        }));
+        let refused = h.read_json_line();
+        assert_eq!(ptr(&refused, "/result/isError"), true);
+        assert_eq!(
+            ptr(&refused, "/result/structuredContent/error"),
+            "secret_material_refused"
+        );
+        let serialized = serde_json::to_string(&refused).unwrap_or_default();
+        assert!(!serialized.contains("SECRET_"));
+        assert!(!serialized.contains("BEGIN PRIVATE KEY"));
+    }
+    assert_eq!(
+        backend.lock_state().recorded_cards.len(),
+        1,
+        "secret-refused cards MUST NOT reach backend"
+    );
+
+    // 4. party_poll emits per-event and top-level mentioned_self: bool
+    h.send_json(&json!({
+        "jsonrpc": "2.0",
+        "id": 30,
+        "method": "tools/call",
+        "params": { "name": "party_poll", "arguments": { "party_id": 7001, "after_seq": 0 } }
+    }));
+    let poll = h.read_json_line();
+    assert_eq!(ptr(&poll, "/result/structuredContent/mentioned_self"), true);
+    assert_eq!(
+        ptr(&poll, "/result/structuredContent/events/0/mentioned_self"),
+        true
+    );
+    assert_eq!(
+        ptr(&poll, "/result/structuredContent/events/1/mentioned_self"),
+        false
+    );
+    assert_eq!(
+        ptr(&poll, "/result/structuredContent/events/2/mentioned_self"),
+        false
+    );
+
+    // 5. party_wait also emits mentioned_self: bool for `@bob's agent`
+    h.send_json(&json!({
+        "jsonrpc": "2.0",
+        "id": 31,
+        "method": "tools/call",
+        "params": { "name": "party_wait", "arguments": { "party_id": 7001, "after_seq": 3, "timeout_ms": 1000 } }
+    }));
+    let wait = h.read_json_line();
+    assert_eq!(ptr(&wait, "/result/structuredContent/mentioned_self"), true);
+    assert_eq!(
+        ptr(&wait, "/result/structuredContent/events/0/mentioned_self"),
+        true
+    );
 
     let _ = h.close_and_wait().await;
 }

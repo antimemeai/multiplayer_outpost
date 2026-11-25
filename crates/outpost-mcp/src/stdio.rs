@@ -22,8 +22,10 @@ use crate::backend::{
     PartyPollResp, PeerProvenance, ProgressSender, ProgressUpdate,
 };
 use crate::json_strict::{StrictJsonError, parse_strict_json_line};
+use crate::mentions::event_mentions_self;
 use crate::tools::{
-    ParsedToolCall, SERVER_NAME, SERVER_VERSION, ToolParseError, parse_tool_call, tool_catalog,
+    ParsedToolCall, SERVER_NAME, SERVER_VERSION, ToolParseError, parse_tool_call,
+    scan_card_secrets, tool_catalog,
 };
 
 /// Hard maximum stdio line length (`16 MiB`). Lines exceeding this cap are discarded until `\n`.
@@ -1007,6 +1009,27 @@ async fn execute_tool_call<B: McpOutpostBackend>(
                 Err(err) => map_backend_error(err, include_structured),
             }
         }
+        ParsedToolCall::PartyPostCard(req) => {
+            if let Err(kind) = scan_card_secrets(&req) {
+                return map_backend_error(BackendError::SecretRefused(kind), include_structured);
+            }
+            let client_msg_id = req.client_msg_id;
+            let res = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return CallOutcome::Cancelled,
+                r = backend.party_post_card(req) => r,
+            };
+            match res {
+                Ok(v) => CallOutcome::Result(build_json_tool_result(v, include_structured)),
+                Err(BackendError::DaemonDisconnected) => {
+                    CallOutcome::Result(build_delivery_unknown_error(
+                        client_msg_id,
+                        include_structured,
+                    ))
+                }
+                Err(err) => map_backend_error(err, include_structured),
+            }
+        }
         ParsedToolCall::BoardPost(req) => {
             let client_msg_id = req.client_msg_id;
             let res = tokio::select! {
@@ -1142,6 +1165,8 @@ async fn execute_tool_call<B: McpOutpostBackend>(
                         cursor_reset: true,
                         gap_possible: true,
                         timed_out: false,
+                        self_account_id: None,
+                        self_handle: None,
                         events: Vec::new(),
                     };
                     build_fenced_poll_outcome(&reset_resp, include_structured)
@@ -1353,21 +1378,14 @@ fn build_fenced_poll_outcome(resp: &PartyPollResp, include_structured: bool) -> 
     let nonce_hex = format!("{nonce:016x}");
     let (daemon_epoch_text, daemon_epoch_json) = format_daemon_epoch(resp.daemon_epoch);
 
-    let mut text = format!(
-        "party_id={} daemon_epoch={} next_seq={} dropped_before_seq={} cursor_reset={} gap_possible={} timed_out={} events={}",
-        resp.party_id,
-        daemon_epoch_text,
-        resp.next_seq,
-        resp.dropped_before_seq,
-        resp.cursor_reset,
-        resp.gap_possible,
-        resp.timed_out,
-        resp.events.len()
-    );
-
     let mut structured_events = Vec::with_capacity(resp.events.len());
+    let mut events_text = String::new();
+    let mut any_mentioned_self = false;
 
     for ev in &resp.events {
+        let mentioned_self =
+            event_mentions_self(ev, resp.self_account_id, resp.self_handle.as_deref());
+        any_mentioned_self |= mentioned_self;
         match &ev.kind {
             McpPartyEventKind::Chat {
                 provenance,
@@ -1384,11 +1402,12 @@ fn build_fenced_poll_outcome(resp: &PartyPollResp, include_structured: bool) -> 
                     format!("room_scope: {scope}\ntarget_selector: {target}\n\n{body}");
                 let fenced = fence_peer_text(&fenced_payload, nonce);
 
-                text.push('\n');
-                text.push_str(&format!(
-                    "[event_seq={} party_epoch={} kind=chat untrusted_remote=true sender_account_id={} sender_device_id={} sender_handle={} safety_number={} timestamp_ns={}]\n{}",
+                events_text.push('\n');
+                events_text.push_str(&format!(
+                    "[event_seq={} party_epoch={} kind=chat untrusted_remote=true mentioned_self={} sender_account_id={} sender_device_id={} sender_handle={} safety_number={} timestamp_ns={}]\n{}",
                     ev.event_seq,
                     ev.party_epoch,
+                    mentioned_self,
                     provenance.sender_account_id,
                     provenance.sender_device_id,
                     handle,
@@ -1403,6 +1422,7 @@ fn build_fenced_poll_outcome(resp: &PartyPollResp, include_structured: bool) -> 
                     "party_epoch": ev.party_epoch,
                     "kind": "chat",
                     "untrusted_remote": true,
+                    "mentioned_self": mentioned_self,
                     "provenance": provenance_json(provenance),
                     "room_scope": scope,
                     "target_selector": target,
@@ -1421,11 +1441,12 @@ fn build_fenced_poll_outcome(resp: &PartyPollResp, include_structured: bool) -> 
                 let sn = sanitize_single_line_meta(&provenance.safety_number);
                 let fenced = fence_peer_text(notice_text, nonce);
 
-                text.push('\n');
-                text.push_str(&format!(
-                    "[event_seq={} party_epoch={} kind=control_notice untrusted_remote=true notice_kind={} sender_account_id={} sender_device_id={} sender_handle={} safety_number={}]\n{}",
+                events_text.push('\n');
+                events_text.push_str(&format!(
+                    "[event_seq={} party_epoch={} kind=control_notice untrusted_remote=true mentioned_self={} notice_kind={} sender_account_id={} sender_device_id={} sender_handle={} safety_number={}]\n{}",
                     ev.event_seq,
                     party_epoch,
+                    mentioned_self,
                     notice_kind,
                     provenance.sender_account_id,
                     provenance.sender_device_id,
@@ -1440,6 +1461,7 @@ fn build_fenced_poll_outcome(resp: &PartyPollResp, include_structured: bool) -> 
                     "party_epoch": party_epoch,
                     "kind": "control_notice",
                     "untrusted_remote": true,
+                    "mentioned_self": mentioned_self,
                     "notice_kind": notice_kind,
                     "provenance": provenance_json(provenance),
                     "body": sanitize_peer_text(notice_text),
@@ -1451,9 +1473,9 @@ fn build_fenced_poll_outcome(resp: &PartyPollResp, include_structured: bool) -> 
                 summary,
             } => {
                 let clean_summary = sanitize_single_line_meta(summary);
-                text.push('\n');
-                text.push_str(&format!(
-                    "[event_seq={} party_epoch={} kind=membership_changed untrusted_remote=false] {}",
+                events_text.push('\n');
+                events_text.push_str(&format!(
+                    "[event_seq={} party_epoch={} kind=membership_changed untrusted_remote=false mentioned_self=false] {}",
                     ev.event_seq, party_epoch, clean_summary
                 ));
                 structured_events.push(json!({
@@ -1462,6 +1484,7 @@ fn build_fenced_poll_outcome(resp: &PartyPollResp, include_structured: bool) -> 
                     "party_epoch": party_epoch,
                     "kind": "membership_changed",
                     "untrusted_remote": false,
+                    "mentioned_self": false,
                     "summary": clean_summary
                 }));
             }
@@ -1477,11 +1500,12 @@ fn build_fenced_poll_outcome(resp: &PartyPollResp, include_structured: bool) -> 
                 let fenced_payload = format!("room_scope: {scope}\n\n{payload_b64}");
                 let fenced = fence_peer_text(&fenced_payload, nonce);
 
-                text.push('\n');
-                text.push_str(&format!(
-                    "[event_seq={} party_epoch={} kind=bridge_envelope untrusted_remote=true sender_account_id={} sender_device_id={} sender_handle={} safety_number={}]\n{}",
+                events_text.push('\n');
+                events_text.push_str(&format!(
+                    "[event_seq={} party_epoch={} kind=bridge_envelope untrusted_remote=true mentioned_self={} sender_account_id={} sender_device_id={} sender_handle={} safety_number={}]\n{}",
                     ev.event_seq,
                     ev.party_epoch,
+                    mentioned_self,
                     provenance.sender_account_id,
                     provenance.sender_device_id,
                     handle,
@@ -1495,6 +1519,7 @@ fn build_fenced_poll_outcome(resp: &PartyPollResp, include_structured: bool) -> 
                     "party_epoch": ev.party_epoch,
                     "kind": "bridge_envelope",
                     "untrusted_remote": true,
+                    "mentioned_self": mentioned_self,
                     "provenance": provenance_json(provenance),
                     "room_scope": scope,
                     "payload_b64": payload_b64,
@@ -1503,6 +1528,20 @@ fn build_fenced_poll_outcome(resp: &PartyPollResp, include_structured: bool) -> 
             }
         }
     }
+
+    let mut text = format!(
+        "party_id={} daemon_epoch={} next_seq={} dropped_before_seq={} cursor_reset={} gap_possible={} timed_out={} mentioned_self={} events={}",
+        resp.party_id,
+        daemon_epoch_text,
+        resp.next_seq,
+        resp.dropped_before_seq,
+        resp.cursor_reset,
+        resp.gap_possible,
+        resp.timed_out,
+        any_mentioned_self,
+        resp.events.len()
+    );
+    text.push_str(&events_text);
 
     let mut res = Map::new();
     res.insert(
@@ -1522,6 +1561,7 @@ fn build_fenced_poll_outcome(resp: &PartyPollResp, include_structured: bool) -> 
                 "cursor_reset": resp.cursor_reset,
                 "gap_possible": resp.gap_possible,
                 "timed_out": resp.timed_out,
+                "mentioned_self": any_mentioned_self,
                 "fence_nonce": nonce_hex,
                 "events": structured_events
             }),

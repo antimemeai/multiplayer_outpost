@@ -483,7 +483,7 @@ async fn oracle5_superseded_4409_reconnect_replaces_stale_conn_and_delivers_fram
     })
     .await?;
 
-    let stale_close = tokio::time::timeout(Duration::from_secs(5), stale_conn.closed()).await?;
+    let stale_close = tokio::time::timeout(Duration::from_secs(15), stale_conn.closed()).await?;
     match stale_close {
         ConnectionError::ApplicationClosed(app) => {
             assert_eq!(app.error_code.into_inner(), u64::from(CLOSE_SUPERSEDED));

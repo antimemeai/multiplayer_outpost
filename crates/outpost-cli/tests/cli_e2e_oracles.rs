@@ -392,8 +392,8 @@ fn oracle_1_custody_lazy_mcp_eof_and_tty_gate() -> Result<(), String> {
         .pointer("/result/tools")
         .and_then(Value::as_array)
         .ok_or("missing tools array")?;
-    if tools.len() != 13 {
-        return Err(format!("expected 13 MCP tools, got {}", tools.len()));
+    if tools.len() != 14 {
+        return Err(format!("expected 14 MCP tools, got {}", tools.len()));
     }
 
     // Verify NO daemon socket was created during initialize / tools/list!
@@ -1375,6 +1375,7 @@ fn oracle_9_chat_no_tty_lobby_help_secret_refusal_and_quit() -> Result<(), Strin
 my secret mprk1_SHOULD_NEVER_LEAK\n\
 /board leak mpcs1_SESSION_SHOULD_NOT_ECHO\n\
 /board -----BEGIN PRIVATE KEY-----\n\
+/card Leak | token mpguest1_CARD_SECRET\n\
 hello from lobby\n",
     );
     script.push_str(&oversized);
@@ -1398,6 +1399,7 @@ hello from lobby\n",
     for expected in [
         "Lobby mode",
         "/board <text>",
+        "/card <title> | <summary>",
         "Not in a party",
         "Not currently in a party",
         "notifications muted",
@@ -1416,6 +1418,7 @@ hello from lobby\n",
     for forbidden in [
         "mprk1_SHOULD_NEVER_LEAK",
         "mpcs1_SESSION_SHOULD_NOT_ECHO",
+        "mpguest1_CARD_SECRET",
         "BEGIN PRIVATE KEY",
     ] {
         if res.stdout.contains(forbidden) || res.stderr.contains(forbidden) {
@@ -4678,27 +4681,29 @@ async fn oracle_8_xbox_live_mp2_unpinned_chat_login_renew_and_strict_pins() -> R
             return Err(format!("unpinned party_send must succeed by default: {send_resp}"));
         }
 
-        // Alice posts an `agent_card` via `board_post` WITHOUT pinning Bob!
-        let card_json = r#"{"title":"Fixed auth test","summary":"2 files changed"}"#;
+        // Alice posts an `agent_card` via `party_post_card` (14th MCP tool, active party auto-resolved!)
         alice_mcp.send(&json!({
             "jsonrpc": "2.0",
             "id": 11,
             "method": "tools/call",
             "params": {
-                "name": "board_post",
+                "name": "party_post_card",
                 "arguments": {
-                    "party_id": 8801,
-                    "room_scope": "party/main",
-                    "payload_b64": B64.encode(card_json.as_bytes())
+                    "title": "Fixed auth test",
+                    "summary": "2 files changed for @bob:agent",
+                    "status": "done",
+                    "diff_stat": "+42 -12",
+                    "files": ["src/auth.rs", "src/main.rs"],
+                    "agent_name": "Claude Code"
                 }
             }
         }))?;
         let card_resp = alice_mcp.recv()?;
         if card_resp.pointer("/result/isError").and_then(Value::as_bool) != Some(false) {
-            return Err(format!("unpinned board_post must succeed by default: {card_resp}"));
+            return Err(format!("unpinned party_post_card must succeed by default: {card_resp}"));
         }
 
-        // Bob polls and receives BOTH chat AND agent_card with real `@alice` provenance + nonce fences!
+        // Bob polls and receives BOTH chat AND agent_card with real `@alice` provenance + nonce fences + mentioned_self!
         let poll_deadline = Instant::now() + Duration::from_secs(5);
         let mut saw_chat = false;
         let mut saw_card = false;
@@ -4723,11 +4728,13 @@ async fn oracle_8_xbox_live_mp2_unpinned_chat_login_renew_and_strict_pins() -> R
                     if ev.get("kind").and_then(Value::as_str) == Some("chat")
                         && ev.get("body").and_then(Value::as_str) == Some("yo unpinned mp2 chat!")
                         && ev.pointer("/provenance/sender_handle").and_then(Value::as_str) == Some("alice")
+                        && ev.get("mentioned_self").and_then(Value::as_bool) == Some(false)
                     {
                         saw_chat = true;
                     }
                     if ev.get("kind").and_then(Value::as_str) == Some("bridge_envelope")
                         && ev.pointer("/provenance/sender_handle").and_then(Value::as_str) == Some("alice")
+                        && ev.get("mentioned_self").and_then(Value::as_bool) == Some(true)
                     {
                         saw_card = true;
                     }
@@ -5032,6 +5039,24 @@ async fn oracle_10_chat_second_window_live_mp2_bidirectional_and_board() -> Resu
         alice_chat.send_line("/board release v0.5.1 ready")?;
         let _ = alice_chat.wait_for_substring("[board] you: release v0.5.1 ready", Duration::from_secs(4))?;
         let _ = bob_chat.wait_for_substring("[board] @alice: release v0.5.1 ready", Duration::from_secs(4))?;
+
+        // 5b. Alice posts `/card` -> both render crisp box-drawn multi-line card!
+        alice_chat.send_line("/card Shipped auth | Updated token check")?;
+        let _ = alice_chat.wait_for_substring("┌ [card] Shipped auth", Duration::from_secs(4))?;
+        let _ = alice_chat.wait_for_substring("│ Updated token check", Duration::from_secs(4))?;
+        let _ = bob_chat.wait_for_substring("┌ [card] Shipped auth", Duration::from_secs(4))?;
+        let _ = bob_chat.wait_for_substring("│ Updated token check", Duration::from_secs(4))?;
+
+        // 5c. Bob mentions `@alice:agent` -> Alice highlights `[MENTION]`; email `foo@alice.com` does NOT!
+        bob_chat.send_line("hey @alice:agent please check")?;
+        let _ = alice_chat.wait_for_substring("[MENTION] @bob: hey @alice:agent please check", Duration::from_secs(4))?;
+        bob_chat.send_line("contact foo@alice.com for billing")?;
+        let email_lines = alice_chat.wait_for_substring("contact foo@alice.com for billing", Duration::from_secs(4))?;
+        if let Some(last) = email_lines.last()
+            && last.contains("[MENTION]")
+        {
+            return Err(format!("email falsely triggered [MENTION]: {last:?}"));
+        }
 
         // 6. Bob secret refusal in active party!
         bob_chat.send_line("secret mpguest1_DO_NOT_SEND")?;

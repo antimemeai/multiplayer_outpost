@@ -120,6 +120,20 @@ pub struct BoardPostReq {
     pub client_msg_id: u64,
 }
 
+/// Request payload for `party_post_card` (structured `agent_card` over `mp2` or P2P board lane).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartyPostCardReq {
+    pub party_id: Option<u64>,
+    pub title: String,
+    pub summary: String,
+    pub files: Vec<String>,
+    pub status: Option<String>,
+    pub diff_stat: Option<String>,
+    pub agent_name: Option<String>,
+    /// Shim-generated CSPRNG idempotency key in `1..=MAX_SAFE_ID`.
+    pub client_msg_id: u64,
+}
+
 /// Request payload for `party_poll` and `board_read`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartyPollReq {
@@ -221,6 +235,8 @@ pub struct PartyPollResp {
     pub cursor_reset: bool,
     pub gap_possible: bool,
     pub timed_out: bool,
+    pub self_account_id: Option<u64>,
+    pub self_handle: Option<String>,
     pub events: Vec<McpPartyEvent>,
 }
 
@@ -292,6 +308,7 @@ pub trait McpOutpostBackend: Send + Sync + 'static {
     fn party_list(&self) -> BoxFuture<'_, Result<Value, BackendError>>;
     fn party_members(&self, party_id: u64) -> BoxFuture<'_, Result<Value, BackendError>>;
     fn party_send(&self, req: PartySendReq) -> BoxFuture<'_, Result<Value, BackendError>>;
+    fn party_post_card(&self, req: PartyPostCardReq) -> BoxFuture<'_, Result<Value, BackendError>>;
     fn board_post(&self, req: BoardPostReq) -> BoxFuture<'_, Result<Value, BackendError>>;
     fn party_poll(&self, req: PartyPollReq) -> BoxFuture<'_, Result<PartyPollResp, BackendError>>;
     fn board_read(&self, req: PartyPollReq) -> BoxFuture<'_, Result<BoardReadResp, BackendError>>;

@@ -23,7 +23,8 @@ use outpost_daemon::{
 use outpost_mcp::{
     BackendError, BoardPostReq, BoardReadResp, BoxFuture, CancellationToken, FriendAddReq,
     McpOutpostBackend, PartyInviteReq, PartyJoinReq, PartyLeaveReq, PartyPollReq, PartyPollResp,
-    PartySendReq, PartyWaitReq, ProgressSender,
+    PartyPostCardReq, PartySendReq, PartyWaitReq, ProgressSender, build_agent_card_json,
+    scan_card_secrets,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -115,6 +116,7 @@ struct MultiplexedConn {
     next_req_id: AtomicU64,
     alive: Arc<AtomicBool>,
     active_party_id: AtomicU64,
+    own_identity: Mutex<Option<(u64, String)>>,
     last_activity_ms: AtomicU64,
     upgrade_available: bool,
     reader_task: tokio::task::JoinHandle<()>,
@@ -176,6 +178,7 @@ impl MultiplexedConn {
             next_req_id: AtomicU64::new(2),
             alive,
             active_party_id: AtomicU64::new(ack.active_party_id),
+            own_identity: Mutex::new(None),
             last_activity_ms: AtomicU64::new(sleep_aware_now_ms()),
             upgrade_available,
             reader_task,
@@ -432,6 +435,37 @@ impl DaemonMcpBridge {
         }
     }
 
+    async fn resolve_own_identity(&self, conn: &MultiplexedConn) -> (Option<u64>, Option<String>) {
+        {
+            let guard = conn.own_identity.lock().await;
+            if let Some((acc_id, ref handle)) = *guard
+                && !handle.is_empty()
+            {
+                return (Some(acc_id), Some(handle.clone()));
+            }
+        }
+        if let Ok(raw) = conn.request(IpcOpcode::GetStatus, Vec::new(), None).await
+            && let Ok(status) = decode_status_resp(&raw)
+        {
+            let acc_id = status.account_id;
+            let handle = status.handle;
+            let mut guard = conn.own_identity.lock().await;
+            *guard = Some((acc_id, handle.clone()));
+            let opt_handle = if handle.is_empty() {
+                None
+            } else {
+                Some(handle)
+            };
+            return (Some(acc_id), opt_handle);
+        }
+        let guard = conn.own_identity.lock().await;
+        match *guard {
+            Some((acc_id, ref handle)) if !handle.is_empty() => (Some(acc_id), Some(handle.clone())),
+            Some((acc_id, _)) => (Some(acc_id), None),
+            None => (None, None),
+        }
+    }
+
     async fn clear_active_party_if_not_found(&self, party_id: u64, err: &BackendError) {
         let not_found_code = format!("ipc_{ERR_NOT_FOUND}");
         if let BackendError::ToolError { code, .. } = err
@@ -587,6 +621,10 @@ impl McpOutpostBackend for DaemonMcpBridge {
             let status = decode_status_resp(&raw).map_err(|_| BackendError::DaemonDisconnected)?;
             let active_id = status.active_party.as_ref().map_or(0, |p| p.party_id);
             conn.active_party_id.store(active_id, Ordering::Release);
+            {
+                let mut guard = conn.own_identity.lock().await;
+                *guard = Some((status.account_id, status.handle.clone()));
+            }
 
             let active_party_json = status.active_party.as_ref().map(|p| {
                 json!({
@@ -765,6 +803,72 @@ impl McpOutpostBackend for DaemonMcpBridge {
         })
     }
 
+    fn party_post_card(&self, req: PartyPostCardReq) -> BoxFuture<'_, Result<Value, BackendError>> {
+        Box::pin(async move {
+            scan_card_secrets(&req).map_err(BackendError::SecretRefused)?;
+            let card_json = build_agent_card_json(
+                &req.title,
+                &req.summary,
+                &req.files,
+                req.status.as_deref(),
+                req.diff_stat.as_deref(),
+                req.agent_name.as_deref(),
+            )
+            .map_err(|e| BackendError::InvalidParams(e.message))?;
+            check_mcp_outbound_secrets(&[card_json.as_bytes()])?;
+
+            let party_id = match req.party_id {
+                Some(pid) => pid,
+                None => {
+                    let (raw_list, conn) = self
+                        .call_ipc(IpcOpcode::PartyList, Vec::new(), None)
+                        .await?;
+                    let list = decode_party_list_resp(&raw_list)
+                        .map_err(|_| BackendError::DaemonDisconnected)?;
+                    let Some(active) = list.parties.last() else {
+                        conn.active_party_id.store(0, Ordering::Release);
+                        return Err(BackendError::ToolError {
+                            code: format!("ipc_{ERR_NOT_FOUND}"),
+                            message: "no active party".to_string(),
+                        });
+                    };
+                    conn.active_party_id.store(active.party_id, Ordering::Release);
+                    active.party_id
+                }
+            };
+
+            let card_bytes = card_json.len();
+            let wire_req = PartyPostBoardReq {
+                party_id,
+                client_msg_id: req.client_msg_id,
+                room_scope: "party/main".to_string(),
+                payload: card_json.into_bytes(),
+            };
+            let encoded = encode_party_post_board_req(&wire_req)
+                .map_err(|e| BackendError::InvalidParams(e.to_string()))?;
+            let (raw, conn) = match self
+                .call_ipc(IpcOpcode::PartyPostBoard, encoded, None)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    self.clear_active_party_if_not_found(party_id, &e).await;
+                    return Err(e);
+                }
+            };
+            let resp = decode_send_result_resp(&raw).map_err(|_| BackendError::DaemonDisconnected)?;
+            conn.active_party_id.store(resp.party_id, Ordering::Release);
+            Ok(json!({
+                "party_id": resp.party_id,
+                "client_msg_id": resp.client_msg_id,
+                "delivered_to": resp.delivered_to,
+                "withheld_unpinned": resp.withheld_unpinned,
+                "disconnected": resp.disconnected,
+                "card_bytes": card_bytes,
+            }))
+        })
+    }
+
     fn board_post(&self, req: BoardPostReq) -> BoxFuture<'_, Result<Value, BackendError>> {
         Box::pin(async move {
             let party_id = req.party_id;
@@ -827,7 +931,13 @@ impl McpOutpostBackend for DaemonMcpBridge {
                 resp.party_id
             };
             conn.active_party_id.store(next_active, Ordering::Release);
-            Ok(resp.into())
+            let mut out: PartyPollResp = resp.into();
+            if !out.events.is_empty() {
+                let (self_account_id, self_handle) = self.resolve_own_identity(&conn).await;
+                out.self_account_id = self_account_id;
+                out.self_handle = self_handle;
+            }
+            Ok(out)
         })
     }
 
@@ -910,7 +1020,13 @@ impl McpOutpostBackend for DaemonMcpBridge {
                 resp.party_id
             };
             conn.active_party_id.store(next_active, Ordering::Release);
-            Ok(resp.into())
+            let mut out: PartyPollResp = resp.into();
+            if !out.events.is_empty() {
+                let (self_account_id, self_handle) = self.resolve_own_identity(&conn).await;
+                out.self_account_id = self_account_id;
+                out.self_handle = self_handle;
+            }
+            Ok(out)
         })
     }
 
@@ -1155,6 +1271,40 @@ mod tests {
             Err(BackendError::SecretRefused(
                 SecretMatchKind::DeviceLinkToken
             ))
+        );
+
+        let res_card_cs = bridge
+            .party_post_card(PartyPostCardReq {
+                party_id: Some(1),
+                title: "Session debug".to_string(),
+                summary: "token mpcs1_secret_session_value".to_string(),
+                files: vec!["src/auth.rs".to_string()],
+                status: Some("working".to_string()),
+                diff_stat: None,
+                agent_name: None,
+                client_msg_id: 5,
+            })
+            .await;
+        assert_eq!(
+            res_card_cs,
+            Err(BackendError::SecretRefused(SecretMatchKind::InviteToken))
+        );
+
+        let res_card_file = bridge
+            .party_post_card(PartyPostCardReq {
+                party_id: None,
+                title: "Clean".to_string(),
+                summary: "Clean summary".to_string(),
+                files: vec!["mpguest1_secret_token.txt".to_string()],
+                status: Some("done".to_string()),
+                diff_stat: Some("+1 -0".to_string()),
+                agent_name: None,
+                client_msg_id: 6,
+            })
+            .await;
+        assert_eq!(
+            res_card_file,
+            Err(BackendError::SecretRefused(SecretMatchKind::InviteToken))
         );
     }
 }

@@ -30,6 +30,7 @@ use outpost_core::fence::{
 use outpost_core::ipc_wire::IpcOpcode;
 use outpost_core::party_state::DEFAULT_POLL_MAX_BYTES;
 use outpost_daemon::DaemonClient;
+use outpost_mcp::{MAX_AGENT_CARD_FILES, build_agent_card_json, text_mentions_handle};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 use zeroize::Zeroizing;
@@ -121,6 +122,7 @@ Arguments:\n\
   --no-tty          Line-oriented mode for pipes, dumb terminals, and scripts\n\n\
 In-chat commands:\n\
   /board <text>             Post to shared party board\n\
+  /card <title> | <summary> Post a structured agent card to the party\n\
   /invite [@handle]         Create room or invite a friend (prints share link)\n\
   /join [@handle|CODE|url]  Join or switch party live\n\
   /leave                    Leave active party (return to lobby)\n\
@@ -355,6 +357,7 @@ pub fn check_chat_secret_refusal(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
     Board(String),
+    Card(String),
     Invite(Option<String>),
     Join(String),
     Leave,
@@ -366,6 +369,17 @@ pub enum SlashCommand {
     Help,
     Quit,
     Unknown(String),
+}
+
+/// Parses `/card <title> | <summary>` arguments into trimmed non-empty `(title, summary)`.
+pub fn parse_card_command(rest: &str) -> Option<(String, String)> {
+    let (left, right) = rest.split_once('|')?;
+    let title = left.trim();
+    let summary = right.trim();
+    if title.is_empty() || summary.is_empty() {
+        return None;
+    }
+    Some((title.to_string(), summary.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,6 +406,7 @@ pub fn parse_user_input(raw: &str) -> UserInputAction {
     let cmd = cmd_raw.to_ascii_lowercase();
     match cmd.as_str() {
         "board" => UserInputAction::Command(SlashCommand::Board(rest_raw.to_string())),
+        "card" => UserInputAction::Command(SlashCommand::Card(rest_raw.to_string())),
         "invite" => {
             let target = rest_raw
                 .split_whitespace()
@@ -1044,6 +1059,101 @@ fn format_hhmm_from_ns(timestamp_ns: i64) -> String {
     format_hhmm_from_unix_secs(secs)
 }
 
+/// Formats a structured JSON `agent_card` payload into crisp sanitized multi-line box lines:
+/// - `┌ [card · done] <title> (+42 -12)`
+/// - `│ <summary>`
+/// - `│ files: a.rs, b.rs`
+///
+/// Returns `None` for plain text `/board` payloads or non-card JSON so plain board posts keep
+/// their compact `[board] <sender>: <text>` presentation.
+pub fn format_agent_card_lines(payload: &[u8]) -> Option<Vec<String>> {
+    let text = core::str::from_utf8(payload).ok()?;
+    let Value::Object(map) = serde_json::from_str::<Value>(text.trim()).ok()? else {
+        return None;
+    };
+
+    let title = map
+        .get("title")
+        .and_then(Value::as_str)
+        .map(sanitize_terminal_inline)
+        .filter(|s| !s.is_empty());
+    let summary_raw = map
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(|s| sanitize_terminal_text(s, true))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if title.is_none() && summary_raw.is_none() {
+        return None;
+    }
+
+    let status = map
+        .get("status")
+        .and_then(Value::as_str)
+        .map(sanitize_terminal_inline)
+        .filter(|s| !s.is_empty());
+    let diff_stat = map
+        .get("diff_stat")
+        .and_then(Value::as_str)
+        .map(sanitize_terminal_inline)
+        .filter(|s| !s.is_empty());
+    let agent_name = map
+        .get("agent_name")
+        .and_then(Value::as_str)
+        .map(sanitize_terminal_inline)
+        .filter(|s| !s.is_empty());
+
+    let files: Vec<String> = map
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .take(MAX_AGENT_CARD_FILES)
+                .filter_map(Value::as_str)
+                .map(sanitize_terminal_inline)
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let tag = match (&status, &agent_name) {
+        (Some(st), Some(ag)) => format!("[card · {st} · {ag}]"),
+        (Some(st), None) => format!("[card · {st}]"),
+        (None, Some(ag)) => format!("[card · {ag}]"),
+        (None, None) => "[card]".to_string(),
+    };
+    let title_str = title.unwrap_or_else(|| "Agent update".to_string());
+    let diff_part = match diff_stat {
+        Some(diff) => format!(" ({diff})"),
+        None => String::new(),
+    };
+
+    let mut lines = Vec::with_capacity(4);
+    lines.push(format!("┌ {tag} {title_str}{diff_part}"));
+    if let Some(summary) = summary_raw {
+        for part in summary.split('\n') {
+            let trimmed = part.trim_end();
+            if !trimmed.is_empty() {
+                lines.push(format!("│ {trimmed}"));
+            }
+        }
+    }
+    if !files.is_empty() {
+        lines.push(format!("│ files: {}", files.join(", ")));
+    }
+    Some(lines)
+}
+
+/// Canonical deduplication key for board / `agent_card` local echoes.
+fn board_echo_key(payload: &[u8]) -> String {
+    if let Some(lines) = format_agent_card_lines(payload) {
+        lines.join("\n")
+    } else {
+        format_board_payload(payload)
+    }
+}
+
 /// Formats a `BridgeEnvelope` (board / agent card) payload safely for terminal display.
 pub fn format_board_payload(payload: &[u8]) -> String {
     match core::str::from_utf8(payload) {
@@ -1078,6 +1188,7 @@ enum LineStyle {
     SelfChat,
     AgentChat,
     Board,
+    Mention,
     System,
     Error,
 }
@@ -1681,12 +1792,13 @@ impl ChatApp {
         }
     }
 
-    fn maybe_ring_bel(&mut self) {
+    fn maybe_ring_bel(&mut self, force_mention: bool) {
         if !self.tty || self.muted {
             return;
         }
         let now = Instant::now();
-        if let Some(prev) = self.last_bel_at
+        if !force_mention
+            && let Some(prev) = self.last_bel_at
             && now.saturating_duration_since(prev) < BEL_COOLDOWN
         {
             return;
@@ -1794,7 +1906,7 @@ impl ChatApp {
         if let Some((ref notice, _)) = self.status_notice {
             format!("─── {notice} ───")
         } else {
-            "─── Enter send · /invite /join /board /friends /members /copy /help /quit ───"
+            "─── Enter send · /card /board /invite /join /friends /members /copy /help /quit ───"
                 .to_string()
         }
     }
@@ -1805,6 +1917,7 @@ impl ChatApp {
             LineStyle::SelfChat => "\x1b[36m",
             LineStyle::AgentChat => "\x1b[35m",
             LineStyle::Board => "\x1b[33m",
+            LineStyle::Mention => "\x1b[1;33m",
             LineStyle::System => "\x1b[90m",
             LineStyle::Error => "\x1b[31m",
         }
@@ -2194,6 +2307,7 @@ impl ChatApp {
         let now = Instant::now();
         let mut need_member_refresh = false;
         let mut ring_bel = false;
+        let mut mention_bel = false;
 
         for ev in fresh {
             match ev.kind {
@@ -2214,8 +2328,10 @@ impl ChatApp {
                     {
                         continue;
                     }
+                    let is_mention =
+                        !is_self && text_mentions_handle(&clean_body, &self.own_handle);
                     let ts = format_hhmm_from_ns(timestamp_ns);
-                    let (sender_label, style) = if is_self {
+                    let (base_label, base_style) = if is_self {
                         if provenance.sender_device_id != 0
                             && provenance.sender_device_id != self.own_device_id
                         {
@@ -2231,9 +2347,18 @@ impl ChatApp {
                         );
                         (sanitize_terminal_inline(&disp), LineStyle::RemoteChat)
                     };
+                    let (sender_label, style) = if is_mention {
+                        (format!("[MENTION] {base_label}"), LineStyle::Mention)
+                    } else {
+                        (base_label, base_style)
+                    };
                     self.emit_multiline(&ts, &sender_label, &clean_body, style);
                     if !is_history && !is_self {
-                        ring_bel = true;
+                        if is_mention {
+                            mention_bel = true;
+                        } else {
+                            ring_bel = true;
+                        }
                     }
                 }
                 IpcPartyEventKind::BridgeEnvelope {
@@ -2241,13 +2366,13 @@ impl ChatApp {
                     room_scope: _,
                     payload,
                 } => {
-                    let formatted = format_board_payload(&payload);
+                    let echo_key = board_echo_key(&payload);
                     let is_self = provenance.sender_account_id != 0
                         && provenance.sender_account_id == self.own_account_id;
                     if is_self
                         && self
                             .dedup
-                            .consume_matching_echo(EchoKind::Board, formatted.trim(), now)
+                            .consume_matching_echo(EchoKind::Board, echo_key.trim(), now)
                     {
                         continue;
                     }
@@ -2260,14 +2385,46 @@ impl ChatApp {
                             &provenance.sender_handle,
                         ))
                     };
-                    self.emit_multiline(
-                        &ts,
-                        &format!("[board] {sender}"),
-                        &formatted,
-                        LineStyle::Board,
-                    );
-                    if !is_history && !is_self {
-                        ring_bel = true;
+                    if let Some(card_lines) = format_agent_card_lines(&payload) {
+                        let is_mention = !is_self
+                            && card_lines
+                                .iter()
+                                .any(|l| text_mentions_handle(l, &self.own_handle));
+                        let label = if is_mention {
+                            format!("[MENTION] {sender}")
+                        } else {
+                            sender
+                        };
+                        let style = if is_mention {
+                            LineStyle::Mention
+                        } else {
+                            LineStyle::Board
+                        };
+                        self.emit_card_lines(&ts, &label, &card_lines, style);
+                        if !is_history && !is_self {
+                            if is_mention {
+                                mention_bel = true;
+                            } else {
+                                ring_bel = true;
+                            }
+                        }
+                    } else {
+                        let formatted = format_board_payload(&payload);
+                        let is_mention =
+                            !is_self && text_mentions_handle(&formatted, &self.own_handle);
+                        let (label, style) = if is_mention {
+                            (format!("[MENTION] [board] {sender}"), LineStyle::Mention)
+                        } else {
+                            (format!("[board] {sender}"), LineStyle::Board)
+                        };
+                        self.emit_multiline(&ts, &label, &formatted, style);
+                        if !is_history && !is_self {
+                            if is_mention {
+                                mention_bel = true;
+                            } else {
+                                ring_bel = true;
+                            }
+                        }
                     }
                 }
                 IpcPartyEventKind::ControlNotice {
@@ -2305,8 +2462,10 @@ impl ChatApp {
         if need_member_refresh {
             self.refresh_members().await;
         }
-        if ring_bel {
-            self.maybe_ring_bel();
+        if mention_bel {
+            self.maybe_ring_bel(true);
+        } else if ring_bel {
+            self.maybe_ring_bel(false);
         }
     }
 
@@ -2315,6 +2474,16 @@ impl ChatApp {
         let first = lines.next().unwrap_or_default();
         self.push_line(format!("[{ts}] {label}: {first}"), style);
         for cont in lines {
+            self.push_line(format!("        {cont}"), style);
+        }
+    }
+
+    fn emit_card_lines(&mut self, ts: &str, label: &str, lines: &[String], style: LineStyle) {
+        let mut iter = lines.iter();
+        if let Some(first) = iter.next() {
+            self.push_line(format!("[{ts}] {label} {first}"), style);
+        }
+        for cont in iter {
             self.push_line(format!("        {cont}"), style);
         }
     }
@@ -2463,11 +2632,11 @@ impl ChatApp {
                         return;
                     }
                 };
-                let formatted = format_board_payload(trimmed.as_bytes());
+                let echo_key = board_echo_key(trimmed.as_bytes());
                 let ts = format_hhmm_now();
                 let echo_id = self.dedup.record_local_echo(
                     EchoKind::Board,
-                    formatted.trim().to_string(),
+                    echo_key.trim().to_string(),
                     Instant::now(),
                 );
                 match self
@@ -2477,7 +2646,12 @@ impl ChatApp {
                 {
                     Ok(raw) => match decode_send_result_resp(&raw) {
                         Ok(_) => {
-                            self.emit_multiline(&ts, "[board] you", &formatted, LineStyle::Board);
+                            if let Some(card_lines) = format_agent_card_lines(trimmed.as_bytes()) {
+                                self.emit_card_lines(&ts, "you", &card_lines, LineStyle::Board);
+                            } else {
+                                let formatted = format_board_payload(trimmed.as_bytes());
+                                self.emit_multiline(&ts, "[board] you", &formatted, LineStyle::Board);
+                            }
                         }
                         Err(e) => {
                             self.dedup.cancel_local_echo(echo_id);
@@ -2487,6 +2661,83 @@ impl ChatApp {
                     Err(e) => {
                         self.dedup.cancel_local_echo(echo_id);
                         self.push_error(&format!("board post failed: {e}"));
+                    }
+                }
+            }
+            SlashCommand::Card(raw_arg) => {
+                if let Err(reason) = check_chat_secret_refusal(&raw_arg, self.local_secret_refs()) {
+                    self.push_error(reason);
+                    return;
+                }
+                let Some((title, summary)) = parse_card_command(&raw_arg) else {
+                    self.push_system("Usage: /card <title> | <summary>");
+                    return;
+                };
+                if let Err(reason) = check_chat_secret_refusal(&title, self.local_secret_refs())
+                    .and_then(|()| check_chat_secret_refusal(&summary, self.local_secret_refs()))
+                {
+                    self.push_error(reason);
+                    return;
+                }
+                let card_json = match build_agent_card_json(&title, &summary, &[], None, None, None) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        self.push_error(&e.message);
+                        return;
+                    }
+                };
+                let Some(party_id) = self.active_party.as_ref().map(|p| p.party_id) else {
+                    self.push_system("Not in a party. Run /invite or /join first.");
+                    return;
+                };
+                let client_msg_id = match random_safe_id() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        self.push_error(&e);
+                        return;
+                    }
+                };
+                let payload_bytes = card_json.into_bytes();
+                let echo_key = board_echo_key(&payload_bytes);
+                let card_lines = format_agent_card_lines(&payload_bytes);
+                let req = PartyPostBoardReq {
+                    party_id,
+                    client_msg_id,
+                    room_scope: "party/main".to_string(),
+                    payload: payload_bytes,
+                };
+                let encoded = match encode_party_post_board_req(&req) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.push_error(&e.to_string());
+                        return;
+                    }
+                };
+                let ts = format_hhmm_now();
+                let echo_id = self.dedup.record_local_echo(
+                    EchoKind::Board,
+                    echo_key.trim().to_string(),
+                    Instant::now(),
+                );
+                match self
+                    .cmd_client
+                    .request(IpcOpcode::PartyPostBoard, encoded)
+                    .await
+                {
+                    Ok(raw) => match decode_send_result_resp(&raw) {
+                        Ok(_) => {
+                            if let Some(lines) = card_lines {
+                                self.emit_card_lines(&ts, "you", &lines, LineStyle::Board);
+                            }
+                        }
+                        Err(e) => {
+                            self.dedup.cancel_local_echo(echo_id);
+                            self.push_error(&e.to_string());
+                        }
+                    },
+                    Err(e) => {
+                        self.dedup.cancel_local_echo(echo_id);
+                        self.push_error(&format!("card post failed: {e}"));
                     }
                 }
             }
@@ -2714,7 +2965,7 @@ impl ChatApp {
             }
             SlashCommand::Help => {
                 self.push_system(
-                    "Commands: /board <text> · /invite [@handle] · /join [@handle|CODE|url] · /leave · /friends · /add @handle · /members · /copy · /mute · /help · /quit",
+                    "Commands: /board <text> · /card <title> | <summary> · /invite [@handle] · /join [@handle|CODE|url] · /leave · /friends · /add @handle · /members · /copy · /mute · /help · /quit",
                 );
             }
             SlashCommand::Quit => {
@@ -3404,5 +3655,63 @@ mod tests {
         assert_eq!(validate_share_url("https://clank.party/KAIH extra"), None);
         let huge = format!("https://clank.party/{}", "a".repeat(250));
         assert_eq!(validate_share_url(&huge), None);
+    }
+
+    #[test]
+    fn format_agent_card_lines_renders_box_and_sanitizes_hostile_escapes() {
+        let card = r#"{
+            "title": "Shipped \u001b[31mPhase 2\u001b[0m",
+            "summary": "Added \u001b]0;pwned\u0007cards\nline two \u202Ertl",
+            "status": "done",
+            "diff_stat": "+42 -12",
+            "agent_name": "Claude Code",
+            "files": ["src/chat.rs", "src/\u001b[2Jtools.rs"]
+        }"#;
+        let lines = format_agent_card_lines(card.as_bytes());
+        assert_eq!(
+            lines,
+            Some(vec![
+                "┌ [card · done · Claude Code] Shipped Phase 2 (+42 -12)".to_string(),
+                "│ Added cards".to_string(),
+                "│ line two rtl".to_string(),
+                "│ files: src/chat.rs, src/tools.rs".to_string(),
+            ])
+        );
+
+        // Plain text board post returns None so it uses compact `[board]` rendering.
+        assert_eq!(format_agent_card_lines(b"release v0.5.1 ready"), None);
+
+        // Card without agent_name renders `┌ [card · done] <title> (+42 -12)`
+        let minimal = r#"{"title":"Auth fix","summary":"Updated CWT parser","status":"done","diff_stat":"+42 -12","files":["a.rs","b.rs"]}"#;
+        assert_eq!(
+            format_agent_card_lines(minimal.as_bytes()),
+            Some(vec![
+                "┌ [card · done] Auth fix (+42 -12)".to_string(),
+                "│ Updated CWT parser".to_string(),
+                "│ files: a.rs, b.rs".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn card_slash_command_parsing_and_secret_refusal() {
+        assert_eq!(
+            parse_user_input("/card Auth fix | Updated CWT parser"),
+            UserInputAction::Command(SlashCommand::Card(
+                "Auth fix | Updated CWT parser".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_card_command("Auth fix | Updated CWT parser"),
+            Some(("Auth fix".to_string(), "Updated CWT parser".to_string()))
+        );
+        assert_eq!(parse_card_command("missing pipe"), None);
+        assert_eq!(parse_card_command(" | summary only"), None);
+        assert_eq!(parse_card_command("title only | "), None);
+
+        // Mention detection shared helper rejects emails and accepts agent forms
+        assert!(text_mentions_handle("hey @alice:agent run tests", "alice"));
+        assert!(text_mentions_handle("@alice's agent check diff", "alice"));
+        assert!(!text_mentions_handle("email foo@alice.com", "alice"));
     }
 }

@@ -16,20 +16,24 @@
 
 pub mod backend;
 pub mod json_strict;
+pub mod mentions;
 pub mod stdio;
 pub mod tools;
 
 pub use backend::{
     BackendError, BoardEnvelopeEvent, BoardPostReq, BoardReadResp, BoxFuture, CancellationToken,
     FriendAddReq, McpOutpostBackend, McpPartyEvent, McpPartyEventKind, PartyInviteReq,
-    PartyJoinReq, PartyLeaveReq, PartyPollReq, PartyPollResp, PartySendReq, PartyWaitReq,
-    PeerProvenance, ProgressSender, ProgressUpdate,
+    PartyJoinReq, PartyLeaveReq, PartyPollReq, PartyPollResp, PartyPostCardReq, PartySendReq,
+    PartyWaitReq, PeerProvenance, ProgressSender, ProgressUpdate,
 };
+pub use mentions::{event_mentions_self, is_self_sender, text_mentions_handle};
 pub use stdio::{
     DEFAULT_PROGRESS_INTERVAL, MAX_LINE_BYTES, McpServerConfig, SUPPORTED_PROTOCOL_VERSIONS,
     run_stdio, run_stdio_with_io,
 };
 pub use tools::{
-    DEFAULT_POLL_LIMIT, DEFAULT_POLL_MAX_BYTES, DEFAULT_WAIT_TIMEOUT_MS, MAX_POLL_LIMIT,
-    MAX_POLL_MAX_BYTES, MAX_WAIT_TIMEOUT_MS, SERVER_NAME, SERVER_VERSION, TOOL_NAMES, tool_catalog,
+    DEFAULT_POLL_LIMIT, DEFAULT_POLL_MAX_BYTES, DEFAULT_WAIT_TIMEOUT_MS, MAX_AGENT_CARD_FILES,
+    MAX_AGENT_CARD_JSON_BYTES, MAX_POLL_LIMIT, MAX_POLL_MAX_BYTES, MAX_WAIT_TIMEOUT_MS,
+    SERVER_NAME, SERVER_VERSION, TOOL_NAMES, VALID_AGENT_CARD_STATUSES, build_agent_card_json,
+    scan_card_secrets, scan_static_secret_text, tool_catalog,
 };

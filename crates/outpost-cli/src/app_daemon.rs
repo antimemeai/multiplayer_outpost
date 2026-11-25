@@ -3096,6 +3096,10 @@ impl AppDaemon {
         // Scan BOTH room_scope AND payload OUTSIDE `self.inner` mutex!
         {
             let (device_secret, device_cwt) = self.snapshot_secret_guard_material().await;
+            let static_match = core::str::from_utf8(&req.payload)
+                .ok()
+                .and_then(outpost_mcp::scan_static_secret_text)
+                .or_else(|| outpost_mcp::scan_static_secret_text(&req.room_scope));
             if let Some(kind) = scan_outbound_secrets(
                 req.room_scope.as_bytes(),
                 &device_secret,
@@ -3107,7 +3111,9 @@ impl AppDaemon {
                     &device_secret,
                     device_cwt.as_slice(),
                 )
-            }) {
+            })
+            .or(static_match)
+            {
                 return Err(ipc_err(
                     secret_kind_to_error_code(kind),
                     false,

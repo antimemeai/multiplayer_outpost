@@ -7,6 +7,7 @@ use core::fmt;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use mp_protocol::MAX_SAFE_ID;
+use outpost_core::fence::{SecretMatchKind, scan_outbound_secrets};
 use outpost_core::p2p_wire::{
     MAX_BRIDGE_PAYLOAD_BYTES, MAX_CHAT_BODY_BYTES, MAX_ROOM_SCOPE_BYTES,
 };
@@ -14,7 +15,7 @@ use serde_json::{Map, Value, json};
 
 use crate::backend::{
     BoardPostReq, FriendAddReq, PartyInviteReq, PartyJoinReq, PartyLeaveReq, PartyPollReq,
-    PartySendReq, PartyWaitReq,
+    PartyPostCardReq, PartySendReq, PartyWaitReq,
 };
 
 pub const SERVER_NAME: &str = "multiplayer-outpost";
@@ -26,9 +27,13 @@ pub const DEFAULT_POLL_LIMIT: u16 = 50;
 pub const MAX_POLL_LIMIT: u16 = 100;
 pub const DEFAULT_POLL_MAX_BYTES: u32 = 512 * 1024;
 pub const MAX_POLL_MAX_BYTES: u32 = 512 * 1024;
+pub const MAX_AGENT_CARD_FILES: usize = 16;
+pub const MAX_AGENT_CARD_JSON_BYTES: usize = 2048;
+pub const VALID_AGENT_CARD_STATUSES: [&str; 5] =
+    ["done", "working", "testing", "blocked", "error"];
 
-/// Exact list of all 13 MCP tool names (9 core + 4 Xbox Live party/friend lifecycle tools).
-pub const TOOL_NAMES: [&str; 13] = [
+/// Exact list of all 14 MCP tool names (9 core + 4 Xbox Live lifecycle + `party_post_card`).
+pub const TOOL_NAMES: [&str; 14] = [
     "outpost_status",
     "party_list",
     "party_members",
@@ -42,6 +47,7 @@ pub const TOOL_NAMES: [&str; 13] = [
     "party_join",
     "party_leave",
     "friend_add",
+    "party_post_card",
 ];
 
 /// Parsed and validated MCP tool invocation ready for backend dispatch.
@@ -51,6 +57,7 @@ pub enum ParsedToolCall {
     PartyList,
     PartyMembers { party_id: u64 },
     PartySend(PartySendReq),
+    PartyPostCard(PartyPostCardReq),
     BoardPost(BoardPostReq),
     PartyPoll(PartyPollReq),
     BoardRead(PartyPollReq),
@@ -347,7 +354,175 @@ pub fn tool_catalog() -> Vec<Value> {
             },
             "annotations": send_ann()
         }),
+        json!({
+            "name": "party_post_card",
+            "description": "Post a structured agent_card update (title, summary, optional status/diff_stat/files/agent_name) to the active party or an explicit party_id over mp2 WSS. Fails closed on secret material and caps JSON payload at 2048 bytes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "party_id": safe_id_schema(),
+                    "title": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200
+                    },
+                    "summary": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1500
+                    },
+                    "files": {
+                        "type": "array",
+                        "maxItems": MAX_AGENT_CARD_FILES,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 256
+                        }
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["done", "working", "testing", "blocked", "error"]
+                    },
+                    "diff_stat": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128
+                    },
+                    "agent_name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64
+                    }
+                },
+                "required": ["title", "summary"],
+                "additionalProperties": false
+            },
+            "annotations": send_ann()
+        }),
     ]
+}
+
+/// Builds and size-validates (`<= 2048` bytes) a compact UTF-8 JSON `agent_card` payload.
+pub fn build_agent_card_json(
+    title: &str,
+    summary: &str,
+    files: &[String],
+    status: Option<&str>,
+    diff_stat: Option<&str>,
+    agent_name: Option<&str>,
+) -> Result<String, ToolParseError> {
+    let title_trimmed = title.trim();
+    if title_trimmed.is_empty() {
+        return Err(ToolParseError::new("field 'title' must not be empty"));
+    }
+    let summary_trimmed = summary.trim();
+    if summary_trimmed.is_empty() {
+        return Err(ToolParseError::new("field 'summary' must not be empty"));
+    }
+    if files.len() > MAX_AGENT_CARD_FILES {
+        return Err(ToolParseError::new(format!(
+            "field 'files' exceeds max count of {MAX_AGENT_CARD_FILES}"
+        )));
+    }
+    if let Some(st) = status
+        && !VALID_AGENT_CARD_STATUSES.contains(&st)
+    {
+        return Err(ToolParseError::new(
+            "field 'status' must be one of done|working|testing|blocked|error",
+        ));
+    }
+
+    let mut obj = Map::new();
+    obj.insert("title".to_string(), Value::String(title_trimmed.to_string()));
+    obj.insert(
+        "summary".to_string(),
+        Value::String(summary_trimmed.to_string()),
+    );
+    if let Some(st) = status {
+        obj.insert("status".to_string(), Value::String(st.to_string()));
+    }
+    if let Some(diff) = diff_stat.map(str::trim).filter(|s| !s.is_empty()) {
+        obj.insert("diff_stat".to_string(), Value::String(diff.to_string()));
+    }
+    if let Some(agent) = agent_name.map(str::trim).filter(|s| !s.is_empty()) {
+        obj.insert("agent_name".to_string(), Value::String(agent.to_string()));
+    }
+    if !files.is_empty() {
+        let arr: Vec<Value> = files.iter().map(|f| Value::String(f.clone())).collect();
+        obj.insert("files".to_string(), Value::Array(arr));
+    }
+
+    let encoded = serde_json::to_string(&Value::Object(obj))
+        .map_err(|e| ToolParseError::new(format!("failed to serialize agent_card JSON: {e}")))?;
+    if encoded.len() > MAX_AGENT_CARD_JSON_BYTES {
+        return Err(ToolParseError::new(format!(
+            "agent_card JSON payload exceeds max length of {MAX_AGENT_CARD_JSON_BYTES} bytes ({} bytes)",
+            encoded.len()
+        )));
+    }
+    Ok(encoded)
+}
+
+/// Scans static text for protected credential prefixes (`mprk1_`, `mpinv1_`, `mppi1_`, `mpdl1_`,
+/// `mpcs1_`, `mpguest1_`), PEM private/secret/recovery keys, `.mpkey` files, and recovery keys.
+pub fn scan_static_secret_text(text: &str) -> Option<SecretMatchKind> {
+    const SENTINEL: [u8; 32] = [
+        0x9e, 0x37, 0x79, 0xb9, 0x7f, 0x4a, 0x7c, 0x15, 0xf3, 0x9c, 0xc0, 0x60, 0x5c, 0xed, 0xc8,
+        0x34, 0x10, 0x82, 0x27, 0x6b, 0xf3, 0xa2, 0x72, 0x51, 0xf8, 0x6c, 0x6a, 0x11, 0xd0, 0xc1,
+        0x8e, 0x95,
+    ];
+
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("mprk1_") {
+        return Some(SecretMatchKind::RecoveryKey);
+    }
+    if lower.contains("mpdl1_") {
+        return Some(SecretMatchKind::DeviceLinkToken);
+    }
+    if lower.contains("mpinv1_")
+        || lower.contains("mppi1_")
+        || lower.contains("mpcs1_")
+        || lower.contains("mpguest1_")
+    {
+        return Some(SecretMatchKind::InviteToken);
+    }
+
+    if let Some(kind) = scan_outbound_secrets(text.as_bytes(), &SENTINEL, &[])
+        && !matches!(
+            kind,
+            SecretMatchKind::OwnDeviceSecret | SecretMatchKind::OwnDeviceCwt
+        )
+    {
+        return Some(kind);
+    }
+    None
+}
+
+/// Enforces strict secret refusal across `title`, `summary`, `diff_stat`, `agent_name`, and `files`.
+pub fn scan_card_secrets(req: &PartyPostCardReq) -> Result<(), SecretMatchKind> {
+    if let Some(kind) = scan_static_secret_text(&req.title) {
+        return Err(kind);
+    }
+    if let Some(kind) = scan_static_secret_text(&req.summary) {
+        return Err(kind);
+    }
+    if let Some(ref diff) = req.diff_stat
+        && let Some(kind) = scan_static_secret_text(diff)
+    {
+        return Err(kind);
+    }
+    if let Some(ref agent) = req.agent_name
+        && let Some(kind) = scan_static_secret_text(agent)
+    {
+        return Err(kind);
+    }
+    for f in &req.files {
+        if let Some(kind) = scan_static_secret_text(f) {
+            return Err(kind);
+        }
+    }
+    Ok(())
 }
 
 fn reject_unknown_keys(args: &Map<String, Value>, allowed: &[&str]) -> Result<(), ToolParseError> {
@@ -635,6 +810,182 @@ pub fn parse_tool_call(
             let handle = require_string(args, "handle", 1, 64)?.to_string();
             Ok(ParsedToolCall::FriendAdd(FriendAddReq { handle }))
         }
+        "party_post_card" => {
+            reject_unknown_keys(
+                args,
+                &[
+                    "party_id",
+                    "title",
+                    "summary",
+                    "files",
+                    "status",
+                    "diff_stat",
+                    "agent_name",
+                ],
+            )?;
+            let party_id = optional_safe_id(args, "party_id")?;
+            let title = require_string(args, "title", 1, 200)?.trim().to_string();
+            if title.is_empty() {
+                return Err(ToolParseError::new("field 'title' must not be empty"));
+            }
+            let summary = require_string(args, "summary", 1, 1500)?.trim().to_string();
+            if summary.is_empty() {
+                return Err(ToolParseError::new("field 'summary' must not be empty"));
+            }
+            let files = match args.get("files") {
+                None => Vec::new(),
+                Some(Value::Array(items)) => {
+                    if items.len() > MAX_AGENT_CARD_FILES {
+                        return Err(ToolParseError::new(format!(
+                            "field 'files' exceeds max count of {MAX_AGENT_CARD_FILES}"
+                        )));
+                    }
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in items {
+                        let Some(s) = item.as_str() else {
+                            return Err(ToolParseError::new(
+                                "each entry in 'files' must be a string",
+                            ));
+                        };
+                        let trimmed = s.trim();
+                        if trimmed.is_empty() || trimmed.len() > 256 {
+                            return Err(ToolParseError::new(
+                                "each entry in 'files' must be 1..=256 bytes",
+                            ));
+                        }
+                        out.push(trimmed.to_string());
+                    }
+                    out
+                }
+                Some(_) => {
+                    return Err(ToolParseError::new(
+                        "field 'files' must be an array of strings",
+                    ));
+                }
+            };
+            let status = match optional_string(args, "status", 1, 16)? {
+                None => None,
+                Some(raw) => {
+                    let norm = raw.trim().to_string();
+                    if !VALID_AGENT_CARD_STATUSES.contains(&norm.as_str()) {
+                        return Err(ToolParseError::new(
+                            "field 'status' must be one of done|working|testing|blocked|error",
+                        ));
+                    }
+                    Some(norm)
+                }
+            };
+            let diff_stat = optional_string(args, "diff_stat", 1, 128)?
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let agent_name = optional_string(args, "agent_name", 1, 64)?
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            // Validate serialized JSON size <= 2048 bytes before dispatching.
+            let _ = build_agent_card_json(
+                &title,
+                &summary,
+                &files,
+                status.as_deref(),
+                diff_stat.as_deref(),
+                agent_name.as_deref(),
+            )?;
+
+            let client_msg_id = next_client_msg_id()?;
+            Ok(ParsedToolCall::PartyPostCard(PartyPostCardReq {
+                party_id,
+                title,
+                summary,
+                files,
+                status,
+                diff_stat,
+                agent_name,
+                client_msg_id,
+            }))
+        }
         _ => Err(ToolParseError::new(format!("unknown tool '{name}'"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn party_post_card_builds_compact_json_and_enforces_caps() {
+        let json_str = build_agent_card_json(
+            "Shipped mp2 cards",
+            "Added structured card rendering",
+            &["src/chat.rs".to_string(), "src/tools.rs".to_string()],
+            Some("done"),
+            Some("+42 -12"),
+            Some("Claude Code"),
+        );
+        let Ok(encoded) = json_str else {
+            unreachable!("valid card should encode");
+        };
+        assert!(encoded.len() <= MAX_AGENT_CARD_JSON_BYTES);
+        let parsed: Value = match serde_json::from_str(&encoded) {
+            Ok(v) => v,
+            Err(_) => unreachable!("encoded card must be valid JSON"),
+        };
+        assert_eq!(parsed.get("title").and_then(Value::as_str), Some("Shipped mp2 cards"));
+        assert_eq!(parsed.get("status").and_then(Value::as_str), Some("done"));
+        assert_eq!(parsed.get("diff_stat").and_then(Value::as_str), Some("+42 -12"));
+        assert_eq!(parsed.get("agent_name").and_then(Value::as_str), Some("Claude Code"));
+
+        // Reject invalid status
+        assert!(build_agent_card_json("t", "s", &[], Some("bogus"), None, None).is_err());
+
+        // Reject > 16 files
+        let too_many: Vec<String> = (0..17).map(|i| format!("f{i}.rs")).collect();
+        assert!(build_agent_card_json("t", "s", &too_many, None, None, None).is_err());
+
+        // Reject JSON > 2048 bytes
+        let big_files: Vec<String> = (0..16).map(|i| format!("{i}_{}", "a".repeat(180))).collect();
+        assert!(build_agent_card_json("t", "s", &big_files, Some("done"), None, None).is_err());
+    }
+
+    #[test]
+    fn card_secret_refusal_catches_all_forbidden_prefixes_and_pem_across_fields() {
+        let base = PartyPostCardReq {
+            party_id: Some(1),
+            title: "Clean title".to_string(),
+            summary: "Clean summary".to_string(),
+            files: vec!["src/main.rs".to_string()],
+            status: Some("done".to_string()),
+            diff_stat: Some("+10 -2".to_string()),
+            agent_name: Some("Claude Code".to_string()),
+            client_msg_id: 1,
+        };
+        assert!(scan_card_secrets(&base).is_ok());
+
+        for secret in [
+            "mprk1_ABCD1234",
+            "mpinv1_secret_token",
+            "mppi1_secret_token",
+            "mpdl1_secret_token",
+            "mpcs1_session_token",
+            "mpguest1_guest_token",
+            "-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+        ] {
+            let mut in_title = base.clone();
+            in_title.title = format!("fix {secret}");
+            assert!(scan_card_secrets(&in_title).is_err(), "missed secret in title: {secret}");
+
+            let mut in_summary = base.clone();
+            in_summary.summary = format!("detail {secret}");
+            assert!(scan_card_secrets(&in_summary).is_err(), "missed secret in summary: {secret}");
+
+            let mut in_diff = base.clone();
+            in_diff.diff_stat = Some(secret.to_string());
+            assert!(scan_card_secrets(&in_diff).is_err(), "missed secret in diff_stat: {secret}");
+
+            let mut in_files = base.clone();
+            in_files.files = vec![format!("path/{secret}.txt")];
+            assert!(scan_card_secrets(&in_files).is_err(), "missed secret in files: {secret}");
+        }
     }
 }

@@ -1869,6 +1869,8 @@ impl From<PartyPollIpcResp> for PartyPollResp {
             cursor_reset: r.cursor_reset,
             gap_possible: r.gap_possible,
             timed_out: r.timed_out,
+            self_account_id: None,
+            self_handle: None,
             events: r.events.into_iter().map(McpPartyEvent::from).collect(),
         }
     }
