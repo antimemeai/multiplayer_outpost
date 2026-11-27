@@ -129,6 +129,8 @@ pub struct Mp2Member {
     pub status: String,
     #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
     pub device_id: Option<u64>,
+    #[serde(default)]
+    pub nick: Option<String>,
 }
 
 impl Mp2Member {
@@ -157,6 +159,8 @@ pub struct Mp2Sender {
     pub agent_name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
     pub device_id: Option<u64>,
+    #[serde(default)]
+    pub nick: Option<String>,
 }
 
 impl Mp2Sender {
@@ -230,6 +234,12 @@ pub struct Mp2Hello {
     pub mls_rekey_required: bool,
     #[serde(default)]
     pub group_id_b64: Option<String>,
+    #[serde(default)]
+    pub party_ds_pubkey_b64: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub mls_invite_epoch: u64,
+    #[serde(default)]
+    pub topic: Option<String>,
 }
 
 /// Authoritative delivery acknowledgement for an outbound `send`.
@@ -287,6 +297,21 @@ pub enum Mp2RoomEvent {
         target_epoch: u64,
         welcome_id: Option<u64>,
     },
+    MlsJoinRequest {
+        kp_id: Option<u64>,
+        account_id: u64,
+        device_id: u64,
+        invite_id: Option<u64>,
+        kp_ref_b64: String,
+        kp_blob_b64: String,
+        join_proof_b64: Option<String>,
+    },
+    MlsCommitDiscarded {
+        committer_device_id: u64,
+        reason: String,
+        strikes_5m: u64,
+        rotate_committer: bool,
+    },
     EphemeralEvent {
         seq: Option<u64>,
         ts_ms: u64,
@@ -320,6 +345,8 @@ struct RawInboundFrame {
     room_code: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    topic: Option<String>,
     #[serde(rename = "self", default)]
     self_info: Option<Mp2SelfInfo>,
     #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
@@ -360,6 +387,10 @@ struct RawInboundFrame {
     mls_rekey_required: Option<bool>,
     #[serde(default)]
     group_id_b64: Option<String>,
+    #[serde(default)]
+    party_ds_pubkey_b64: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    mls_invite_epoch: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
     parent_epoch: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
@@ -375,7 +406,11 @@ struct RawInboundFrame {
     #[serde(default)]
     commit_b64: Option<String>,
     #[serde(default)]
+    commit_blob_b64: Option<String>,
+    #[serde(default)]
     proposal_blobs_b64: Option<Vec<String>>,
+    #[serde(default)]
+    proposals_b64: Option<Vec<String>>,
     #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
     deadline_ms: Option<u64>,
     #[serde(default)]
@@ -386,12 +421,37 @@ struct RawInboundFrame {
     elected_committer_device_id: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
     welcome_id: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    kp_id: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    account_id: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    device_id: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    invite_id: Option<u64>,
+    #[serde(default)]
+    kp_ref_b64: Option<String>,
+    #[serde(default)]
+    kp_blob_b64: Option<String>,
+    #[serde(default)]
+    join_proof_b64: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    strikes_5m: Option<u64>,
+    #[serde(default)]
+    rotate_committer: Option<bool>,
 }
 
 fn is_mls_control_frame_type(t: &str) -> bool {
     matches!(
         t,
-        "mls_commit_tentative" | "mls_commit_finalized" | "mls_rekey_needed" | "mls_welcome_ready"
+        "mls_commit_tentative"
+            | "mls_commit_finalized"
+            | "mls_rekey_needed"
+            | "mls_welcome_ready"
+            | "mls_welcome_available"
+            | "mls_join_request"
+            | "mls_key_package_available"
+            | "mls_commit_discarded"
     )
 }
 
@@ -441,6 +501,9 @@ pub fn parse_mp2_server_text(text: &str) -> Result<Mp2RoomEvent, Mp2WsError> {
                 min_allowed_mls_epoch: raw.min_allowed_mls_epoch.unwrap_or(0),
                 mls_rekey_required: raw.mls_rekey_required.unwrap_or(false),
                 group_id_b64: raw.group_id_b64,
+                party_ds_pubkey_b64: raw.party_ds_pubkey_b64,
+                mls_invite_epoch: raw.mls_invite_epoch.unwrap_or(0),
+                topic: raw.topic,
             }))
         }
         "event" => {
@@ -491,16 +554,14 @@ pub fn parse_mp2_server_text(text: &str) -> Result<Mp2RoomEvent, Mp2WsError> {
             members: raw.members.unwrap_or_default(),
         }),
         "mls_commit_tentative" => {
-            let group_id_b64 = raw.group_id_b64.ok_or_else(|| {
-                Mp2WsError::InvalidJson("mls_commit_tentative missing group_id_b64".to_owned())
-            })?;
+            let group_id_b64 = raw.group_id_b64.unwrap_or_default();
             let parent_epoch = raw.parent_epoch.ok_or_else(|| {
                 Mp2WsError::InvalidJson("mls_commit_tentative missing parent_epoch".to_owned())
             })?;
             let target_epoch = raw.target_epoch.ok_or_else(|| {
                 Mp2WsError::InvalidJson("mls_commit_tentative missing target_epoch".to_owned())
             })?;
-            let commit_b64 = raw.commit_b64.ok_or_else(|| {
+            let commit_b64 = raw.commit_b64.or(raw.commit_blob_b64).ok_or_else(|| {
                 Mp2WsError::InvalidJson("mls_commit_tentative missing commit_b64".to_owned())
             })?;
             Ok(Mp2RoomEvent::MlsCommitTentative {
@@ -512,18 +573,19 @@ pub fn parse_mp2_server_text(text: &str) -> Result<Mp2RoomEvent, Mp2WsError> {
                 committer_account_id: raw.committer_account_id.unwrap_or(0),
                 committer_device_id: raw.committer_device_id.unwrap_or(0),
                 commit_b64,
-                proposal_blobs_b64: raw.proposal_blobs_b64.unwrap_or_default(),
+                proposal_blobs_b64: raw
+                    .proposal_blobs_b64
+                    .or(raw.proposals_b64)
+                    .unwrap_or_default(),
                 deadline_ms: raw.deadline_ms.unwrap_or(0),
             })
         }
         "mls_commit_finalized" => {
-            let group_id_b64 = raw.group_id_b64.ok_or_else(|| {
-                Mp2WsError::InvalidJson("mls_commit_finalized missing group_id_b64".to_owned())
-            })?;
+            let group_id_b64 = raw.group_id_b64.unwrap_or_default();
             let epoch = raw.epoch.or(raw.target_epoch).or(raw.mls_epoch).ok_or_else(|| {
                 Mp2WsError::InvalidJson("mls_commit_finalized missing epoch".to_owned())
             })?;
-            let commit_b64 = raw.commit_b64.ok_or_else(|| {
+            let commit_b64 = raw.commit_b64.or(raw.commit_blob_b64).ok_or_else(|| {
                 Mp2WsError::InvalidJson("mls_commit_finalized missing commit_b64".to_owned())
             })?;
             Ok(Mp2RoomEvent::MlsCommitFinalized {
@@ -532,7 +594,10 @@ pub fn parse_mp2_server_text(text: &str) -> Result<Mp2RoomEvent, Mp2WsError> {
                 epoch,
                 commit_sha256_b64: raw.commit_sha256_b64.unwrap_or_default(),
                 commit_b64,
-                proposal_blobs_b64: raw.proposal_blobs_b64.unwrap_or_default(),
+                proposal_blobs_b64: raw
+                    .proposal_blobs_b64
+                    .or(raw.proposals_b64)
+                    .unwrap_or_default(),
                 confirmed_transcript_hash_b64: raw.confirmed_transcript_hash_b64,
             })
         }
@@ -542,14 +607,41 @@ pub fn parse_mp2_server_text(text: &str) -> Result<Mp2RoomEvent, Mp2WsError> {
             mls_epoch: raw.mls_epoch.unwrap_or(0),
             min_allowed_mls_epoch: raw.min_allowed_mls_epoch.unwrap_or(0),
             reason: sanitize_server_error(raw.reason.as_deref().unwrap_or("rekey_needed")),
-            proposal_blobs_b64: raw.proposal_blobs_b64.unwrap_or_default(),
+            proposal_blobs_b64: raw
+                .proposal_blobs_b64
+                .or(raw.proposals_b64)
+                .unwrap_or_default(),
             elected_committer_device_id: raw.elected_committer_device_id,
         }),
-        "mls_welcome_ready" => Ok(Mp2RoomEvent::MlsWelcomeReady {
+        "mls_welcome_ready" | "mls_welcome_available" => Ok(Mp2RoomEvent::MlsWelcomeReady {
             party_id: raw.party_id,
             group_id_b64: raw.group_id_b64.unwrap_or_default(),
             target_epoch: raw.target_epoch.or(raw.mls_epoch).unwrap_or(0),
             welcome_id: raw.welcome_id,
+        }),
+        "mls_join_request" | "mls_key_package_available" => {
+            let account_id = raw.account_id.ok_or_else(|| {
+                Mp2WsError::InvalidJson("mls_join_request missing account_id".to_owned())
+            })?;
+            let device_id = raw.device_id.ok_or_else(|| {
+                Mp2WsError::InvalidJson("mls_join_request missing device_id".to_owned())
+            })?;
+            let kp_blob_b64 = raw.kp_blob_b64.unwrap_or_default();
+            Ok(Mp2RoomEvent::MlsJoinRequest {
+                kp_id: raw.kp_id,
+                account_id,
+                device_id,
+                invite_id: raw.invite_id,
+                kp_ref_b64: raw.kp_ref_b64.unwrap_or_default(),
+                kp_blob_b64,
+                join_proof_b64: raw.join_proof_b64,
+            })
+        }
+        "mls_commit_discarded" => Ok(Mp2RoomEvent::MlsCommitDiscarded {
+            committer_device_id: raw.committer_device_id.unwrap_or(0),
+            reason: sanitize_server_error(raw.reason.as_deref().unwrap_or("discarded")),
+            strikes_5m: raw.strikes_5m.unwrap_or(0),
+            rotate_committer: raw.rotate_committer.unwrap_or(false),
         }),
         "ephemeral_event" => {
             let sender = raw.sender.ok_or_else(|| {
@@ -691,6 +783,20 @@ struct OutboundStatusFrame<'a> {
     agent_state: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_summary: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct OutboundNickFrame<'a> {
+    v: u8,
+    t: &'static str,
+    nick: &'a str,
+}
+
+#[derive(Serialize)]
+struct OutboundTopicFrame<'a> {
+    v: u8,
+    t: &'static str,
+    topic: &'a str,
 }
 
 /// Strictly validates a server-supplied `mp2` WebSocket path before RFC 9421 signing.
@@ -998,6 +1104,48 @@ impl Mp2RoomSocket {
                 max_len: MAX_MP2_FRAME_BYTES,
             });
         }
+        self.stream
+            .send(Message::text(text))
+            .await
+            .map_err(Mp2WsError::Websocket)
+    }
+
+    /// Sends a `{ v: 2, t: "nick", nick }` frame in standard (`e2ee_mode == 0`) rooms.
+    ///
+    /// Suppressed (no-op) in `e2ee_mode == 1` rooms where nick updates MUST travel inside
+    /// encrypted `e2ee_app` payloads (`{"mp_irc":1,"t":"nick","nick":...}`).
+    pub async fn send_nick(&mut self, nick: &str) -> Result<(), Mp2WsError> {
+        if self.e2ee_mode == 1 {
+            return Ok(());
+        }
+        let frame = OutboundNickFrame {
+            v: 2,
+            t: "nick",
+            nick,
+        };
+        let text = serde_json::to_string(&frame)
+            .map_err(|e| Mp2WsError::InvalidJson(e.to_string()))?;
+        self.stream
+            .send(Message::text(text))
+            .await
+            .map_err(Mp2WsError::Websocket)
+    }
+
+    /// Sends a `{ v: 2, t: "topic", topic }` frame in standard (`e2ee_mode == 0`) rooms.
+    ///
+    /// Suppressed (no-op) in `e2ee_mode == 1` rooms where topic updates MUST travel inside
+    /// encrypted `e2ee_app` payloads (`{"mp_irc":1,"t":"topic","topic":...}`).
+    pub async fn send_topic(&mut self, topic: &str) -> Result<(), Mp2WsError> {
+        if self.e2ee_mode == 1 {
+            return Ok(());
+        }
+        let frame = OutboundTopicFrame {
+            v: 2,
+            t: "topic",
+            topic,
+        };
+        let text = serde_json::to_string(&frame)
+            .map_err(|e| Mp2WsError::InvalidJson(e.to_string()))?;
         self.stream
             .send(Message::text(text))
             .await

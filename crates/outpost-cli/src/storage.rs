@@ -42,7 +42,12 @@ pub const PEERS_FILE: &str = "peers.bin";
 pub const EPOCHS_FILE: &str = "epochs.bin";
 pub const DEVICES_SUBDIR: &str = "devices";
 pub const MLS_SUBDIR: &str = "mls";
+pub const MLS_IDENTITY_FILE: &str = "identity.mls.bin";
 pub const DEFAULT_RELAY_URL: &str = "https://relay.multiplayer.tech";
+
+const MLS_IDENTITY_SENTINEL_PARTY_ID: u64 = 1;
+const MLS_IDENTITY_SENTINEL_GROUP_ID: [u8; MP_GROUP_ID_LEN] = *b"mp-mls-device-identity-1";
+const MLS_PENDING_KP_SENTINEL_GROUP_ID: [u8; MP_GROUP_ID_LEN] = *b"mp-mls-pending-kp-v1\0\0\0\0";
 
 pub const STATE_LOCK_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_SMALL_STATE_BYTES: usize = 64 * 1024;
@@ -97,6 +102,115 @@ pub fn mls_room_filename(party_id: u64) -> Result<String, String> {
         return Err(format!("invalid party_id {party_id}"));
     }
     Ok(format!("p{party_id:013x}.mls.bin"))
+}
+
+pub fn mls_pending_kp_filename(party_id: u64) -> Result<String, String> {
+    if party_id == 0 || party_id > MAX_SAFE_ID {
+        return Err(format!("invalid party_id {party_id}"));
+    }
+    Ok(format!("p{party_id:013x}.kp.bin"))
+}
+
+/// Encrypts and atomically saves the device's signed `MpMlsDeviceBindingV1` (236 B) and
+/// `AccountDeviceListV1` blob under `<state_dir>/mls/d<13hex>/identity.mls.bin` (0600, backup-excluded).
+pub fn save_mls_device_identity(
+    state_dir_path: &Path,
+    _lock: &StateLock,
+    device_secret: &[u8; 32],
+    device_id: u64,
+    binding_236b: &[u8],
+    device_list_blob: &[u8],
+) -> Result<(), String> {
+    let mls_dir = open_mls_device_dir(state_dir_path, device_id)?;
+    let key = derive_mls_store_key(device_secret, device_id);
+    let snap = MlsRoomSnapshotPlain {
+        device_binding_236b: binding_236b.to_vec(),
+        device_list_blob: device_list_blob.to_vec(),
+        ..MlsRoomSnapshotPlain::default()
+    };
+    let encrypted = encrypt_mls_snapshot_random(
+        &key,
+        device_id,
+        MLS_IDENTITY_SENTINEL_PARTY_ID,
+        &MLS_IDENTITY_SENTINEL_GROUP_ID,
+        &snap,
+    )
+    .map_err(|e| format!("encrypt MLS device identity failed: {e}"))?;
+    atomic_write_in_dir(mls_dir.as_raw_fd(), MLS_IDENTITY_FILE, &encrypted)
+        .map_err(|e| e.to_string())
+}
+
+/// Loads and decrypts the device's cached `(binding_236b, device_list_blob)` fail-closed.
+pub type PersistedMlsIdentity = (Vec<u8>, Vec<u8>);
+
+pub fn load_mls_device_identity(
+    state_dir_path: &Path,
+    device_secret: &[u8; 32],
+    device_id: u64,
+) -> Result<Option<PersistedMlsIdentity>, String> {
+    let mls_dir = open_mls_device_dir(state_dir_path, device_id)?;
+    let Some(raw) = read_file_in_dir(
+        mls_dir.as_raw_fd(),
+        MLS_IDENTITY_FILE,
+        MLS_STORE_MAX_FILE_BYTES,
+    )
+    .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let key = derive_mls_store_key(device_secret, device_id);
+    let plain = decrypt_mls_snapshot(
+        &key,
+        device_id,
+        MLS_IDENTITY_SENTINEL_PARTY_ID,
+        &MLS_IDENTITY_SENTINEL_GROUP_ID,
+        &raw,
+    )
+    .map_err(|e| format!("corrupt or mismatched MLS device identity: {e}"))?;
+    if plain.device_binding_236b.is_empty() || plain.device_list_blob.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((plain.device_binding_236b, plain.device_list_blob)))
+}
+
+/// Persists a single-use pending `KeyPackage` private bundle encrypted under `StateLock` BEFORE upload.
+pub fn save_mls_pending_key_package(
+    state_dir_path: &Path,
+    _lock: &StateLock,
+    device_secret: &[u8; 32],
+    device_id: u64,
+    party_id: u64,
+    kp: outpost_core::mls_store::PersistedKeyPackage,
+) -> Result<(), String> {
+    let mls_dir = open_mls_device_dir(state_dir_path, device_id)?;
+    let fname = mls_pending_kp_filename(party_id)?;
+    let key = derive_mls_store_key(device_secret, device_id);
+    let snap = MlsRoomSnapshotPlain {
+        pending_key_packages: vec![kp],
+        ..MlsRoomSnapshotPlain::default()
+    };
+    let encrypted = encrypt_mls_snapshot_random(
+        &key,
+        device_id,
+        party_id,
+        &MLS_PENDING_KP_SENTINEL_GROUP_ID,
+        &snap,
+    )
+    .map_err(|e| format!("encrypt MLS pending KeyPackage failed: {e}"))?;
+    atomic_write_in_dir(mls_dir.as_raw_fd(), &fname, &encrypted).map_err(|e| e.to_string())
+}
+
+pub fn remove_mls_pending_key_package(
+    state_dir_path: &Path,
+    _lock: &StateLock,
+    device_id: u64,
+    party_id: u64,
+) {
+    if let Ok(mls_dir) = open_mls_device_dir(state_dir_path, device_id)
+        && let Ok(fname) = mls_pending_kp_filename(party_id)
+    {
+        let _ = std::fs::remove_file(mls_dir.path().join(fname));
+    }
 }
 
 /// Atomically writes already-encrypted `MPM1` MLS snapshot bytes into `<state_dir>/mls/d<13hex>/`

@@ -2,7 +2,7 @@
 
 Standalone Outpost / sidecar (single static Rust binary: CLI + live second-window terminal chat + detached local daemon + local MCP stdio server) connecting **8 coding hosts** (**Claude Code**, **Codex CLI**, **Cursor**, **Antigravity**, **Gemini CLI**, **OpenCode**, **Hermes**, and **Zed**) to [`multiplayer.tech`](https://multiplayer.tech) and [`clank.party`](https://clank.party) parties over persistent **`mp2` WebSockets (port 443)** with **MLS (RFC 9420, `openmls`) end-to-end encryption** — without installing or running the full Blackbird harness.
 
-## Install & Upgrade Prebuilt Binary (`v0.7.0`)
+## Install & Upgrade Prebuilt Binary (`v0.7.1`)
 
 macOS (`darwin-arm64`) and Linux (`linux-x86_64`, `linux-arm64`):
 

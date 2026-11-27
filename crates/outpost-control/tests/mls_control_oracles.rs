@@ -513,6 +513,7 @@ async fn oracle_2_signed_rfc9421_mls_https_control_plane_and_256kib_budget() {
                 welcome_b64: None,
                 welcome_auth_b64: None,
                 joiner_device_id: None,
+                welcomes: Vec::new(),
             },
         )
         .await;
@@ -599,11 +600,11 @@ async fn oracle_2_signed_rfc9421_mls_https_control_plane_and_256kib_budget() {
         .mls_submit_join(
             pid,
             &MlsJoinRequest {
-                invite_id: 9001,
-                server_invite_token_b64: "VE9LRU4=".to_owned(),
+                invite_id: Some(9001),
+                server_invite_token_b64: Some("VE9LRU4=".to_owned()),
                 kp_ref_b64: "S1BSRUY=".to_owned(),
                 kp_blob_b64: "S1A=".to_owned(),
-                join_proof_b64: "UFJPT0Y=".to_owned(),
+                join_proof_b64: Some("UFJPT0Y=".to_owned()),
             },
         )
         .await
@@ -621,6 +622,7 @@ async fn oracle_2_signed_rfc9421_mls_https_control_plane_and_256kib_budget() {
                 welcome_b64: None,
                 welcome_auth_b64: None,
                 joiner_device_id: None,
+                welcomes: Vec::new(),
             },
         )
         .await
@@ -665,6 +667,7 @@ async fn oracle_2_signed_rfc9421_mls_https_control_plane_and_256kib_budget() {
                 group_id_b64: "GID".to_owned(),
                 target_epoch: 1,
                 kp_ref_b64: "S1BSRUY=".to_owned(),
+                welcome_id: None,
             },
         )
         .await

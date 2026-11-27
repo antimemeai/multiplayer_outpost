@@ -153,3 +153,14 @@ Authored `docs/OUTPOST_ARCHITECTURE_AND_SPEC.md` (v1 Draft) and ran all 5 indepe
    - Vendored `crates/mp-mls` into the workspace for 100% self-contained GitHub Actions builds and `--locked` verification.
    - Implemented backup-excluded AES-256-GCM MLS state persistence (`crates/outpost-core/src/mls_store.rs`) and MLS group session lifecycle (`crates/outpost-core/src/mls_session.rs`) with exact `512 / 2048 / 8192 / 24000 B` wire padding buckets.
    - Added epoch-stale outbound requeue on commit races, historical-catchup `@mention` suppression, Tier 0–3 trust/verification state + `epoch_authenticator` MCP surface, and unit/control oracles (`mls_e2ee_oracles.rs`, `mls_control_oracles.rs`).
+
+## 2026-11-27 — `v0.7.1` Live MLS Mode-1 Room Wiring, 2-Step Cloud-Bind, Sibling-Device Multi-Server Fleet & Classic IRC Chat
+
+1. **Live MLS `e2ee_mode = 1` Daemon Wiring (`crates/mp-mls/`, `crates/outpost-core/`, `crates/outpost-control/`, `crates/outpost-cli/`):**
+   - Wired end-to-end live MLS attach in `app_daemon.rs` (`e2ee_mode = 1` default on `op_room_invite`, `POST /v1/parties/:id/mls/init` creator bootstrap, pre-WS `POST /mls/join` + `GET /mls/welcome` joiner gate, encrypted `MPM1` `0600` local snapshots, `MlsJoinRequest` auto-Add, `CommitAckV1` quorum submission, `MlsCommitFinalized` catchup, `MlsRekeyNeeded` external-remove commits, and strict fail-closed plaintext refusal).
+   - Implemented exact 2-step `POST /v1/accounts/me/mls/cloud-bind` for cloud-managed (`custody_mode = 0`) accounts (`sign_pop` -> local PoP verification of `b"mp-mls-dev-pop-v1:" || SHA-256(body || root_sig)` -> Ed25519 PoP -> finalized 236B `MpMlsDeviceBindingV1` + `AccountDeviceListV1`).
+   - Added `sibling_welcome_mac_key`, `commit_add_sibling_device`, and `join_from_welcome_sibling` so 1-operator multi-server fleets under the same `@handle` join and exchange encrypted `e2ee_app` messages seamlessly across distinct `device_id`s.
+2. **Classic IRC Chat Charm (`crates/outpost-cli/src/chat.rs`):**
+   - Added `--nick <name>`, `/nick <name>`, `/me <action>`, `/topic [text]`, `/names`, joinlines/partlines (`-->` / `<--`), `[HH:MM]` timestamps, and deterministic ANSI nick colors with strict anti-spoofing (always paired with verified `@handle`) and ANSI/BiDi sanitization.
+   - In `e2ee_mode = 1` rooms, `/nick`, `/me`, and `/topic` travel exclusively inside encrypted `e2ee_app` JSON payloads (`{"mp_irc":1,"t":"nick"|"me"|"topic",...}`) matching `room.multiplayer.tech` and Blackbird `v0.9.1`.
+3. **Verification:** `cargo test --workspace` (**188/188 passed**, including 4-daemon real TLS 1.3 + `MpMlsPublicDs` end-to-end live MLS test) + `cargo clippy --workspace --all-targets -- -D warnings` (0 warnings).

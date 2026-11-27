@@ -15,10 +15,11 @@ pub mod invite;
 pub mod policy;
 
 pub use client::{
-    generate_single_use_key_package, mp_join_config, unbounded_mls_lifetime, AddMemberCommitOutput,
-    DecryptedAppMessage, DeviceIdentity, MpMlsClient, PendingOutboxEntry, MP_MAX_FORWARD_DISTANCE,
-    MP_MAX_FRAMES_PER_EPOCH, MP_MAX_PAST_EPOCHS, MP_OUT_OF_ORDER_TOLERANCE,
-    MP_PAST_EPOCH_RETENTION_SECS, MP_PCS_UPDATE_FRAME_THRESHOLD,
+    generate_single_use_key_package, mp_join_config, sibling_welcome_mac_key,
+    unbounded_mls_lifetime, AddMemberCommitOutput, DecryptedAppMessage, DeviceIdentity,
+    MpMlsClient, PendingOutboxEntry, MP_MAX_FORWARD_DISTANCE, MP_MAX_FRAMES_PER_EPOCH,
+    MP_MAX_PAST_EPOCHS, MP_OUT_OF_ORDER_TOLERANCE, MP_PAST_EPOCH_RETENTION_SECS,
+    MP_PCS_UPDATE_FRAME_THRESHOLD,
 };
 pub use crypto::{
     ct_eq_bytes, encode_crockford_grouped_4, is_canonical_ed25519_scalar, sha256, sign_ed25519,
@@ -33,6 +34,7 @@ pub use ds::{
     MAX_MLS_CATCHUP_EPOCHS,
 };
 pub use error::MpMlsError;
+pub use openmls::prelude::LeafNodeIndex;
 pub use framing::{
     app_payload_len_for_wire_bucket, MpAppAadV1, MpAppPayloadV1, MsgClass,
     APP_PAYLOAD_OVERHEAD_LEN, BUCKET_APP_LENS, MAX_APP_BODY_BYTES, MAX_MLS_VECTOR_LEN,

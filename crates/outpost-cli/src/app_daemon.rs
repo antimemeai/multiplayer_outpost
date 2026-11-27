@@ -19,6 +19,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use ed25519_dalek::SigningKey;
+use mp_mls::{
+    AccountDeviceListV1, DeviceIdentity, InviteFragmentV2, InviteRecordV1, InviteSecrets,
+    MP_GROUP_ID_LEN, MpCryptoProvider, MpGroupId, MpMlsClient, MpMlsDeviceBindingV1,
+    MpMlsLeafCredV1, MpRoomPolicyExtV1, WelcomeAuthV1, compute_join_proof,
+    generate_single_use_key_package,
+};
 use mp_protocol::{
     AccountId, DeviceId, EndpointDescriptor, MAX_DIRECT_ADDRS, Mp1Message, PartyId, PartyInviteId,
     PartyJoinMode, PartyMemberRecord, PartySnapshot, PartyVisibility, RelayPolicy, RequestId,
@@ -27,10 +34,11 @@ use mp_protocol::{
 use outpost_control::{
     ApprovePartyRequest, ChurnStatus, ControlClient, ControlError, CreatePartyRequest,
     EndpointUpdateCoalescer, EvictionChurnDetector, JoinPartyRequest, JoinPartyResponse,
-    MAX_MP2_BODY_BYTES, MintPartyInviteRequest, MlsCommitAckRequest, MlsCommitRequest, Mp1WsEvent,
-    Mp1WsTarget, Mp2Ack, Mp2Event, Mp2EventKind, Mp2Member, Mp2RoomEvent, RequestSigner,
-    RoomEnterRequest, RoomInviteRequest, WsConnectError, sleep_aware_now_ms, wall_now_ms,
-    wall_now_secs,
+    MAX_MP2_BODY_BYTES, MintPartyInviteRequest, MlsCommitAckRequest, MlsCommitRequest,
+    MlsCreateInviteRequest, MlsInitRequest, MlsJoinRequest, MlsWelcomeAckRequest, MlsWelcomeEntry,
+    Mp1WsEvent, Mp1WsTarget, Mp2Ack, Mp2Event, Mp2EventKind, Mp2Member, Mp2RoomEvent,
+    RequestSigner, RoomEnterRequest, RoomInviteRequest, WsConnectError, sleep_aware_now_ms,
+    wall_now_ms, wall_now_secs,
 };
 use outpost_core::fence::{sanitize_peer_text, scan_outbound_secrets};
 use outpost_core::ipc_wire::IpcOpcode;
@@ -38,6 +46,7 @@ use outpost_core::mls_session::{
     DecryptedInboundPayload, MP_FAILOVER_REKEY_DELAY, MP_PAST_EPOCH_SWEEP_INTERVAL, MlsRoomSession,
     MlsRoomStatusSnapshot,
 };
+use outpost_core::mls_store::{PersistedKeyPackage, derive_mls_store_key};
 use outpost_core::p2p_wire::{
     P2pActivityState, P2pBridgeEnvelope, P2pChatMessage, P2pControlNotice, P2pControlNoticeKind,
     P2pEphemeralPulse, P2pPartyFrame,
@@ -52,7 +61,9 @@ use outpost_core::trust::{
     AdmissionDecision, PeerTrustLookup, api_authority_hash, compute_safety_number,
     effective_relay_policy, evaluate_peer_admission,
 };
-use outpost_daemon::{CancellationToken, DaemonHandler, DrainMode, write_log_lock_free};
+use outpost_daemon::{
+    CancellationToken, DaemonHandler, DrainMode, fill_random, write_log_lock_free,
+};
 use outpost_p2p::{
     CLOSE_PEER_REVOKED, CLOSE_UNAUTHORIZED, P2pEventStream, P2pTransportEvent, PartyP2pConfig,
     PartyP2pHandle, PartyP2pTransport, PeerDialTarget, Watcher as _,
@@ -87,9 +98,11 @@ use crate::ipc_payloads::{
     trust_state_to_u8,
 };
 use crate::storage::{
-    build_control_client_config, load_device_record, load_epochs_store, load_peers_store,
-    lock_state, open_state_dir, pubkey_fingerprint_hex, remove_mls_room_snapshot,
-    save_device_record, save_epochs_store, save_mls_room_bytes, save_peers_store,
+    build_control_client_config, load_device_record, load_epochs_store, load_mls_device_identity,
+    load_mls_room_snapshot, load_peers_store, lock_state, open_state_dir, pubkey_fingerprint_hex,
+    remove_mls_pending_key_package, remove_mls_room_snapshot, save_device_record,
+    save_epochs_store, save_mls_device_identity, save_mls_pending_key_package, save_mls_room_bytes,
+    save_peers_store,
 };
 
 const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
@@ -181,6 +194,18 @@ enum Mp2OutboundCmd {
         mls_epoch: u64,
         body_b64: String,
     },
+    Nick {
+        nick: String,
+    },
+    Topic {
+        topic: String,
+    },
+}
+
+struct PendingJoinKeyPackage {
+    kp_ref: [u8; 32],
+    provider_blob: Vec<u8>,
+    kp_submitted: bool,
 }
 
 struct ActivePartySession {
@@ -202,7 +227,13 @@ struct ActivePartySession {
     mls_epoch: u64,
     min_allowed_mls_epoch: u64,
     mls_rekey_required: bool,
+    mls_invite_epoch: u64,
     group_id_b64: Option<String>,
+    party_ds_pubkey: Option<[u8; 32]>,
+    is_mls_creator: bool,
+    pending_invite_fragment: Option<InviteFragmentV2>,
+    pending_join_kp: Option<PendingJoinKeyPackage>,
+    processed_kp_refs: HashSet<[u8; 32]>,
     mls_session: Option<MlsRoomSession>,
     members: HashMap<u64, PartyMemberState>,
     mp2_members: Vec<Mp2Member>,
@@ -1099,7 +1130,7 @@ impl AppDaemon {
                 return;
             }
 
-            let (control, ws_path, has_p2p) = {
+            let (control, ws_path, has_p2p, needs_mls_pre_ws, is_creator, has_ds_pk) = {
                 let st = self.inner.lock().await;
                 let Some(sess) = st.active_party.as_ref() else {
                     return;
@@ -1116,8 +1147,50 @@ impl AppDaemon {
                     ));
                     return;
                 };
-                (st.control.clone(), path, sess.p2p.is_some())
+                let needs_mls = sess.e2ee_mode == 1 && sess.mls_session.is_none();
+                (
+                    st.control.clone(),
+                    path,
+                    sess.p2p.is_some(),
+                    needs_mls,
+                    sess.is_mls_creator,
+                    sess.party_ds_pubkey.is_some(),
+                )
             };
+
+            if needs_mls_pre_ws {
+                let ready = if is_creator && has_ds_pk {
+                    match self.bootstrap_mls_creator_group(party_id).await {
+                        Ok(true) => true,
+                        Ok(false) => {
+                            // Room already initialized on server (e.g. sibling device) -> join via KP/Welcome!
+                            self.drive_mls_join_step(party_id).await.unwrap_or(false)
+                        }
+                        Err(e) => {
+                            log_line(&format!("Party {party_id} MLS creator bootstrap failed: {e}"));
+                            false
+                        }
+                    }
+                } else {
+                    match self.drive_mls_join_step(party_id).await {
+                        Ok(joined) => joined,
+                        Err(e) => {
+                            log_line(&format!("Party {party_id} MLS join step error: {e}"));
+                            false
+                        }
+                    }
+                };
+                if !ready {
+                    // Wait briefly for Welcome delivery before retrying (do NOT dial /ws before
+                    // membership is finalized in `party_mls_members`, which returns HTTP 404).
+                    tokio::select! {
+                        _ = stop.cancelled() => return,
+                        _ = self.shutdown.cancelled() => return,
+                        _ = tokio::time::sleep(Duration::from_millis(120)) => {}
+                    }
+                    continue;
+                }
+            }
 
             match control.connect_mp2_room_path(&ws_path).await {
                 Ok(mut ws) => {
@@ -1230,6 +1303,16 @@ impl AppDaemon {
                                             break;
                                         }
                                     }
+                                    Mp2OutboundCmd::Nick { nick } => {
+                                        if ws.send_nick(&nick).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Mp2OutboundCmd::Topic { topic } => {
+                                        if ws.send_topic(&topic).await.is_err() {
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             _ = mls_prune_iv.tick() => {
@@ -1251,6 +1334,8 @@ impl AppDaemon {
                                     Ok(Some(Mp2RoomEvent::Hello(hello))) => {
                                         let hello_e2ee_mode = hello.e2ee_mode;
                                         let hello_rekey_required = hello.mls_rekey_required;
+                                        let hello_mls_epoch = hello.mls_epoch;
+                                        let hello_group_id_b64 = hello.group_id_b64.clone();
                                         ws.set_e2ee_mode(hello_e2ee_mode);
                                         let resume_seq = self.handle_mp2_hello(party_id, hello).await;
                                         if let Some(seq) = resume_seq
@@ -1259,6 +1344,55 @@ impl AppDaemon {
                                             break;
                                         }
                                         if hello_e2ee_mode == 1 {
+                                            // Ensure creator bootstrap or persisted snapshot restore + commit catch-up!
+                                            let has_session = {
+                                                let st = self.inner.lock().await;
+                                                st.active_party
+                                                    .as_ref()
+                                                    .filter(|s| s.party_id == party_id)
+                                                    .is_some_and(|s| s.mls_session.is_some())
+                                            };
+                                            if !has_session {
+                                                if let Some(ref gid_b64) = hello_group_id_b64 {
+                                                    let _ = self
+                                                        .try_restore_persisted_mls_session(
+                                                            party_id, gid_b64,
+                                                        )
+                                                        .await;
+                                                } else {
+                                                    let _ = self
+                                                        .bootstrap_mls_creator_group(party_id)
+                                                        .await;
+                                                }
+                                            }
+                                            let local_epoch = {
+                                                let st = self.inner.lock().await;
+                                                st.active_party
+                                                    .as_ref()
+                                                    .filter(|s| s.party_id == party_id)
+                                                    .and_then(|s| s.mls_session.as_ref())
+                                                    .map(|m| m.epoch())
+                                            };
+                                            if let Some(cur_ep) = local_epoch {
+                                                if hello_mls_epoch > cur_ep {
+                                                    let flush_frames =
+                                                        self.catchup_mls_commits(party_id).await;
+                                                    for frame in flush_frames {
+                                                        if ws
+                                                            .send_e2ee_app(
+                                                                &frame.client_msg_id,
+                                                                frame.mls_epoch,
+                                                                &frame.body_b64,
+                                                            )
+                                                            .await
+                                                            .is_err()
+                                                        {
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                self.poll_pending_key_packages(party_id).await;
+                                            }
                                             // Spec v3 §4.5: NEVER send clear `status` in `e2ee_mode == 1` rooms;
                                             // emit encrypted `e2ee_ephemeral` status instead when MLS session is ready.
                                             if let Some(prep) = self
@@ -1278,9 +1412,15 @@ impl AppDaemon {
                                                     )
                                                     .await;
                                             }
-                                            if hello_rekey_required && failover_rekey_deadline.is_none() {
-                                                failover_rekey_deadline =
-                                                    Some(tokio::time::Instant::now() + MP_FAILOVER_REKEY_DELAY);
+                                            if hello_rekey_required {
+                                                self.fetch_and_apply_pending_proposals(party_id)
+                                                    .await;
+                                                if failover_rekey_deadline.is_none() {
+                                                    failover_rekey_deadline = Some(
+                                                        tokio::time::Instant::now()
+                                                            + MP_FAILOVER_REKEY_DELAY,
+                                                    );
+                                                }
                                             }
                                         } else {
                                             let _ = ws
@@ -1307,6 +1447,8 @@ impl AppDaemon {
                                     }
                                     Ok(Some(Mp2RoomEvent::MlsCommitTentative {
                                         target_epoch,
+                                        committer_account_id,
+                                        committer_device_id,
                                         commit_b64,
                                         proposal_blobs_b64,
                                         ..
@@ -1314,6 +1456,8 @@ impl AppDaemon {
                                         self.handle_mp2_mls_commit_tentative(
                                             party_id,
                                             target_epoch,
+                                            committer_account_id,
+                                            committer_device_id,
                                             &proposal_blobs_b64,
                                             &commit_b64,
                                         )
@@ -1348,6 +1492,29 @@ impl AppDaemon {
                                             }
                                         }
                                     }
+                                    Ok(Some(Mp2RoomEvent::MlsJoinRequest {
+                                        account_id,
+                                        device_id,
+                                        invite_id,
+                                        kp_ref_b64,
+                                        kp_blob_b64,
+                                        join_proof_b64,
+                                        ..
+                                    })) => {
+                                        self.handle_mls_join_request(
+                                            party_id,
+                                            account_id,
+                                            device_id,
+                                            invite_id,
+                                            &kp_ref_b64,
+                                            &kp_blob_b64,
+                                            join_proof_b64.as_deref(),
+                                        )
+                                        .await;
+                                    }
+                                    Ok(Some(Mp2RoomEvent::MlsCommitDiscarded { .. })) => {
+                                        self.handle_mp2_mls_commit_discarded(party_id).await;
+                                    }
                                     Ok(Some(Mp2RoomEvent::MlsRekeyNeeded {
                                         elected_committer_device_id,
                                         proposal_blobs_b64,
@@ -1375,6 +1542,7 @@ impl AppDaemon {
                                         log_line(&format!(
                                             "Party {party_id} MLS welcome ready for local device at epoch {target_epoch}"
                                         ));
+                                        let _ = self.poll_and_install_mls_welcome(party_id).await;
                                     }
                                     Ok(Some(Mp2RoomEvent::Ack(ack))) => {
                                         self.handle_mp2_ack(party_id, &ack.client_msg_id).await;
@@ -1470,6 +1638,38 @@ impl AppDaemon {
                     self.run_legacy_mp1_party_ws_loop(pid, stop).await;
                     return;
                 }
+                Err(WsConnectError::Terminal(404)) => {
+                    // On `e2ee_mode == 1` rooms where `/v1/rooms/enter` did not advertise `e2ee_mode`,
+                    // `PartyDO` returns HTTP 404 on `/ws` until this device is added to `party_mls_members`.
+                    // Probe `GET /v1/parties/:id/mls/welcome` once to detect an active E2EE room!
+                    let probed_e2ee = if let Ok(wel) = control.mls_fetch_welcome(pid).await {
+                        if let Some(ds_b64) = wel.party_ds_pubkey_b64
+                            && let Some(ds_pk) = decode_ds_pubkey_b64(&ds_b64)
+                        {
+                            let mut st = self.inner.lock().await;
+                            if let Some(sess) = st.active_party.as_mut()
+                                && sess.party_id == party_id
+                            {
+                                sess.e2ee_mode = 1;
+                                sess.party_ds_pubkey = Some(ds_pk);
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if probed_e2ee {
+                        continue;
+                    }
+                    log_line(&format!(
+                        "Party {party_id} mp2 WS terminal HTTP 404; tearing down party"
+                    ));
+                    self.teardown_active_party(party_id, "ws_terminal_http_404")
+                        .await;
+                    return;
+                }
                 Err(WsConnectError::Terminal(code)) => {
                     log_line(&format!(
                         "Party {party_id} mp2 WS terminal HTTP {code}; tearing down party"
@@ -1486,7 +1686,9 @@ impl AppDaemon {
                             | Mp2OutboundCmd::SendE2eeApp { ack_tx, .. } => {
                                 let _ = ack_tx.send(Err("reconnecting to party room...".to_string()));
                             }
-                            Mp2OutboundCmd::SendE2eeEphemeral { .. } => {}
+                            Mp2OutboundCmd::SendE2eeEphemeral { .. }
+                            | Mp2OutboundCmd::Nick { .. }
+                            | Mp2OutboundCmd::Topic { .. } => {}
                         }
                     }
                 }
@@ -1540,8 +1742,14 @@ impl AppDaemon {
                 .min_allowed_mls_epoch
                 .max(hello.min_allowed_mls_epoch);
             sess.mls_rekey_required = hello.mls_rekey_required;
+            sess.mls_invite_epoch = sess.mls_invite_epoch.max(hello.mls_invite_epoch);
             if hello.group_id_b64.is_some() {
                 sess.group_id_b64 = hello.group_id_b64;
+            }
+            if let Some(ref ds_b64) = hello.party_ds_pubkey_b64
+                && let Some(ds_pk) = decode_ds_pubkey_b64(ds_b64)
+            {
+                sess.party_ds_pubkey = Some(ds_pk);
             }
             if let Some(ref mut mls) = sess.mls_session {
                 mls.set_min_allowed_mls_epoch(sess.min_allowed_mls_epoch);
@@ -1595,7 +1803,14 @@ impl AppDaemon {
                         safety_number: String::new(),
                     });
             }
+            let was_e2ee_app = sess.e2ee_mode == 1 && ev.kind != Mp2EventKind::System;
             ingest_mp2_event_into_session(sess, ev, false);
+            if was_e2ee_app
+                && let Some(ref mut mls) = sess.mls_session
+                && let Ok(enc) = mls.export_encrypted_snapshot()
+            {
+                let _ = self.persist_mls_bytes_locked(party_id, &enc);
+            }
         }
     }
 
@@ -1692,9 +1907,14 @@ impl AppDaemon {
         &self,
         party_id: u64,
         commit_epoch: u64,
+        committer_account_id: u64,
+        committer_device_id: u64,
         proposals_b64: &[String],
         commit_b64: &str,
     ) {
+        if committer_device_id == self.device_id {
+            return;
+        }
         let Ok(commit_bytes) = B64.decode(commit_b64.as_bytes()) else {
             return;
         };
@@ -1709,6 +1929,10 @@ impl AppDaemon {
         };
         let (control, ack_req) = {
             let mut st = self.inner.lock().await;
+            let local_account_id = st.device.account_id;
+            if committer_account_id != 0 && committer_account_id == local_account_id {
+                return;
+            }
             let control = st.control.clone();
             let Some(sess) = st.active_party.as_mut() else {
                 return;
@@ -1747,6 +1971,33 @@ impl AppDaemon {
         proposals_b64: &[String],
         commit_b64: &str,
     ) -> Vec<outpost_core::mls_session::PreparedOutboundE2ee> {
+        let local_epoch = {
+            let st = self.inner.lock().await;
+            st.active_party
+                .as_ref()
+                .filter(|s| s.party_id == party_id)
+                .and_then(|s| s.mls_session.as_ref())
+                .map(|m| m.epoch())
+        };
+        if let Some(cur) = local_epoch {
+            if commit_epoch <= cur {
+                return Vec::new();
+            }
+            if commit_epoch > cur.saturating_add(1) {
+                return self.catchup_mls_commits(party_id).await;
+            }
+        }
+        self.apply_finalized_mls_commit_single(party_id, commit_epoch, proposals_b64, commit_b64)
+            .await
+    }
+
+    async fn apply_finalized_mls_commit_single(
+        &self,
+        party_id: u64,
+        commit_epoch: u64,
+        proposals_b64: &[String],
+        commit_b64: &str,
+    ) -> Vec<outpost_core::mls_session::PreparedOutboundE2ee> {
         let Ok(commit_bytes) = B64.decode(commit_b64.as_bytes()) else {
             return Vec::new();
         };
@@ -1768,6 +2019,9 @@ impl AppDaemon {
         let Some(ref mut mls) = sess.mls_session else {
             return Vec::new();
         };
+        if commit_epoch <= mls.epoch() {
+            return Vec::new();
+        }
         if let Err(e) = mls.handle_finalized_commit(&proposal_blobs, &commit_bytes, now_s) {
             log_line(&format!(
                 "Party {party_id} failed to merge finalized MLS commit epoch {commit_epoch}: {e}"
@@ -1837,13 +2091,28 @@ impl AppDaemon {
                 welcome_b64: None,
                 welcome_auth_b64: None,
                 joiner_device_id: None,
+                welcomes: Vec::new(),
             };
             (control, req)
         };
-        if let Err(e) = control.mls_submit_commit(pid, &req).await {
-            log_line(&format!(
-                "Party {party_id} failover rekey commit submission failed: {e}"
-            ));
+        match control.mls_submit_commit(pid, &req).await {
+            Ok(resp) if resp.is_finalized() => {
+                let _ = self
+                    .handle_mp2_mls_commit_finalized(
+                        party_id,
+                        resp.target_epoch,
+                        &[],
+                        &req.commit_b64,
+                    )
+                    .await;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                log_line(&format!(
+                    "Party {party_id} failover rekey commit submission failed: {e}"
+                ));
+                self.handle_mp2_mls_commit_discarded(party_id).await;
+            }
         }
     }
 
@@ -1876,13 +2145,28 @@ impl AppDaemon {
                 welcome_b64: None,
                 welcome_auth_b64: None,
                 joiner_device_id: None,
+                welcomes: Vec::new(),
             };
             (control, req)
         };
-        if let Err(e) = control.mls_submit_commit(pid, &req).await {
-            log_line(&format!(
-                "Party {party_id} PCS self-Update commit failed: {e}"
-            ));
+        match control.mls_submit_commit(pid, &req).await {
+            Ok(resp) if resp.is_finalized() => {
+                let _ = self
+                    .handle_mp2_mls_commit_finalized(
+                        party_id,
+                        resp.target_epoch,
+                        &[],
+                        &req.commit_b64,
+                    )
+                    .await;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                log_line(&format!(
+                    "Party {party_id} PCS self-Update commit failed: {e}"
+                ));
+                self.handle_mp2_mls_commit_discarded(party_id).await;
+            }
         }
     }
 
@@ -1953,6 +2237,1029 @@ impl AppDaemon {
         {
             let _ = self.persist_mls_bytes_locked(party_id, &enc);
         }
+    }
+
+    async fn handle_mp2_mls_commit_discarded(&self, party_id: u64) {
+        let mut st = self.inner.lock().await;
+        let Some(sess) = st.active_party.as_mut() else {
+            return;
+        };
+        if sess.party_id != party_id {
+            return;
+        }
+        if let Some(ref mut mls) = sess.mls_session {
+            let _ = mls.client_mut().discard_pending_commit();
+        }
+    }
+
+    async fn load_local_mls_identity(
+        &self,
+        party_id: Option<u64>,
+    ) -> Result<(DeviceIdentity, Vec<u8>, Vec<u8>), String> {
+        let (account_id, device_id, root_pubkey, device_secret, device_pubkey, control) = {
+            let st = self.inner.lock().await;
+            (
+                st.device.account_id,
+                st.device.device_id,
+                st.device.root_pubkey,
+                Zeroizing::new(st.device.device_secret),
+                st.device.device_pubkey,
+                st.control.clone(),
+            )
+        };
+
+        let now_s = u64::try_from(wall_now_secs()).unwrap_or(0);
+        let cached = load_mls_device_identity(&self.state_dir_path, &device_secret, device_id)?;
+        let (binding_bytes, mut list_bytes) = match cached {
+            Some((b_bytes, l_bytes))
+                if MpMlsDeviceBindingV1::decode_and_verify(&b_bytes)
+                    .is_ok_and(|b| b.body.exp_s > now_s.saturating_add(3600)) =>
+            {
+                (b_bytes, l_bytes)
+            }
+            _ => {
+                // Cloud-managed (`custody_mode = 0`) automatic 2-step MLS credential bootstrap
+                // via `POST /v1/accounts/me/mls/cloud-bind`:
+                //   Step 1: request deterministic `body_b64`, `root_sig_b64`, `pop_message_b64`.
+                //   Verify `body` + `root_sig` + `pop_message == DEV_POP_DOMAIN_SEP || SHA-256(body || root_sig)`
+                //   locally before signing `device_pop_sig` with `device_sk` (never blind-sign!).
+                //   Step 2: submit `device_sig_b64` to receive finalized 236B `binding_b64` + `device_list_b64`.
+                let device_sk = SigningKey::from_bytes(&device_secret);
+                let iat_s = now_s;
+                let exp_s = iat_s.saturating_add(mp_mls::identity::MAX_NATIVE_BINDING_TTL_S);
+                let step1_req = outpost_control::MlsCloudBindRequest {
+                    mls_sig_pubkey_b64: B64.encode(device_pubkey),
+                    client_class: mp_mls::identity::ClientClass::Outpost as u8,
+                    agent_capable: true,
+                    iat_s,
+                    exp_s,
+                    device_sig_b64: None,
+                };
+                let step1_resp = control.mls_cloud_bind(&step1_req).await.map_err(|e| {
+                    format!(
+                        "local MLS identity not provisioned and cloud-bind step 1 failed: {e}"
+                    )
+                })?;
+
+                let body_raw = B64
+                    .decode(
+                        step1_resp
+                            .body_b64
+                            .as_deref()
+                            .ok_or_else(|| "cloud-bind step 1 missing body_b64".to_string())?
+                            .as_bytes(),
+                    )
+                    .map_err(|_| "cloud-bind step 1 returned invalid body_b64".to_string())?;
+                let root_sig_raw = B64
+                    .decode(
+                        step1_resp
+                            .root_sig_b64
+                            .as_deref()
+                            .ok_or_else(|| "cloud-bind step 1 missing root_sig_b64".to_string())?
+                            .as_bytes(),
+                    )
+                    .map_err(|_| "cloud-bind step 1 returned invalid root_sig_b64".to_string())?;
+                let pop_msg_raw = B64
+                    .decode(
+                        step1_resp
+                            .pop_message_b64
+                            .as_deref()
+                            .ok_or_else(|| {
+                                "cloud-bind step 1 missing pop_message_b64".to_string()
+                            })?
+                            .as_bytes(),
+                    )
+                    .map_err(|_| "cloud-bind step 1 returned invalid pop_message_b64".to_string())?;
+
+                let parsed_body = mp_mls::identity::MpMlsDeviceBindingBodyV1::decode(&body_raw)
+                    .map_err(|e| format!("cloud-bind step 1 invalid binding body: {e}"))?;
+                if parsed_body.account_id != account_id
+                    || parsed_body.device_id != device_id
+                    || parsed_body.root_pubkey != root_pubkey
+                    || parsed_body.mls_sig_pubkey != device_pubkey
+                    || parsed_body.custody_mode != mp_mls::identity::CustodyMode::CloudManaged
+                {
+                    return Err(
+                        "cloud-bind step 1 binding body does not match local device identity"
+                            .to_string(),
+                    );
+                }
+                let root_sig: [u8; 64] = root_sig_raw
+                    .try_into()
+                    .map_err(|_| "cloud-bind step 1 root_sig must be 64 bytes".to_string())?;
+
+                let mut bind_msg = Vec::with_capacity(
+                    mp_mls::identity::DEV_BIND_DOMAIN_SEP.len() + body_raw.len(),
+                );
+                bind_msg.extend_from_slice(mp_mls::identity::DEV_BIND_DOMAIN_SEP);
+                bind_msg.extend_from_slice(&body_raw);
+                mp_mls::crypto::verify_ed25519_strict(&root_pubkey, &bind_msg, &root_sig)
+                    .map_err(|e| format!("cloud-bind step 1 invalid root_sig: {e}"))?;
+
+                let mut pop_hash_in = Vec::with_capacity(body_raw.len() + 64);
+                pop_hash_in.extend_from_slice(&body_raw);
+                pop_hash_in.extend_from_slice(&root_sig);
+                let pop_digest = mp_mls::crypto::sha256(&pop_hash_in);
+                let mut expected_pop_msg =
+                    Vec::with_capacity(mp_mls::identity::DEV_POP_DOMAIN_SEP.len() + 32);
+                expected_pop_msg.extend_from_slice(mp_mls::identity::DEV_POP_DOMAIN_SEP);
+                expected_pop_msg.extend_from_slice(&pop_digest);
+                if pop_msg_raw != expected_pop_msg {
+                    return Err(
+                        "cloud-bind step 1 pop_message_b64 mismatch (refusing blind PoP sign)"
+                            .to_string(),
+                    );
+                }
+
+                let device_pop_sig = mp_mls::crypto::sign_ed25519(&device_sk, &expected_pop_msg);
+                let eff_iat_s = if step1_resp.iat_s > 0 {
+                    step1_resp.iat_s
+                } else {
+                    iat_s
+                };
+                let eff_exp_s = if step1_resp.exp_s > 0 {
+                    step1_resp.exp_s
+                } else {
+                    exp_s
+                };
+                let step2_req = outpost_control::MlsCloudBindRequest {
+                    mls_sig_pubkey_b64: B64.encode(device_pubkey),
+                    client_class: mp_mls::identity::ClientClass::Outpost as u8,
+                    agent_capable: true,
+                    iat_s: eff_iat_s,
+                    exp_s: eff_exp_s,
+                    device_sig_b64: Some(B64.encode(device_pop_sig)),
+                };
+                let step2_resp = control
+                    .mls_cloud_bind(&step2_req)
+                    .await
+                    .map_err(|e| format!("cloud-bind step 2 failed: {e}"))?;
+
+                let b_bytes = B64
+                    .decode(
+                        step2_resp
+                            .binding_b64
+                            .as_deref()
+                            .ok_or_else(|| "cloud-bind step 2 missing binding_b64".to_string())?
+                            .as_bytes(),
+                    )
+                    .map_err(|_| "cloud-bind step 2 returned invalid binding_b64".to_string())?;
+                let l_bytes = B64
+                    .decode(
+                        step2_resp
+                            .device_list_b64
+                            .as_deref()
+                            .ok_or_else(|| {
+                                "cloud-bind step 2 missing device_list_b64".to_string()
+                            })?
+                            .as_bytes(),
+                    )
+                    .map_err(|_| {
+                        "cloud-bind step 2 returned invalid device_list_b64".to_string()
+                    })?;
+
+                // Persist encrypted MLS identity locally (0600) so subsequent joins reuse it.
+                if let Ok(sd) = open_state_dir(&self.state_dir_path)
+                    && let Ok(lock) = lock_state(&sd)
+                {
+                    let _ = save_mls_device_identity(
+                        &self.state_dir_path,
+                        &lock,
+                        &device_secret,
+                        device_id,
+                        &b_bytes,
+                        &l_bytes,
+                    );
+                }
+                (b_bytes, l_bytes)
+            }
+        };
+
+        let binding = MpMlsDeviceBindingV1::decode_and_verify(&binding_bytes)
+            .map_err(|e| format!("invalid local MLS device binding: {e}"))?;
+        if binding.body.account_id != account_id
+            || binding.body.device_id != device_id
+            || binding.body.root_pubkey != root_pubkey
+            || binding.body.mls_sig_pubkey != device_pubkey
+        {
+            return Err("local MLS device binding does not match enrolled device record".to_string());
+        }
+
+        // Best-effort refresh of own AccountDeviceListV1 from server if a newer list exists.
+        let mut device_list = AccountDeviceListV1::decode(&list_bytes)
+            .map_err(|e| format!("invalid local MLS device list: {e}"))?;
+        device_list
+            .verify(&root_pubkey)
+            .map_err(|e| format!("local MLS device list signature invalid: {e}"))?;
+
+        if let Ok(remote) = control.get_device_list().await
+            && let Ok(remote_raw) = B64.decode(remote.device_list_b64.as_bytes())
+            && let Ok(remote_list) = AccountDeviceListV1::decode(&remote_raw)
+            && remote_list.account_id == account_id
+            && remote_list.root_gen == binding.body.root_gen
+            && remote_list.list_version > device_list.list_version
+            && remote_list.verify(&root_pubkey).is_ok()
+            && remote_list.authorizes_leaf(&binding.body)
+        {
+            list_bytes = remote_raw;
+            device_list = remote_list;
+            if let Ok(sd) = open_state_dir(&self.state_dir_path)
+                && let Ok(lock) = lock_state(&sd)
+            {
+                let _ = save_mls_device_identity(
+                    &self.state_dir_path,
+                    &lock,
+                    &device_secret,
+                    device_id,
+                    &binding_bytes,
+                    &list_bytes,
+                );
+            }
+        } else if let Some(pid_u64) = party_id
+            && let Ok(pid) = PartyId::new(pid_u64)
+            && let Ok(dls) = control.mls_fetch_device_lists(pid).await
+        {
+            for item in dls.device_lists {
+                if item.account_id != account_id {
+                    continue;
+                }
+                if let Ok(remote_raw) = B64.decode(item.device_list_b64.as_bytes())
+                    && let Ok(remote_list) = AccountDeviceListV1::decode(&remote_raw)
+                    && remote_list.account_id == account_id
+                    && remote_list.root_gen == binding.body.root_gen
+                    && remote_list.list_version > device_list.list_version
+                    && remote_list.verify(&root_pubkey).is_ok()
+                    && remote_list.authorizes_leaf(&binding.body)
+                {
+                    list_bytes = remote_raw;
+                    device_list = remote_list;
+                    if let Ok(sd) = open_state_dir(&self.state_dir_path)
+                        && let Ok(lock) = lock_state(&sd)
+                    {
+                        let _ = save_mls_device_identity(
+                            &self.state_dir_path,
+                            &lock,
+                            &device_secret,
+                            device_id,
+                            &binding_bytes,
+                            &list_bytes,
+                        );
+                    }
+                }
+            }
+        }
+
+        let list_hash = device_list
+            .list_hash()
+            .map_err(|e| format!("failed hashing local MLS device list: {e}"))?;
+        let cred = MpMlsLeafCredV1 {
+            binding,
+            list_version: device_list.list_version,
+            list_hash,
+        };
+        let identity = DeviceIdentity::new(cred, device_list, SigningKey::from_bytes(&device_secret))
+            .map_err(|e| format!("failed building MLS DeviceIdentity: {e}"))?;
+        Ok((identity, binding_bytes, list_bytes))
+    }
+
+    async fn try_restore_persisted_mls_session(
+        &self,
+        party_id: u64,
+        group_id_b64: &str,
+    ) -> Result<bool, String> {
+        let gid_raw = B64
+            .decode(group_id_b64.as_bytes())
+            .map_err(|_| "invalid group_id_b64".to_string())?;
+        let group_id: [u8; MP_GROUP_ID_LEN] = gid_raw
+            .try_into()
+            .map_err(|_| "group_id_b64 must decode to 24 bytes".to_string())?;
+        let device_secret = {
+            let st = self.inner.lock().await;
+            Zeroizing::new(st.device.device_secret)
+        };
+        let Some(snap) = load_mls_room_snapshot(
+            &self.state_dir_path,
+            &device_secret,
+            self.device_id,
+            party_id,
+            &group_id,
+        )?
+        else {
+            return Ok(false);
+        };
+        let (identity, _, _) = self.load_local_mls_identity(Some(party_id)).await?;
+        let store_key = derive_mls_store_key(&device_secret, self.device_id);
+        let session =
+            MlsRoomSession::restore_from_snapshot(party_id, group_id, identity, *store_key, snap)
+                .map_err(|e| format!("fail-closed MLS snapshot restore error: {e}"))?;
+
+        let mut st = self.inner.lock().await;
+        if let Some(sess) = st.active_party.as_mut()
+            && sess.party_id == party_id
+            && sess.mls_session.is_none()
+        {
+            sess.mls_epoch = session.epoch();
+            sess.group_id_b64 = Some(B64.encode(session.group_id()));
+            sess.mls_session = Some(session);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn bootstrap_mls_creator_group(&self, party_id: u64) -> Result<bool, String> {
+        let pid = PartyId::new(party_id).map_err(|e| e.to_string())?;
+        let (control, account_id, device_secret, ds_pubkey_opt) = {
+            let st = self.inner.lock().await;
+            let Some(sess) = st.active_party.as_ref() else {
+                return Ok(false);
+            };
+            if sess.party_id != party_id {
+                return Ok(false);
+            }
+            if sess.mls_session.is_some() {
+                return Ok(true);
+            }
+            (
+                st.control.clone(),
+                st.device.account_id,
+                Zeroizing::new(st.device.device_secret),
+                sess.party_ds_pubkey,
+            )
+        };
+        let Some(ds_pubkey) = ds_pubkey_opt else {
+            return Ok(false);
+        };
+
+        let (identity, binding_bytes, list_bytes) =
+            self.load_local_mls_identity(Some(party_id)).await?;
+
+        let mut incarnation_nonce = [0u8; 8];
+        fill_random(&mut incarnation_nonce).map_err(|e| format!("CSPRNG failure: {e}"))?;
+
+        let policy = MpRoomPolicyExtV1 {
+            version: 1,
+            party_id,
+            e2ee_mode: 1,
+            require_self_custody: false,
+            allow_browser_devices: true,
+            org_id: 0,
+            invite_epoch: 0,
+            host_account_ids: vec![account_id],
+            banned_account_ids: Vec::new(),
+        };
+
+        let (client, group_info_bytes) =
+            MpMlsClient::create_room(party_id, incarnation_nonce, &ds_pubkey, policy, identity)
+                .map_err(|e| format!("MpMlsClient::create_room failed: {e}"))?;
+        let group_id = client.group_id();
+        let group_id_b64 = B64.encode(group_id);
+
+        let init_req = MlsInitRequest {
+            group_id_b64: group_id_b64.clone(),
+            group_info_b64: B64.encode(&group_info_bytes),
+        };
+        match control.mls_init_group(pid, &init_req).await {
+            Ok(_) => {}
+            Err(ControlError::Api {
+                status: 409,
+                ref error,
+                ..
+            }) if error == "mls_already_initialized" => {
+                let mut st = self.inner.lock().await;
+                if let Some(sess) = st.active_party.as_mut()
+                    && sess.party_id == party_id
+                {
+                    sess.is_mls_creator = false;
+                }
+                return Ok(false);
+            }
+            Err(e) => return Err(format!("POST /v1/parties/{party_id}/mls/init failed: {e}")),
+        }
+
+        let store_key = derive_mls_store_key(&device_secret, self.device_id);
+        let mut mls = MlsRoomSession::new(client, *store_key);
+        mls.set_device_binding_and_list(binding_bytes, list_bytes);
+        let enc = mls
+            .export_encrypted_snapshot()
+            .map_err(|e| format!("export initial MLS snapshot failed: {e}"))?;
+        self.persist_mls_bytes_locked(party_id, &enc)?;
+
+        let mut st = self.inner.lock().await;
+        if let Some(sess) = st.active_party.as_mut()
+            && sess.party_id == party_id
+        {
+            sess.e2ee_mode = 1;
+            sess.mls_epoch = 0;
+            sess.group_id_b64 = Some(group_id_b64);
+            sess.is_mls_creator = false;
+            sess.mls_session = Some(mls);
+        }
+        Ok(true)
+    }
+
+    async fn mint_mls_invite_for_active_party(&self, party_id: u64) -> Result<(u64, String), String> {
+        let pid = PartyId::new(party_id).map_err(|e| e.to_string())?;
+        let (control, group_id, invite_epoch, inviter_root_pk) = {
+            let st = self.inner.lock().await;
+            let Some(sess) = st.active_party.as_ref() else {
+                return Err("no active party".to_string());
+            };
+            if sess.party_id != party_id {
+                return Err("party not active".to_string());
+            }
+            let Some(ref mls) = sess.mls_session else {
+                return Err("MLS session not initialized".to_string());
+            };
+            let policy = mls
+                .client()
+                .room_policy()
+                .map_err(|e| format!("failed reading room policy: {e}"))?;
+            (
+                st.control.clone(),
+                mls.group_id(),
+                policy.invite_epoch,
+                st.device.root_pubkey,
+            )
+        };
+
+        let mut invite_seed = Zeroizing::new([0u8; 32]);
+        fill_random(invite_seed.as_mut()).map_err(|e| format!("CSPRNG failure: {e}"))?;
+        let secrets = InviteSecrets::derive(&group_id, &invite_seed)
+            .map_err(|e| format!("derive invite secrets failed: {e}"))?;
+        let now_ms = wall_now_ms();
+        let expires_at_ms = now_ms.saturating_add(3_600_000);
+        let expires_at_s = expires_at_ms / 1_000;
+        let max_uses = 8u32;
+
+        let req = MlsCreateInviteRequest {
+            server_token_hash_b64: B64.encode(secrets.server_token_hash),
+            max_uses,
+            expires_at_ms,
+            invite_epoch: Some(invite_epoch),
+        };
+        let resp = control
+            .mls_create_invite(pid, &req)
+            .await
+            .map_err(|e| format!("POST /v1/parties/{party_id}/mls/invites failed: {e}"))?;
+
+        let effective_exp_s = if resp.expires_at_ms > 0 {
+            resp.expires_at_ms / 1_000
+        } else {
+            expires_at_s
+        };
+        let frag = InviteFragmentV2 {
+            group_id,
+            invite_id: resp.invite_id,
+            invite_epoch: resp.invite_epoch,
+            expires_at_s: effective_exp_s,
+            policy_bits: 0,
+            inviter_root_pk,
+            invite_seed: *invite_seed,
+        };
+        let frag_b64u = frag
+            .encode_b64url()
+            .map_err(|e| format!("encode InviteFragmentV2 failed: {e}"))?;
+
+        let record = InviteRecordV1 {
+            invite_id: resp.invite_id,
+            invite_epoch: resp.invite_epoch,
+            max_uses,
+            expires_at_s: effective_exp_s,
+            inviter_root_pk,
+            member_join_mac_key: secrets.member_join_mac_key,
+        };
+        {
+            let mut st = self.inner.lock().await;
+            if let Some(sess) = st.active_party.as_mut()
+                && sess.party_id == party_id
+                && let Some(ref mut mls) = sess.mls_session
+            {
+                mls.register_active_invite(record);
+            }
+        }
+        Ok((resp.invite_id, frag_b64u))
+    }
+
+    async fn drive_mls_join_step(&self, party_id: u64) -> Result<bool, String> {
+        let pid = PartyId::new(party_id).map_err(|e| e.to_string())?;
+        let (control, account_id, device_secret, existing_gid, already_submitted, invite_frag) = {
+            let st = self.inner.lock().await;
+            let Some(sess) = st.active_party.as_ref() else {
+                return Ok(false);
+            };
+            if sess.party_id != party_id {
+                return Ok(false);
+            }
+            if sess.mls_session.is_some() {
+                return Ok(true);
+            }
+            (
+                st.control.clone(),
+                st.device.account_id,
+                Zeroizing::new(st.device.device_secret),
+                sess.group_id_b64.clone(),
+                sess.pending_join_kp
+                    .as_ref()
+                    .is_some_and(|kp| kp.kp_submitted),
+                sess.pending_invite_fragment.clone(),
+            )
+        };
+
+        // First try restoring a persisted encrypted MLS snapshot if group_id is already known.
+        if let Some(ref gid_b64) = existing_gid
+            && self
+                .try_restore_persisted_mls_session(party_id, gid_b64)
+                .await
+                .unwrap_or(false)
+        {
+            let _ = self.catchup_mls_commits(party_id).await;
+            return Ok(true);
+        }
+
+        if !already_submitted {
+            let (identity, _, _) = self.load_local_mls_identity(Some(party_id)).await?;
+            let provider = MpCryptoProvider::new();
+            let (kp_wire_bytes, kp_ref) = generate_single_use_key_package(&identity, &provider)
+                .map_err(|e| format!("generate_single_use_key_package failed: {e}"))?;
+            let provider_blob = provider
+                .export_storage_binary()
+                .map_err(|e| format!("export KP provider blob failed: {e}"))?;
+
+            // Spec v3.1 §4.2.2: Persist single-use KeyPackage private bundle encrypted BEFORE upload!
+            let now_s = u64::try_from(wall_now_secs()).unwrap_or(0);
+            {
+                let sd = open_state_dir(&self.state_dir_path)?;
+                let lock = lock_state(&sd)?;
+                save_mls_pending_key_package(
+                    &self.state_dir_path,
+                    &lock,
+                    &device_secret,
+                    self.device_id,
+                    party_id,
+                    PersistedKeyPackage {
+                        kp_ref,
+                        kp_wire_bytes: kp_wire_bytes.clone(),
+                        provider_blob: provider_blob.clone(),
+                        created_at_s: now_s,
+                    },
+                )?;
+            }
+
+            let join_req = if let Some(ref frag) = invite_frag {
+                let secrets = frag
+                    .derive_secrets()
+                    .map_err(|e| format!("derive invite secrets failed: {e}"))?;
+                let join_proof = compute_join_proof(
+                    &secrets.member_join_mac_key,
+                    &frag.group_id,
+                    frag.invite_id,
+                    frag.invite_epoch,
+                    frag.expires_at_s,
+                    account_id,
+                    self.device_id,
+                    &kp_ref,
+                )
+                .map_err(|e| format!("compute_join_proof failed: {e}"))?;
+                MlsJoinRequest {
+                    invite_id: Some(frag.invite_id),
+                    server_invite_token_b64: Some(B64.encode(secrets.server_invite_token)),
+                    kp_ref_b64: B64.encode(kp_ref),
+                    kp_blob_b64: B64.encode(&kp_wire_bytes),
+                    join_proof_b64: Some(B64.encode(join_proof)),
+                }
+            } else {
+                MlsJoinRequest {
+                    invite_id: None,
+                    server_invite_token_b64: None,
+                    kp_ref_b64: B64.encode(kp_ref),
+                    kp_blob_b64: B64.encode(&kp_wire_bytes),
+                    join_proof_b64: None,
+                }
+            };
+
+            control
+                .mls_submit_join(pid, &join_req)
+                .await
+                .map_err(|e| format!("POST /v1/parties/{party_id}/mls/join failed: {e}"))?;
+
+            let mut st = self.inner.lock().await;
+            if let Some(sess) = st.active_party.as_mut()
+                && sess.party_id == party_id
+            {
+                sess.pending_join_kp = Some(PendingJoinKeyPackage {
+                    kp_ref,
+                    provider_blob,
+                    kp_submitted: true,
+                });
+            }
+        }
+
+        self.poll_and_install_mls_welcome(party_id).await
+    }
+
+    async fn poll_and_install_mls_welcome(&self, party_id: u64) -> Result<bool, String> {
+        let pid = PartyId::new(party_id).map_err(|e| e.to_string())?;
+        let (control, device_secret, pending_kp_opt, known_ds_pk, invite_frag) = {
+            let st = self.inner.lock().await;
+            let Some(sess) = st.active_party.as_ref() else {
+                return Ok(false);
+            };
+            if sess.party_id != party_id || sess.mls_session.is_some() {
+                return Ok(sess.mls_session.is_some());
+            }
+            let kp = sess
+                .pending_join_kp
+                .as_ref()
+                .map(|k| (k.kp_ref, k.provider_blob.clone()));
+            (
+                st.control.clone(),
+                Zeroizing::new(st.device.device_secret),
+                kp,
+                sess.party_ds_pubkey,
+                sess.pending_invite_fragment.clone(),
+            )
+        };
+
+        let resp = control
+            .mls_fetch_welcome(pid)
+            .await
+            .map_err(|e| format!("GET /v1/parties/{party_id}/mls/welcome failed: {e}"))?;
+
+        let ds_pubkey_opt = resp
+            .party_ds_pubkey_b64
+            .as_deref()
+            .and_then(decode_ds_pubkey_b64)
+            .or(known_ds_pk);
+        if let Some(ds_pk) = ds_pubkey_opt {
+            let mut st = self.inner.lock().await;
+            if let Some(sess) = st.active_party.as_mut()
+                && sess.party_id == party_id
+            {
+                sess.party_ds_pubkey = Some(ds_pk);
+            }
+        }
+
+        let (Some(welcome_b64), Some(welcome_auth_b64)) = (
+            resp.resolved_welcome_b64(),
+            resp.resolved_welcome_auth_b64(),
+        ) else {
+            return Ok(false);
+        };
+        let Some((expected_kp_ref, provider_blob)) = pending_kp_opt else {
+            return Ok(false);
+        };
+        let Some(ds_pubkey) = ds_pubkey_opt else {
+            return Err("Welcome arrived but party_ds_pubkey is unknown".to_string());
+        };
+
+        let welcome_bytes = B64
+            .decode(welcome_b64.as_bytes())
+            .map_err(|_| "invalid welcome_b64".to_string())?;
+        let auth_bytes = B64
+            .decode(welcome_auth_b64.as_bytes())
+            .map_err(|_| "invalid welcome_auth_b64".to_string())?;
+        let welcome_auth = WelcomeAuthV1::decode(&auth_bytes)
+            .map_err(|e| format!("invalid WelcomeAuthV1: {e}"))?;
+
+        let (identity, binding_bytes, list_bytes) =
+            self.load_local_mls_identity(Some(party_id)).await?;
+        let mut provider = MpCryptoProvider::import_storage_binary(&provider_blob)
+            .map_err(|e| format!("restore KP provider failed: {e}"))?;
+
+        let client = if let Some(ref frag) = invite_frag {
+            let secrets = frag
+                .derive_secrets()
+                .map_err(|e| format!("derive invite secrets failed: {e}"))?;
+            MpMlsClient::join_from_welcome(
+                &welcome_bytes,
+                &welcome_auth,
+                &secrets.member_join_mac_key,
+                &expected_kp_ref,
+                frag.group_id,
+                party_id,
+                &ds_pubkey,
+                frag.policy_bits,
+                frag.invite_epoch,
+                &frag.inviter_root_pk,
+                identity,
+                &mut provider,
+            )
+            .map_err(|e| format!("MpMlsClient::join_from_welcome failed: {e}"))?
+        } else {
+            MpMlsClient::join_from_welcome_sibling(
+                &welcome_bytes,
+                &welcome_auth,
+                &expected_kp_ref,
+                welcome_auth.group_id,
+                party_id,
+                &ds_pubkey,
+                0,
+                welcome_auth.invite_epoch,
+                identity,
+                &mut provider,
+            )
+            .map_err(|e| format!("MpMlsClient::join_from_welcome_sibling failed: {e}"))?
+        };
+
+        let store_key = derive_mls_store_key(&device_secret, self.device_id);
+        let group_id = client.group_id();
+        let target_epoch = client.epoch();
+        let mut mls = MlsRoomSession::new(client, *store_key);
+        mls.set_device_binding_and_list(binding_bytes, list_bytes);
+        let enc = mls
+            .export_encrypted_snapshot()
+            .map_err(|e| format!("export post-Welcome MLS snapshot failed: {e}"))?;
+
+        // Persist Welcome-installed group state atomically BEFORE acking Welcome to PartyDO (§4.2.4)!
+        self.persist_mls_bytes_locked(party_id, &enc)?;
+        if let Ok(sd) = open_state_dir(&self.state_dir_path)
+            && let Ok(lock) = lock_state(&sd)
+        {
+            remove_mls_pending_key_package(&self.state_dir_path, &lock, self.device_id, party_id);
+        }
+
+        let ack_req = MlsWelcomeAckRequest {
+            group_id_b64: B64.encode(group_id),
+            target_epoch,
+            kp_ref_b64: B64.encode(expected_kp_ref),
+            welcome_id: resp.resolved_welcome_id(),
+        };
+        let _ = control.mls_ack_welcome(pid, &ack_req).await;
+
+        {
+            let mut st = self.inner.lock().await;
+            if let Some(sess) = st.active_party.as_mut()
+                && sess.party_id == party_id
+            {
+                sess.e2ee_mode = 1;
+                sess.mls_epoch = target_epoch;
+                sess.group_id_b64 = Some(B64.encode(group_id));
+                sess.pending_join_kp = None;
+                sess.mls_session = Some(mls);
+            }
+        }
+        let _ = self.catchup_mls_commits(party_id).await;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_mls_join_request(
+        &self,
+        party_id: u64,
+        joiner_account_id: u64,
+        joiner_device_id: u64,
+        invite_id: Option<u64>,
+        kp_ref_b64: &str,
+        kp_blob_b64: &str,
+        join_proof_b64: Option<&str>,
+    ) {
+        // NEVER skip sibling devices of our own account_id — skip ONLY our exact device_id!
+        if joiner_device_id == 0 || joiner_device_id == self.device_id {
+            return;
+        }
+        let Ok(pid) = PartyId::new(party_id) else {
+            return;
+        };
+        let Ok(kp_bytes) = B64.decode(kp_blob_b64.as_bytes()) else {
+            return;
+        };
+        let kp_ref_opt: Option<[u8; 32]> = B64
+            .decode(kp_ref_b64.as_bytes())
+            .ok()
+            .and_then(|v| v.try_into().ok());
+
+        // Best-effort refresh of account device lists before KeyPackage admission so newly
+        // enrolled sibling devices are recognized in `DeviceListTracker`.
+        let (control, local_account_id) = {
+            let st = self.inner.lock().await;
+            let Some(sess) = st.active_party.as_ref() else {
+                return;
+            };
+            if sess.party_id != party_id || sess.mls_session.is_none() {
+                return;
+            }
+            if let Some(ref kp_ref) = kp_ref_opt
+                && sess.processed_kp_refs.contains(kp_ref)
+            {
+                return;
+            }
+            (st.control.clone(), st.device.account_id)
+        };
+
+        if let Ok(dls) = control.mls_fetch_device_lists(pid).await {
+            let mut st = self.inner.lock().await;
+            if let Some(sess) = st.active_party.as_mut()
+                && sess.party_id == party_id
+                && let Some(ref mut mls) = sess.mls_session
+            {
+                for item in dls.device_lists {
+                    if let Ok(raw) = B64.decode(item.device_list_b64.as_bytes())
+                        && let Ok(list) = AccountDeviceListV1::decode(&raw)
+                    {
+                        let _ = mls.client_mut().observe_device_list(list, None);
+                    }
+                }
+            }
+        }
+
+        let now_s = u64::try_from(wall_now_secs()).unwrap_or(0);
+        let commit_req_opt = {
+            let mut st = self.inner.lock().await;
+            let Some(sess) = st.active_party.as_mut() else {
+                return;
+            };
+            if sess.party_id != party_id {
+                return;
+            }
+            if let Some(ref kp_ref) = kp_ref_opt
+                && sess.processed_kp_refs.contains(kp_ref)
+            {
+                return;
+            }
+            let Some(ref mut mls) = sess.mls_session else {
+                return;
+            };
+            let parent_epoch = mls.epoch();
+
+            let add_out_res = if let (Some(inv_id), Some(jp_b64)) = (invite_id, join_proof_b64)
+                && let Ok(jp_raw) = B64.decode(jp_b64.as_bytes())
+                && let Ok(jp_arr) = <[u8; 32]>::try_from(jp_raw)
+            {
+                mls.build_add_member_commit(&kp_bytes, inv_id, &jp_arr, now_s, false)
+            } else if joiner_account_id == local_account_id {
+                mls.build_add_sibling_device_commit(&kp_bytes, now_s)
+            } else {
+                return;
+            };
+
+            match add_out_res {
+                Ok(out) => {
+                    let welcome_auth_bytes = match out.welcome_auth.encode() {
+                        Ok(b) => b,
+                        Err(_) => {
+                            let _ = mls.client_mut().discard_pending_commit();
+                            return;
+                        }
+                    };
+                    let eff_kp_ref_b64 = if kp_ref_b64.is_empty() {
+                        B64.encode(out.welcome_auth.joiner_kp_ref)
+                    } else {
+                        kp_ref_b64.to_string()
+                    };
+                    sess.processed_kp_refs
+                        .insert(out.welcome_auth.joiner_kp_ref);
+                    let welcome_b64 = B64.encode(&out.welcome_bytes);
+                    let welcome_auth_b64 = B64.encode(welcome_auth_bytes);
+                    Some(MlsCommitRequest {
+                        parent_epoch,
+                        commit_b64: B64.encode(&out.commit_bytes),
+                        welcome_b64: Some(welcome_b64.clone()),
+                        welcome_auth_b64: Some(welcome_auth_b64.clone()),
+                        joiner_device_id: Some(joiner_device_id),
+                        welcomes: vec![MlsWelcomeEntry {
+                            target_device_id: joiner_device_id,
+                            kp_ref_b64: eff_kp_ref_b64,
+                            welcome_blob_b64: welcome_b64,
+                            welcome_auth_blob_b64: welcome_auth_b64,
+                        }],
+                    })
+                }
+                Err(e) => {
+                    log_line(&format!(
+                        "Party {party_id} skipped Add commit for device {joiner_device_id}: {e}"
+                    ));
+                    None
+                }
+            }
+        };
+
+        let Some(commit_req) = commit_req_opt else {
+            return;
+        };
+
+        match control.mls_submit_commit(pid, &commit_req).await {
+            Ok(resp) if resp.is_finalized() => {
+                let _ = self
+                    .handle_mp2_mls_commit_finalized(
+                        party_id,
+                        resp.target_epoch,
+                        &[],
+                        &commit_req.commit_b64,
+                    )
+                    .await;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                log_line(&format!(
+                    "Party {party_id} POST /mls/commit (Add device {joiner_device_id}) failed: {e}"
+                ));
+                let mut st = self.inner.lock().await;
+                if let Some(sess) = st.active_party.as_mut()
+                    && sess.party_id == party_id
+                {
+                    if let Some(ref kp_ref) = kp_ref_opt {
+                        sess.processed_kp_refs.remove(kp_ref);
+                    }
+                    if let Some(ref mut mls) = sess.mls_session {
+                        let _ = mls.client_mut().discard_pending_commit();
+                    }
+                }
+            }
+        }
+    }
+
+    async fn poll_pending_key_packages(&self, party_id: u64) {
+        let Ok(pid) = PartyId::new(party_id) else {
+            return;
+        };
+        let control = {
+            let st = self.inner.lock().await;
+            let Some(sess) = st.active_party.as_ref() else {
+                return;
+            };
+            if sess.party_id != party_id || sess.mls_session.is_none() {
+                return;
+            }
+            st.control.clone()
+        };
+        let Ok(resp) = control.mls_fetch_pending_key_packages(pid).await else {
+            return;
+        };
+        for item in resp.key_packages {
+            self.handle_mls_join_request(
+                party_id,
+                item.account_id,
+                item.device_id,
+                item.invite_id,
+                &item.kp_ref_b64,
+                &item.kp_blob_b64,
+                item.join_proof_b64.as_deref(),
+            )
+            .await;
+        }
+    }
+
+    async fn fetch_and_apply_pending_proposals(&self, party_id: u64) {
+        let Ok(pid) = PartyId::new(party_id) else {
+            return;
+        };
+        let control = {
+            let st = self.inner.lock().await;
+            st.control.clone()
+        };
+        if let Ok(resp) = control.mls_fetch_pending_proposals(pid).await
+            && !resp.proposals_b64.is_empty()
+        {
+            self.handle_mp2_mls_rekey_needed(party_id, &resp.proposals_b64)
+                .await;
+        }
+    }
+
+    async fn catchup_mls_commits(
+        &self,
+        party_id: u64,
+    ) -> Vec<outpost_core::mls_session::PreparedOutboundE2ee> {
+        let Ok(pid) = PartyId::new(party_id) else {
+            return Vec::new();
+        };
+        let mut flushed = Vec::new();
+        for _ in 0..16 {
+            let (control, from_epoch) = {
+                let st = self.inner.lock().await;
+                let Some(sess) = st.active_party.as_ref() else {
+                    break;
+                };
+                if sess.party_id != party_id {
+                    break;
+                }
+                let Some(ref mls) = sess.mls_session else {
+                    break;
+                };
+                (st.control.clone(), mls.epoch().saturating_add(1))
+            };
+            let Ok(page) = control.mls_fetch_commits(pid, from_epoch, 32).await else {
+                break;
+            };
+            if page.commits.is_empty() {
+                break;
+            }
+            let page_len = page.commits.len();
+            for rec in page.commits {
+                let mut batch = self
+                    .apply_finalized_mls_commit_single(
+                        party_id,
+                        rec.epoch,
+                        &rec.proposal_blobs_b64,
+                        &rec.commit_b64,
+                    )
+                    .await;
+                flushed.append(&mut batch);
+            }
+            if page_len < 32 {
+                break;
+            }
+        }
+        flushed
     }
 
     async fn run_legacy_mp1_party_ws_loop(self: Arc<Self>, pid: PartyId, stop: CancellationToken) {
@@ -3140,7 +4447,13 @@ impl AppDaemon {
                 mls_epoch: 0,
                 min_allowed_mls_epoch: 0,
                 mls_rekey_required: false,
+                mls_invite_epoch: 0,
                 group_id_b64: None,
+                party_ds_pubkey: None,
+                is_mls_creator: false,
+                pending_invite_fragment: None,
+                pending_join_kp: None,
+                processed_kp_refs: std::collections::HashSet::new(),
                 mls_session: None,
                 members: HashMap::new(),
                 mp2_members: Vec::new(),
@@ -3645,40 +4958,90 @@ impl AppDaemon {
                 delivered_preview,
                 withheld_unpinned,
             } => {
-                let (ack_tx, ack_rx) = oneshot::channel();
-                tx.send(Mp2OutboundCmd::Send {
-                    client_msg_id: mp2_msg_id,
-                    kind: Mp2EventKind::Chat,
-                    target,
-                    body_encoding: "utf8".to_string(),
-                    body,
-                    ack_tx,
-                })
-                .await
-                .map_err(|_| {
-                    ipc_err(
-                        ERR_CONFLICT,
-                        true,
-                        "party room socket is not active; reconnect or rejoin",
-                    )
-                })?;
-                let _ack = tokio::time::timeout(MP2_ACK_TIMEOUT, ack_rx)
+                // In standard (`e2ee_mode == 0`) rooms, translate shared `{"mp_irc":1,"t":"nick"|"topic",...}`
+                // payloads into native `{ v: 2, t: "nick", nick }` / `{ v: 2, t: "topic", topic }` frames!
+                let mut sent_irc_meta = false;
+                if body.starts_with("{\"mp_irc\":1,")
+                    && let Ok(serde_json::Value::Object(map)) =
+                        serde_json::from_str::<serde_json::Value>(&body)
+                    && map.get("mp_irc").and_then(serde_json::Value::as_u64) == Some(1)
+                {
+                    match map.get("t").and_then(serde_json::Value::as_str) {
+                        Some("nick") => {
+                            if let Some(nick) =
+                                map.get("nick").and_then(serde_json::Value::as_str)
+                            {
+                                tx.send(Mp2OutboundCmd::Nick {
+                                    nick: nick.to_string(),
+                                })
+                                .await
+                                .map_err(|_| {
+                                    ipc_err(
+                                        ERR_CONFLICT,
+                                        true,
+                                        "party room socket is not active; reconnect or rejoin",
+                                    )
+                                })?;
+                                sent_irc_meta = true;
+                            }
+                        }
+                        Some("topic") => {
+                            if let Some(topic) =
+                                map.get("topic").and_then(serde_json::Value::as_str)
+                            {
+                                tx.send(Mp2OutboundCmd::Topic {
+                                    topic: topic.to_string(),
+                                })
+                                .await
+                                .map_err(|_| {
+                                    ipc_err(
+                                        ERR_CONFLICT,
+                                        true,
+                                        "party room socket is not active; reconnect or rejoin",
+                                    )
+                                })?;
+                                sent_irc_meta = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !sent_irc_meta {
+                    let (ack_tx, ack_rx) = oneshot::channel();
+                    tx.send(Mp2OutboundCmd::Send {
+                        client_msg_id: mp2_msg_id,
+                        kind: Mp2EventKind::Chat,
+                        target,
+                        body_encoding: "utf8".to_string(),
+                        body,
+                        ack_tx,
+                    })
                     .await
                     .map_err(|_| {
                         ipc_err(
                             ERR_CONFLICT,
                             true,
-                            "timed out waiting for room acknowledgement",
+                            "party room socket is not active; reconnect or rejoin",
                         )
-                    })?
-                    .map_err(|_| {
-                        ipc_err(
-                            ERR_CONFLICT,
-                            true,
-                            "party room socket closed before acknowledgement",
-                        )
-                    })?
-                    .map_err(|msg| ipc_err(ERR_CONFLICT, true, msg))?;
+                    })?;
+                    let _ack = tokio::time::timeout(MP2_ACK_TIMEOUT, ack_rx)
+                        .await
+                        .map_err(|_| {
+                            ipc_err(
+                                ERR_CONFLICT,
+                                true,
+                                "timed out waiting for room acknowledgement",
+                            )
+                        })?
+                        .map_err(|_| {
+                            ipc_err(
+                                ERR_CONFLICT,
+                                true,
+                                "party room socket closed before acknowledgement",
+                            )
+                        })?
+                        .map_err(|msg| ipc_err(ERR_CONFLICT, true, msg))?;
+                }
                 (delivered_preview, withheld_unpinned, Vec::new())
             }
             ChatDispatch::Mp2E2ee {
@@ -4622,7 +5985,13 @@ impl AppDaemon {
                 mls_epoch: 0,
                 min_allowed_mls_epoch: 0,
                 mls_rekey_required: false,
+                mls_invite_epoch: 0,
                 group_id_b64: None,
+                party_ds_pubkey: None,
+                is_mls_creator: false,
+                pending_invite_fragment: None,
+                pending_join_kp: None,
+                processed_kp_refs: std::collections::HashSet::new(),
                 mls_session: None,
                 members: HashMap::new(),
                 mp2_members: Vec::new(),
@@ -4896,7 +6265,13 @@ impl AppDaemon {
                         mls_epoch: 0,
                         min_allowed_mls_epoch: 0,
                         mls_rekey_required: false,
+                        mls_invite_epoch: 0,
                         group_id_b64: None,
+                        party_ds_pubkey: None,
+                        is_mls_creator: false,
+                        pending_invite_fragment: None,
+                        pending_join_kp: None,
+                        processed_kp_refs: std::collections::HashSet::new(),
                         mls_session: None,
                         members: HashMap::new(),
                         mp2_members: Vec::new(),
@@ -5276,6 +6651,7 @@ impl AppDaemon {
     }
 
     /// Attaches (or updates) an `mp2`-only active party session without spawning `iroh` P2P.
+    #[allow(clippy::too_many_arguments)]
     async fn attach_mp2_room_session(
         self: &Arc<Self>,
         party_id: u64,
@@ -5284,6 +6660,11 @@ impl AppDaemon {
         share_url: String,
         ws_path: String,
         initial_members: Vec<Mp2Member>,
+        e2ee_mode: u8,
+        party_ds_pubkey: Option<[u8; 32]>,
+        group_id_b64: Option<String>,
+        is_creator: bool,
+        invite_fragment: Option<InviteFragmentV2>,
     ) {
         let existing_pid = {
             let mut st = self.inner.lock().await;
@@ -5300,6 +6681,18 @@ impl AppDaemon {
                     }
                     if !initial_members.is_empty() {
                         sess.mp2_members = initial_members;
+                    }
+                    if e2ee_mode == 1 {
+                        sess.e2ee_mode = 1;
+                    }
+                    if party_ds_pubkey.is_some() {
+                        sess.party_ds_pubkey = party_ds_pubkey;
+                    }
+                    if group_id_b64.is_some() {
+                        sess.group_id_b64 = group_id_b64;
+                    }
+                    if invite_fragment.is_some() {
+                        sess.pending_invite_fragment = invite_fragment;
                     }
                     return;
                 }
@@ -5349,11 +6742,17 @@ impl AppDaemon {
                 room_name,
                 share_url,
                 ws_path: eff_ws_path,
-                e2ee_mode: 0,
+                e2ee_mode,
                 mls_epoch: 0,
                 min_allowed_mls_epoch: 0,
                 mls_rekey_required: false,
-                group_id_b64: None,
+                mls_invite_epoch: 0,
+                group_id_b64: group_id_b64.clone(),
+                party_ds_pubkey,
+                is_mls_creator: is_creator,
+                pending_invite_fragment: invite_fragment,
+                pending_join_kp: None,
+                processed_kp_refs: std::collections::HashSet::new(),
                 mls_session: None,
                 members: HashMap::new(),
                 mp2_members: initial_members.clone(),
@@ -5379,6 +6778,27 @@ impl AppDaemon {
             self.active_party_atomic.store(party_id, Ordering::Release);
         }
 
+        // For `e2ee_mode == 1`, attempt immediate snapshot restore or creator bootstrap BEFORE
+        // spawning the live WS loop so the creator's epoch-0 MLS group is ready synchronously!
+        if e2ee_mode == 1 {
+            let mut restored = false;
+            if let Some(ref gid_b64) = group_id_b64 {
+                restored = self
+                    .try_restore_persisted_mls_session(party_id, gid_b64)
+                    .await
+                    .unwrap_or(false);
+            }
+            if !restored
+                && is_creator
+                && party_ds_pubkey.is_some()
+                && let Err(e) = self.bootstrap_mls_creator_group(party_id).await
+            {
+                log_line(&format!(
+                    "Party {party_id} synchronous MLS creator bootstrap deferred/failed: {e}"
+                ));
+            }
+        }
+
         let (ws_task, cwt_task) = self.spawn_party_drivers(party_id, ws_stop, mp2_rx);
         self.attach_party_tasks(party_id, None, ws_task, cwt_task)
             .await;
@@ -5400,10 +6820,12 @@ impl AppDaemon {
             .map(|h| h.trim().trim_start_matches('@').to_string())
             .filter(|h| !h.is_empty());
 
+        let creating_new = req.party_id.or(active_pid).is_none();
         let rest_req = RoomInviteRequest {
             handle: clean_handle,
             party_id: req.party_id.or(active_pid),
             name: req.name.clone(),
+            e2ee_mode: Some(1),
         };
         let resp = control
             .room_invite(&rest_req)
@@ -5411,6 +6833,11 @@ impl AppDaemon {
             .map_err(|e| map_control_err_to_ipc(&e))?;
 
         let validated_ws_path = validate_party_ws_path(resp.party_id, &resp.ws_path)?;
+        let ds_pubkey = resp
+            .party_ds_pubkey_b64
+            .as_deref()
+            .and_then(decode_ds_pubkey_b64);
+        let is_creator = resp.is_creator.unwrap_or(creating_new);
 
         self.attach_mp2_room_session(
             resp.party_id,
@@ -5419,13 +6846,32 @@ impl AppDaemon {
             resp.share_url.clone(),
             validated_ws_path.clone(),
             Vec::new(),
+            resp.e2ee_mode,
+            ds_pubkey,
+            resp.group_id_b64.clone(),
+            is_creator,
+            None,
         )
         .await;
+
+        let mut share_url = resp.share_url;
+        if resp.e2ee_mode == 1
+            && let Ok((_invite_id, frag_b64u)) =
+                self.mint_mls_invite_for_active_party(resp.party_id).await
+        {
+            share_url = format!("https://multiplayer.tech/p/i/{}#{frag_b64u}", resp.party_id);
+            let mut st = self.inner.lock().await;
+            if let Some(sess) = st.active_party.as_mut()
+                && sess.party_id == resp.party_id
+            {
+                sess.share_url = share_url.clone();
+            }
+        }
 
         encode_room_invite_resp(&RoomInviteIpcResp {
             party_id: resp.party_id,
             room_code: resp.room_code,
-            share_url: resp.share_url,
+            share_url,
             handle_url: resp.handle_url,
             ws_path: validated_ws_path,
             invited_handle: resp.invited_handle,
@@ -5438,9 +6884,18 @@ impl AppDaemon {
         let req = decode_room_enter_req(payload)
             .map_err(|e| ipc_err(ERR_INVALID_PARAMS, false, e.to_string()))?;
 
+        // Extract any 114-byte `InviteFragmentV2` locally so `invite_seed` NEVER leaves the
+        // client to `POST /v1/rooms/enter` (Spec v3.1 §4.2)!
+        let (enter_target, invite_fragment) =
+            if let Some((pid_from_frag, frag)) = extract_mls_invite_fragment(&req.target) {
+                (pid_from_frag.to_string(), Some(frag))
+            } else {
+                (normalize_room_enter_target(&req.target), None)
+            };
+
         let control = self.inner.lock().await.control.clone();
         let rest_req = RoomEnterRequest {
-            target: normalize_room_enter_target(&req.target),
+            target: enter_target,
             client: "outpost".to_string(),
             agent_name: req.agent_name.or_else(|| Some("Outpost".to_string())),
         };
@@ -5450,6 +6905,20 @@ impl AppDaemon {
             .map_err(|e| map_control_err_to_ipc(&e))?;
 
         let validated_ws_path = validate_party_ws_path(resp.party_id, &resp.ws_path)?;
+        let ds_pubkey = resp
+            .party_ds_pubkey_b64
+            .as_deref()
+            .and_then(decode_ds_pubkey_b64);
+        let eff_e2ee_mode = if resp.e2ee_mode == 1 || invite_fragment.is_some() {
+            1
+        } else {
+            0
+        };
+        let eff_group_id_b64 = resp.group_id_b64.clone().or_else(|| {
+            invite_fragment
+                .as_ref()
+                .map(|f| B64.encode(f.group_id))
+        });
 
         let mp2_members: Vec<Mp2Member> = resp
             .members
@@ -5469,7 +6938,8 @@ impl AppDaemon {
                     agent_state: None,
                     agent_summary: None,
                     status: m.status.clone(),
-                    device_id: None,
+                    device_id: m.device_id,
+                    nick: None,
                 }
             })
             .collect();
@@ -5481,6 +6951,11 @@ impl AppDaemon {
             resp.share_url.clone(),
             validated_ws_path.clone(),
             mp2_members,
+            eff_e2ee_mode,
+            ds_pubkey,
+            eff_group_id_b64,
+            false,
+            invite_fragment,
         )
         .await;
 
@@ -6104,6 +7579,24 @@ fn validate_party_ws_path(party_id: u64, ws_path: &str) -> Result<String, IpcErr
     Ok(canonical)
 }
 
+fn decode_ds_pubkey_b64(raw: &str) -> Option<[u8; 32]> {
+    let bytes = B64.decode(raw.trim().as_bytes()).ok()?;
+    bytes.try_into().ok()
+}
+
+/// Extracts a 114-byte `InviteFragmentV2` from `#<b64url>` in a room invite URL (or bare `#<b64url>`),
+/// returning `(party_id, InviteFragmentV2)` so `invite_seed` is NEVER transmitted to `/v1/rooms/enter`.
+fn extract_mls_invite_fragment(raw: &str) -> Option<(u64, InviteFragmentV2)> {
+    let (_, frag_str) = raw.trim().split_once('#')?;
+    let clean = frag_str.trim();
+    if clean.is_empty() {
+        return None;
+    }
+    let frag = InviteFragmentV2::decode_b64url(clean).ok()?;
+    let gid = MpGroupId::parse(&frag.group_id).ok()?;
+    Some((gid.party_id, frag))
+}
+
 fn format_guest_display_name(raw: &str) -> String {
     let trimmed = raw.trim().trim_start_matches('@').trim();
     let base = trimmed.strip_suffix(" (guest)").unwrap_or(trimmed).trim();
@@ -6432,7 +7925,10 @@ fn plan_mp2_recipients(
     // unpinned/guest member when `--strict-pins` is enabled).
     for m in &sess.mp2_members {
         let is_guest = m.is_guest || m.account_id == 0;
-        if !is_guest && m.account_id == local_account_id {
+        let is_own_device = !is_guest
+            && (m.device_id == Some(local_device_id)
+                || (m.device_id.is_none() && m.account_id == local_account_id));
+        if is_own_device {
             continue;
         }
         let dev_id = if is_guest {
@@ -6916,6 +8412,10 @@ fn build_ipc_poll_resp(
 }
 
 #[cfg(test)]
+#[path = "mls_live_e2e_tests.rs"]
+mod mls_live_e2e_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
@@ -7154,7 +8654,13 @@ mod tests {
             mls_epoch: 0,
             min_allowed_mls_epoch: 0,
             mls_rekey_required: false,
+            mls_invite_epoch: 0,
             group_id_b64: None,
+            party_ds_pubkey: None,
+            is_mls_creator: false,
+            pending_invite_fragment: None,
+            pending_join_kp: None,
+            processed_kp_refs: std::collections::HashSet::new(),
             mls_session: None,
             members: HashMap::new(),
             mp2_members: members,
@@ -7215,6 +8721,7 @@ mod tests {
             agent_summary: None,
             status: "live".to_string(),
             device_id: Some(2001),
+            nick: None,
         };
         let bob_pinned = Mp2Member {
             account_id: 1002,
@@ -7227,6 +8734,7 @@ mod tests {
             agent_summary: None,
             status: "live".to_string(),
             device_id: Some(2002),
+            nick: None,
         };
         let carol_unpinned = Mp2Member {
             account_id: 1003,
@@ -7239,6 +8747,7 @@ mod tests {
             agent_summary: None,
             status: "live".to_string(),
             device_id: Some(2003),
+            nick: None,
         };
         let mallory_revoked = Mp2Member {
             account_id: 1004,
@@ -7251,6 +8760,7 @@ mod tests {
             agent_summary: None,
             status: "live".to_string(),
             device_id: Some(2004),
+            nick: None,
         };
         let web_guest = Mp2Member {
             account_id: 0,
@@ -7263,6 +8773,7 @@ mod tests {
             agent_summary: None,
             status: "live".to_string(),
             device_id: None,
+            nick: None,
         };
 
         // 1. Mixed pinned + unpinned room: strict_pins MUST fail closed (no broadcast leak!)
@@ -7374,6 +8885,7 @@ mod tests {
             agent_summary: None,
             status: "live".to_string(),
             device_id: None,
+            nick: None,
         };
         let mut sess = make_mp2_test_session(vec![guest.clone()]);
         update_mp2_provenance_cache(&mut sess, &[guest], auth_hash, &peers);
@@ -7396,6 +8908,7 @@ mod tests {
                     is_browser: true,
                     agent_name: None,
                     device_id: None,
+                    nick: None,
                 },
                 target: "@all".to_string(),
                 kind: Mp2EventKind::Chat,
@@ -7422,6 +8935,7 @@ mod tests {
                     is_browser: false,
                     agent_name: None,
                     device_id: Some(9999),
+                    nick: None,
                 },
                 target: "@all".to_string(),
                 kind: Mp2EventKind::Chat,
@@ -7447,6 +8961,7 @@ mod tests {
                     is_browser: true,
                     agent_name: None,
                     device_id: None,
+                    nick: None,
                 },
                 target: "@all".to_string(),
                 kind: Mp2EventKind::Chat,
@@ -7679,6 +9194,7 @@ mod tests {
                     is_browser: false,
                     agent_name: None,
                     device_id: Some(2001),
+                    nick: None,
                 },
                 target: "@all".to_string(),
                 kind: Mp2EventKind::Chat,
@@ -7716,6 +9232,7 @@ mod tests {
                     is_browser: false,
                     agent_name: None,
                     device_id: Some(2001),
+                    nick: None,
                 },
                 target: "*".to_string(),
                 kind: Mp2EventKind::E2eeApp,

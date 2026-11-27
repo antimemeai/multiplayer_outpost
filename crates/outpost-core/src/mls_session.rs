@@ -19,9 +19,9 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use mp_mls::{
-    AddMemberCommitOutput, ClientClass, CommitAckV1, Ed25519PubKey, LocalPolicyReport,
-    MP_GROUP_ID_LEN, MP_PCS_UPDATE_FRAME_THRESHOLD, MpMlsClient, MpMlsError, MpRoomPolicyExtV1,
-    MsgClass, PendingOutboxEntry, RoomTrustTier,
+    AddMemberCommitOutput, ClientClass, CommitAckV1, DeviceIdentity, Ed25519PubKey, InviteRecordV1,
+    LocalPolicyReport, MP_GROUP_ID_LEN, MP_PCS_UPDATE_FRAME_THRESHOLD, MpMlsClient, MpMlsError,
+    MpRoomPolicyExtV1, MsgClass, PendingOutboxEntry, PinnedAccountRoot, RoomTrustTier,
 };
 use ring::rand::{SecureRandom as _, SystemRandom};
 
@@ -356,6 +356,59 @@ impl MlsRoomSession {
         self.inviter_unconfirmed = true;
         self.pinned_inviter_root_pk = Some(inviter_root_pk);
         self
+    }
+
+    /// Restores a live [`MlsRoomSession`] fail-closed from a decrypted `MPM1` snapshot.
+    pub fn restore_from_snapshot(
+        party_id: u64,
+        group_id: [u8; MP_GROUP_ID_LEN],
+        identity: DeviceIdentity,
+        store_key: [u8; 32],
+        snap: MlsRoomSnapshotPlain,
+    ) -> Result<Self, MlsSessionError> {
+        let mut pins = Vec::with_capacity(snap.pinned_roots.len());
+        for p in &snap.pinned_roots {
+            pins.push(PinnedAccountRoot::try_from(*p)?);
+        }
+        let client = MpMlsClient::restore_from_storage(
+            party_id,
+            group_id,
+            snap.epoch,
+            snap.device_epoch_seq,
+            snap.total_sent_frames_in_epoch,
+            snap.cloned_device_key_suspected,
+            snap.inviter_unconfirmed,
+            &pins,
+            &snap.mls_storage_blob,
+            identity,
+        )?;
+        Ok(Self {
+            client,
+            store_key,
+            e2ee_mode: 1,
+            min_allowed_mls_epoch: 0,
+            mls_rekey_required: false,
+            inviter_unconfirmed: snap.inviter_unconfirmed,
+            pinned_inviter_root_pk: None,
+            clone_detected: snap.cloned_device_key_suspected,
+            has_pending_removals: false,
+            outbox: snap.outbox,
+            dedup_ring: MlsDedupRing::from_vec(snap.dedup_ring),
+            device_binding_236b: snap.device_binding_236b,
+            device_list_blob: snap.device_list_blob,
+        })
+    }
+
+    pub fn register_active_invite(&mut self, record: InviteRecordV1) {
+        self.client.register_active_invite(record);
+    }
+
+    pub fn build_add_sibling_device_commit(
+        &mut self,
+        kp_bytes: &[u8],
+        now_s: u64,
+    ) -> Result<AddMemberCommitOutput, MlsSessionError> {
+        Ok(self.client.commit_add_sibling_device(kp_bytes, now_s)?)
     }
 
     pub fn party_id(&self) -> u64 {

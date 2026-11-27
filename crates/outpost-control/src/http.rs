@@ -1494,6 +1494,29 @@ impl ControlClient {
     // Room Protocol v2 (`mp2`) & Cloud Auth REST Endpoints
     // -----------------------------------------------------------------------
 
+    /// `POST /v1/rooms/create` (device-authenticated).
+    ///
+    /// Creates a new `mp2` room explicitly (supporting `e2ee_mode: Some(1)` and returning
+    /// `e2ee_mode` + `party_ds_pubkey_b64`).
+    pub async fn room_create(
+        &self,
+        req: &RoomCreateRequest,
+    ) -> Result<RoomCreateResponse, ControlError> {
+        let signer = self.require_device_signer()?;
+        let body = encode_json(req)?;
+        let resp = self
+            .execute_signed(signer, HttpMethod::Post, "/v1/rooms/create", "?", body, None)
+            .await?;
+        let decoded: RoomCreateResponse = Self::decode_json_response(resp, &[200, 201])?;
+        PartyId::new(decoded.party_id).map_err(|_| {
+            ControlError::Protocol(format!(
+                "invalid party_id ({}) in room_create response",
+                decoded.party_id
+            ))
+        })?;
+        Ok(decoded)
+    }
+
     /// `POST /v1/rooms/invite` (device-authenticated).
     ///
     /// Creates a room automatically if `party_id` is omitted, puts the caller in it,
@@ -1954,6 +1977,63 @@ impl ControlClient {
         Ok(decoded)
     }
 
+    /// `POST /v1/devices/binding` (device or `.root` signer; uploads 236-byte `MpMlsDeviceBindingV1`
+    /// using exact `multiplayer_site` `{ binding_b64 }` wire schema).
+    pub async fn post_device_binding(
+        &self,
+        signer: &RequestSigner,
+        binding_b64: &str,
+    ) -> Result<PutDeviceBindingResponse, ControlError> {
+        require_device_or_root_signer(signer)?;
+        let decoded_binding = B64_STD
+            .decode(binding_b64.as_bytes())
+            .map_err(|_| ControlError::InvalidRequest("invalid binding_b64".to_owned()))?;
+        if decoded_binding.len() != MLS_DEVICE_BINDING_BYTES {
+            return Err(ControlError::InvalidRequest(format!(
+                "device_binding must be exactly {MLS_DEVICE_BINDING_BYTES} bytes (got {})",
+                decoded_binding.len()
+            )));
+        }
+        let body = encode_json_bounded(&PostDeviceBindingWire { binding_b64 }, MAX_MLS_CONTROL_BODY_BYTES)?;
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Post,
+                "/v1/devices/binding",
+                "?",
+                body,
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        let decoded: PutDeviceBindingResponse = Self::decode_json_response(resp, &[200, 201])?;
+        validate_device_id(decoded.device_id, "post_device_binding")?;
+        Ok(decoded)
+    }
+
+    /// `POST /v1/devices/list` (device or `.root` signer; uploads root-signed `AccountDeviceListV1`
+    /// using exact `multiplayer_site` `{ list_b64 }` wire schema).
+    pub async fn post_device_list(
+        &self,
+        signer: &RequestSigner,
+        list_b64: &str,
+    ) -> Result<PutDeviceListResponse, ControlError> {
+        require_device_or_root_signer(signer)?;
+        let body = encode_json_bounded(&PostDeviceListWire { list_b64 }, MAX_MLS_CONTROL_BODY_BYTES)?;
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Post,
+                "/v1/devices/list",
+                "?",
+                body,
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200, 201])
+    }
+
     /// `PUT /v1/devices/binding` (device or `.root` signer; uploads 236-byte `MpMlsDeviceBindingV1`).
     pub async fn put_device_binding(
         &self,
@@ -2237,6 +2317,74 @@ impl ControlClient {
             )
             .await?;
         Self::decode_json_response(resp, &[200])
+    }
+
+    /// `GET /v1/parties/<party_id>/mls/proposals/pending` (strict device signer; fetches pending
+    /// DS External Remove proposals when `mls_rekey_required == true`).
+    pub async fn mls_fetch_pending_proposals(
+        &self,
+        party_id: PartyId,
+    ) -> Result<MlsPendingProposalsResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        let path = format!("/v1/parties/{party_id}/mls/proposals/pending");
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Get,
+                &path,
+                "?",
+                Bytes::new(),
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
+    /// `GET /v1/parties/<party_id>/mls/key-packages` (strict device signer; optional catch-up poll
+    /// for queued unconsumed KeyPackages if exposed by the Delivery Service).
+    pub async fn mls_fetch_pending_key_packages(
+        &self,
+        party_id: PartyId,
+    ) -> Result<MlsPendingKeyPackagesResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        let path = format!("/v1/parties/{party_id}/mls/key-packages");
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Get,
+                &path,
+                "?",
+                Bytes::new(),
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
+    /// `POST /v1/accounts/me/mls/cloud-bind` (strict device signer; mints cloud-managed
+    /// `custody_mode = 0` `MpMlsDeviceBindingV1` + `AccountDeviceListV1` signed by the account's
+    /// cloud-custodied root key in `AccountDO`).
+    pub async fn mls_cloud_bind(
+        &self,
+        req: &MlsCloudBindRequest,
+    ) -> Result<MlsCloudBindResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        let body = serde_json::to_vec(req)
+            .map_err(|e| ControlError::InvalidJsonResponse(e.to_string()))?;
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Post,
+                "/v1/accounts/me/mls/cloud-bind",
+                "?",
+                Bytes::from(body),
+                Some("application/json"),
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200, 201])
     }
 }
 
@@ -3734,6 +3882,38 @@ where
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct RoomCreateRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub e2ee_mode: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RoomCreateResponse {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub party_id: u64,
+    #[serde(default)]
+    pub room_code: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub e2ee_mode: u8,
+    #[serde(default)]
+    pub party_ds_pubkey_b64: Option<String>,
+    #[serde(default)]
+    pub share_url: String,
+    #[serde(default)]
+    pub ws_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct RoomInviteRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handle: Option<String>,
@@ -3741,6 +3921,8 @@ pub struct RoomInviteRequest {
     pub party_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub e2ee_mode: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -3757,6 +3939,14 @@ pub struct RoomInviteResponse {
     pub ws_path: String,
     #[serde(default)]
     pub invited_handle: Option<String>,
+    #[serde(default)]
+    pub e2ee_mode: u8,
+    #[serde(default)]
+    pub party_ds_pubkey_b64: Option<String>,
+    #[serde(default)]
+    pub group_id_b64: Option<String>,
+    #[serde(default)]
+    pub is_creator: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -3783,6 +3973,8 @@ pub struct RoomMemberSummary {
     pub agent_name: Option<String>,
     #[serde(default)]
     pub status: String,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    pub device_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -3799,6 +3991,12 @@ pub struct RoomEnterResponse {
     pub ws_path: String,
     #[serde(default)]
     pub members: Vec<RoomMemberSummary>,
+    #[serde(default)]
+    pub e2ee_mode: u8,
+    #[serde(default)]
+    pub party_ds_pubkey_b64: Option<String>,
+    #[serde(default)]
+    pub group_id_b64: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -4133,6 +4331,16 @@ pub struct ReserveDeviceResponse {
     pub device_gen: u32,
 }
 
+#[derive(Serialize)]
+struct PostDeviceBindingWire<'a> {
+    binding_b64: &'a str,
+}
+
+#[derive(Serialize)]
+struct PostDeviceListWire<'a> {
+    list_b64: &'a str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PutDeviceBindingRequest {
     pub device_binding_b64: String,
@@ -4171,6 +4379,7 @@ pub struct GetDeviceListResponse {
     pub account_id: u64,
     #[serde(default, deserialize_with = "deserialize_u64_or_string")]
     pub list_version: u64,
+    #[serde(alias = "list_b64")]
     pub device_list_b64: String,
 }
 
@@ -4193,6 +4402,7 @@ pub struct MlsInitResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MlsCreateInviteRequest {
+    #[serde(rename = "token_hash_b64")]
     pub server_token_hash_b64: String,
     pub max_uses: u32,
     pub expires_at_ms: u64,
@@ -4212,11 +4422,14 @@ pub struct MlsCreateInviteResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MlsJoinRequest {
-    pub invite_id: u64,
-    pub server_invite_token_b64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_invite_token_b64: Option<String>,
     pub kp_ref_b64: String,
     pub kp_blob_b64: String,
-    pub join_proof_b64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub join_proof_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -4225,6 +4438,18 @@ pub struct MlsJoinResponse {
     pub status: String,
     #[serde(default, deserialize_with = "deserialize_u64_or_string")]
     pub mls_epoch: u64,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    pub kp_id: Option<u64>,
+    #[serde(default)]
+    pub kp_ref_b64: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MlsWelcomeEntry {
+    pub target_device_id: u64,
+    pub kp_ref_b64: String,
+    pub welcome_blob_b64: String,
+    pub welcome_auth_blob_b64: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -4237,18 +4462,26 @@ pub struct MlsCommitRequest {
     pub welcome_auth_b64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub joiner_device_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub welcomes: Vec<MlsWelcomeEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MlsCommitResponse {
     #[serde(default)]
     pub status: String,
-    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    #[serde(default, alias = "mls_epoch", deserialize_with = "deserialize_u64_or_string")]
     pub target_epoch: u64,
     #[serde(default)]
     pub commit_sha256_b64: String,
     #[serde(default)]
     pub finalized: bool,
+}
+
+impl MlsCommitResponse {
+    pub fn is_finalized(&self) -> bool {
+        self.finalized || self.status == "finalized"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -4268,19 +4501,28 @@ pub struct MlsCommitAckResponse {
     #[serde(default)]
     pub ok: bool,
     #[serde(default)]
+    pub outcome: String,
+    #[serde(default)]
     pub finalized: bool,
     #[serde(default)]
     pub discarded: bool,
-    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    #[serde(default, alias = "mls_epoch", deserialize_with = "deserialize_u64_or_string")]
     pub new_epoch: u64,
+}
+
+impl MlsCommitAckResponse {
+    pub fn is_finalized(&self) -> bool {
+        self.finalized || self.outcome == "finalized"
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MlsCommitBundleItem {
-    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    #[serde(alias = "mls_epoch", deserialize_with = "deserialize_u64_or_string")]
     pub epoch: u64,
+    #[serde(alias = "commit_blob_b64")]
     pub commit_b64: String,
-    #[serde(default)]
+    #[serde(default, alias = "proposals_b64")]
     pub proposal_blobs_b64: Vec<String>,
 }
 
@@ -4288,10 +4530,26 @@ pub struct MlsCommitBundleItem {
 pub struct MlsFetchCommitsResponse {
     #[serde(default)]
     pub group_id_b64: String,
-    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    #[serde(default, alias = "current_epoch", deserialize_with = "deserialize_u64_or_string")]
     pub head_epoch: u64,
     #[serde(default)]
     pub commits: Vec<MlsCommitBundleItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsNestedWelcome {
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    pub welcome_id: Option<u64>,
+    #[serde(default, alias = "target_epoch", deserialize_with = "deserialize_u64_or_string")]
+    pub mls_epoch: u64,
+    #[serde(default)]
+    pub group_id_b64: Option<String>,
+    #[serde(default)]
+    pub kp_ref_b64: Option<String>,
+    #[serde(alias = "welcome_b64")]
+    pub welcome_blob_b64: String,
+    #[serde(alias = "welcome_auth_b64")]
+    pub welcome_auth_blob_b64: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -4308,6 +4566,50 @@ pub struct MlsFetchWelcomeResponse {
     pub welcome_auth_b64: Option<String>,
     #[serde(default)]
     pub party_ds_pubkey_b64: Option<String>,
+    #[serde(default)]
+    pub welcome: Option<MlsNestedWelcome>,
+}
+
+impl MlsFetchWelcomeResponse {
+    pub fn resolved_welcome_b64(&self) -> Option<&str> {
+        self.welcome
+            .as_ref()
+            .map(|w| w.welcome_blob_b64.as_str())
+            .or(self.welcome_b64.as_deref())
+    }
+
+    pub fn resolved_welcome_auth_b64(&self) -> Option<&str> {
+        self.welcome
+            .as_ref()
+            .map(|w| w.welcome_auth_blob_b64.as_str())
+            .or(self.welcome_auth_b64.as_deref())
+    }
+
+    pub fn resolved_welcome_id(&self) -> Option<u64> {
+        self.welcome.as_ref().and_then(|w| w.welcome_id)
+    }
+
+    pub fn resolved_kp_ref_b64(&self) -> Option<&str> {
+        self.welcome.as_ref().and_then(|w| w.kp_ref_b64.as_deref())
+    }
+
+    pub fn resolved_target_epoch(&self) -> u64 {
+        self.welcome
+            .as_ref()
+            .map_or(self.target_epoch, |w| w.mls_epoch)
+    }
+
+    pub fn resolved_group_id_b64(&self) -> Option<&str> {
+        if let Some(g) = self.welcome.as_ref().and_then(|w| w.group_id_b64.as_deref())
+            && !g.is_empty()
+        {
+            return Some(g);
+        }
+        if !self.group_id_b64.is_empty() {
+            return Some(self.group_id_b64.as_str());
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -4315,11 +4617,13 @@ pub struct MlsWelcomeAckRequest {
     pub group_id_b64: String,
     pub target_epoch: u64,
     pub kp_ref_b64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub welcome_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MlsWelcomeAckResponse {
-    #[serde(default)]
+    #[serde(default, alias = "acked")]
     pub ok: bool,
 }
 
@@ -4329,6 +4633,7 @@ pub struct MlsAccountDeviceListItem {
     pub account_id: u64,
     #[serde(default, deserialize_with = "deserialize_u64_or_string")]
     pub list_version: u64,
+    #[serde(alias = "list_b64")]
     pub device_list_b64: String,
 }
 
@@ -4336,4 +4641,90 @@ pub struct MlsAccountDeviceListItem {
 pub struct MlsDeviceListsResponse {
     #[serde(default)]
     pub device_lists: Vec<MlsAccountDeviceListItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsPendingProposalsResponse {
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub mls_epoch: u64,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub min_allowed_mls_epoch: u64,
+    #[serde(default)]
+    pub mls_rekey_required: bool,
+    #[serde(default, alias = "proposal_blobs_b64")]
+    pub proposals_b64: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsPendingKeyPackageItem {
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    pub kp_id: Option<u64>,
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub account_id: u64,
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub device_id: u64,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    pub invite_id: Option<u64>,
+    #[serde(default)]
+    pub kp_ref_b64: String,
+    pub kp_blob_b64: String,
+    #[serde(default)]
+    pub join_proof_b64: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsPendingKeyPackagesResponse {
+    #[serde(default)]
+    pub key_packages: Vec<MlsPendingKeyPackageItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MlsCloudBindRequest {
+    pub mls_sig_pubkey_b64: String,
+    pub client_class: u8,
+    pub agent_capable: bool,
+    pub iat_s: u64,
+    pub exp_s: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_sig_b64: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsCloudBindResponse {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub step: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub account_id: u64,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub device_id: u64,
+    #[serde(default)]
+    pub device_gen: u32,
+    #[serde(default)]
+    pub root_gen: u32,
+    #[serde(default)]
+    pub root_pubkey_b64: String,
+    #[serde(default)]
+    pub custody_mode: u8,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub iat_s: u64,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub exp_s: u64,
+    #[serde(default)]
+    pub body_b64: Option<String>,
+    #[serde(default)]
+    pub root_sig_b64: Option<String>,
+    #[serde(default)]
+    pub pop_message_b64: Option<String>,
+    #[serde(default)]
+    pub binding_b64: Option<String>,
+    #[serde(default)]
+    pub leaf_cred_b64: Option<String>,
+    #[serde(default, alias = "list_b64")]
+    pub device_list_b64: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub list_version: u64,
+    #[serde(default)]
+    pub list_hash_b64: String,
 }

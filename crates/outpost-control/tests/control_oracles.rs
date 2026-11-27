@@ -3495,6 +3495,7 @@ async fn oracle_mp2_rest_room_v2_and_cloud_auth_contract() {
             handle: Some("phall".to_owned()),
             party_id: None,
             name: Some("Friday Build".to_owned()),
+            e2ee_mode: None,
         })
         .await
         .expect("room_invite");

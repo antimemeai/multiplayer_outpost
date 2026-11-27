@@ -63,6 +63,8 @@ const BEL_COOLDOWN: Duration = Duration::from_secs(5);
 const STATUS_NOTICE_TTL: Duration = Duration::from_secs(4);
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
+const MAX_SESSION_NICK_CHARS: usize = 32;
+const MAX_TOPIC_CHARS: usize = 160;
 
 // ---------------------------------------------------------------------------
 // CLI Argument Parsing
@@ -72,6 +74,7 @@ const DEFAULT_ROWS: u16 = 24;
 pub struct ChatArgs {
     pub target: Option<String>,
     pub party_id: Option<u64>,
+    pub nick: Option<String>,
     pub no_tty: bool,
     pub show_help: bool,
 }
@@ -94,6 +97,11 @@ pub fn parse_chat_args(args: &[String]) -> Result<ChatArgs, String> {
                 let val = next_val(args, &mut i, "--party")?;
                 parsed.party_id = Some(parse_safe_id(val, "--party")?);
             }
+            "--nick" => {
+                let val = next_val(args, &mut i, "--nick")?;
+                let clean = validate_session_nick(val).map_err(|e| format!("invalid --nick: {e}"))?;
+                parsed.nick = Some(clean);
+            }
             other if !other.starts_with('-') && parsed.target.is_none() => {
                 let trimmed = other.trim();
                 if !trimmed.is_empty() {
@@ -114,13 +122,18 @@ pub fn parse_chat_args(args: &[String]) -> Result<ChatArgs, String> {
 
 fn print_chat_usage() {
     println!(
-        "Usage: mp-outpost chat [target] [--party <id>] [--no-tty]\n\n\
+        "Usage: mp-outpost chat [target] [--party <id>] [--nick <name>] [--no-tty]\n\n\
 Interactive second-window live party chat sharing your local mp-outpost daemon.\n\n\
 Arguments:\n\
   [target]          Optional @handle, 4-char code, or clank.party/mp.gg/multiplayer.tech URL to join first\n\
   --party <id>      Attach to a specific active party ID\n\
+  --nick <name>     Set a per-session nick (1..=32 printable chars, always paired with @handle)\n\
   --no-tty          Line-oriented mode for pipes, dumb terminals, and scripts\n\n\
 In-chat commands:\n\
+  /me <action>              Send an IRC action (* nick <action>)\n\
+  /nick <name>              Set per-session nick (1..=32 chars, paired with @handle)\n\
+  /topic [text]             Show or set room topic (E2EE-encrypted in MLS rooms)\n\
+  /names                    Print compact IRC roster ([Users: ...])\n\
   /board <text>             Post to shared party board\n\
   /card <title> | <summary> Post a structured agent card to the party\n\
   /invite [@handle]         Create room or invite a friend (prints share link)\n\
@@ -351,11 +364,355 @@ pub fn check_chat_secret_refusal(
 }
 
 // ---------------------------------------------------------------------------
+// Classic IRC Helpers (Nick Validation, Wire Framing, Colors, Presence Diff)
+// ---------------------------------------------------------------------------
+
+/// Validates and sanitizes a per-session IRC nick (`1..=32` printable non-whitespace chars).
+///
+/// Anti-spoofing invariants:
+/// - Strips all ANSI/CSI/OSC/DCS/C0/C1/BiDi escape sequences first.
+/// - Forbids `@`, whitespace, parentheses, angle brackets, colons, and brackets so a peer
+///   can NEVER forge `@other_handle` or `fake (@operator)` inside a nick!
+/// - Always rendered alongside the cryptographically/server-verified `@handle`.
+pub fn validate_session_nick(raw: &str) -> Result<String, &'static str> {
+    let cleaned = sanitize_terminal_inline(raw);
+    let count = cleaned.chars().count();
+    if count == 0 {
+        return Err("nick must be 1..=32 printable characters");
+    }
+    if count > MAX_SESSION_NICK_CHARS {
+        return Err("nick must be at most 32 characters");
+    }
+    if cleaned.chars().any(|c| {
+        c.is_whitespace()
+            || c.is_control()
+            || matches!(c, '@' | '(' | ')' | '<' | '>' | '[' | ']' | ':')
+    }) {
+        return Err("nick cannot contain whitespace, '@', or punctuation '()<>[] :'");
+    }
+    Ok(cleaned)
+}
+
+/// Validates and sanitizes a room topic (`1..=160` printable chars, single-line).
+pub fn validate_room_topic(raw: &str) -> Result<String, &'static str> {
+    let cleaned = sanitize_terminal_inline(raw);
+    let count = cleaned.chars().count();
+    if count == 0 {
+        return Err("topic must be non-empty");
+    }
+    if count > MAX_TOPIC_CHARS {
+        return Err("topic must be at most 160 characters");
+    }
+    Ok(cleaned)
+}
+
+/// Pairs an optional validated session nick with the verified `@handle` display label.
+/// Never drops the verified `@handle` so a nick can never spoof another operator.
+pub fn format_nick_with_handle(
+    nick: Option<&str>,
+    account_id: u64,
+    verified_handle: &str,
+) -> String {
+    let verified = sanitize_terminal_inline(&format_member_display(account_id, verified_handle));
+    match nick.and_then(|n| validate_session_nick(n).ok()) {
+        Some(clean_nick) => format!("{clean_nick} ({verified})"),
+        None => verified,
+    }
+}
+
+/// Deterministic subtle ANSI foreground color derived purely from numeric `(account_id, device_id)`.
+/// Palette avoids harsh bright red/black/white and remains legible on dark and light terminals.
+pub fn deterministic_nick_ansi_color(account_id: u64, device_id: u64) -> &'static str {
+    const PALETTE: [&str; 8] = [
+        "\x1b[36m", // cyan
+        "\x1b[32m", // green
+        "\x1b[33m", // yellow
+        "\x1b[34m", // blue
+        "\x1b[35m", // magenta
+        "\x1b[96m", // bright cyan
+        "\x1b[92m", // bright green
+        "\x1b[94m", // bright blue
+    ];
+    let mut z = account_id ^ device_id.rotate_left(17) ^ 0x9E37_79B9_7F4A_7C15;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    let idx = usize::try_from(z % (PALETTE.len() as u64)).unwrap_or(0);
+    PALETTE.get(idx).copied().unwrap_or("\x1b[36m")
+}
+
+/// Parsed IRC-style wire payload carried inside regular chat / encrypted `e2ee_app` body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IrcWireMessage {
+    Plain(String),
+    Action(String),
+    Nick(String),
+    Topic(String),
+}
+
+/// Encodes an IRC control event into the shared cross-client E2EE JSON envelope
+/// (`{"mp_irc":1,"t":"nick"|"me"|"topic",...}`) with `"mp_irc":1` as the first key
+/// so both Outpost/Blackbird and browser `room-app.js` parse it cleanly inside `e2ee_app`.
+pub fn encode_irc_wire_json(msg: &IrcWireMessage) -> Option<String> {
+    match msg {
+        IrcWireMessage::Nick(nick) => {
+            let escaped = serde_json::to_string(nick).ok()?;
+            Some(format!("{{\"mp_irc\":1,\"t\":\"nick\",\"nick\":{escaped}}}"))
+        }
+        IrcWireMessage::Action(action) => {
+            let escaped = serde_json::to_string(action).ok()?;
+            Some(format!("{{\"mp_irc\":1,\"t\":\"me\",\"text\":{escaped}}}"))
+        }
+        IrcWireMessage::Topic(topic) => {
+            let escaped = serde_json::to_string(topic).ok()?;
+            Some(format!("{{\"mp_irc\":1,\"t\":\"topic\",\"topic\":{escaped}}}"))
+        }
+        IrcWireMessage::Plain(_) => None,
+    }
+}
+
+/// Parses an inbound chat body (plaintext or decrypted `e2ee_app` payload) into an IRC
+/// semantic message. Supports BOTH the shared JSON envelope
+/// (`{"mp_irc":1,"t":"nick"|"me"|"topic","nick":...,"text":...,"topic":...}`)
+/// AND lightweight prefix conventions (`/me ...`, `/nick ...`, `/topic ...`).
+/// All fields are strictly sanitized against terminal escapes.
+pub fn parse_irc_wire_body(raw: &str) -> IrcWireMessage {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{')
+        && let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed)
+    {
+        let kind = if map.get("mp_irc").and_then(Value::as_u64) == Some(1) {
+            map.get("t").and_then(Value::as_str)
+        } else {
+            map.get("mp_irc").and_then(Value::as_str)
+        };
+        if let Some(kind) = kind {
+            match kind {
+                "me" => {
+                    if let Some(text) = map.get("text").and_then(Value::as_str) {
+                        let clean = sanitize_terminal_inline(text);
+                        if !clean.is_empty() {
+                            return IrcWireMessage::Action(clean);
+                        }
+                    }
+                }
+                "nick" => {
+                    if let Some(nick) = map
+                        .get("nick")
+                        .or_else(|| map.get("text"))
+                        .and_then(Value::as_str)
+                        && let Ok(clean) = validate_session_nick(nick)
+                    {
+                        return IrcWireMessage::Nick(clean);
+                    }
+                }
+                "topic" => {
+                    if let Some(topic) = map
+                        .get("topic")
+                        .or_else(|| map.get("text"))
+                        .and_then(Value::as_str)
+                        && let Ok(clean) = validate_room_topic(topic)
+                    {
+                        return IrcWireMessage::Topic(clean);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(rest) = trimmed
+        .strip_prefix("/me ")
+        .or_else(|| trimmed.strip_prefix("/ME "))
+    {
+        let clean = sanitize_terminal_inline(rest);
+        if !clean.is_empty() {
+            return IrcWireMessage::Action(clean);
+        }
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("/nick ")
+        .or_else(|| trimmed.strip_prefix("/NICK "))
+        && let Ok(clean) = validate_session_nick(rest)
+    {
+        return IrcWireMessage::Nick(clean);
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("/topic ")
+        .or_else(|| trimmed.strip_prefix("/TOPIC "))
+        && let Ok(clean) = validate_room_topic(rest)
+    {
+        return IrcWireMessage::Topic(clean);
+    }
+
+    IrcWireMessage::Plain(sanitize_terminal_text(raw, true))
+}
+
+/// Formats a classic IRC joinline: `--> nick (@handle · client) has joined` or `--> @handle (client) has joined`.
+pub fn format_irc_joinline(
+    nick: Option<&str>,
+    account_id: u64,
+    handle: &str,
+    client_label: Option<&str>,
+) -> String {
+    let verified = sanitize_terminal_inline(&format_member_display(account_id, handle));
+    let client = client_label
+        .map(sanitize_terminal_inline)
+        .filter(|s| !s.is_empty());
+    match (nick.and_then(|n| validate_session_nick(n).ok()), client) {
+        (Some(n), Some(c)) => format!("--> {n} ({verified} · {c}) has joined"),
+        (Some(n), None) => format!("--> {n} ({verified}) has joined"),
+        (None, Some(c)) => format!("--> {verified} ({c}) has joined"),
+        (None, None) => format!("--> {verified} has joined"),
+    }
+}
+
+/// Formats a classic IRC partline: `<-- nick (@handle) has left` or `<-- @handle has left`.
+pub fn format_irc_partline(nick: Option<&str>, account_id: u64, handle: &str) -> String {
+    let display = format_nick_with_handle(nick, account_id, handle);
+    format!("<-- {display} has left")
+}
+
+/// Formats the `/names` IRC roster line: `[Users: nick (@handle · client · status), ...]`.
+pub fn format_irc_names_line(
+    members: &[SquadMemberView],
+    peer_nicks: &HashMap<(u64, u64), String>,
+    local_nick: Option<&str>,
+    own_account_id: u64,
+    own_device_id: u64,
+) -> String {
+    if members.is_empty() {
+        return "[Users: (none)]".to_string();
+    }
+    let mut items = Vec::with_capacity(members.len());
+    for m in members {
+        let verified = sanitize_terminal_inline(&format_member_display(m.account_id, &m.handle));
+        let nick = resolve_member_nick(
+            m.account_id,
+            m.device_id,
+            peer_nicks,
+            local_nick,
+            own_account_id,
+            own_device_id,
+        );
+        let status = if m.live { "live" } else { "away" };
+        let client = m
+            .client_label
+            .as_deref()
+            .map(sanitize_terminal_inline)
+            .filter(|s| !s.is_empty());
+        let formatted = match (nick, client) {
+            (Some(n), Some(c)) => format!("{n} ({verified} · {c} · {status})"),
+            (Some(n), None) => format!("{n} ({verified} · {status})"),
+            (None, Some(c)) => format!("{verified} ({c} · {status})"),
+            (None, None) => format!("{verified} ({status})"),
+        };
+        items.push(formatted);
+    }
+    format!("[Users: {}]", items.join(", "))
+}
+
+fn resolve_member_nick<'a>(
+    account_id: u64,
+    device_id: u64,
+    peer_nicks: &'a HashMap<(u64, u64), String>,
+    local_nick: Option<&'a str>,
+    own_account_id: u64,
+    own_device_id: u64,
+) -> Option<&'a str> {
+    if account_id == own_account_id
+        && (device_id == 0 || device_id == own_device_id)
+        && let Some(n) = local_nick
+    {
+        return Some(n);
+    }
+    if device_id != 0
+        && let Some(n) = peer_nicks.get(&(account_id, device_id))
+    {
+        return Some(n.as_str());
+    }
+    peer_nicks.get(&(account_id, 0)).map(String::as_str)
+}
+
+/// Computes classic IRC joinlines & partlines between two consecutive member roster snapshots.
+/// Avoids false churn when transitioning between coarse `RoomEnter` snapshots (`device_id == 0`)
+/// and per-device `PartyMembers` snapshots (`device_id != 0`).
+pub fn diff_presence_notices(
+    prev: &[SquadMemberView],
+    next: &[SquadMemberView],
+    peer_nicks: &HashMap<(u64, u64), String>,
+    local_nick: Option<&str>,
+    own_account_id: u64,
+    own_device_id: u64,
+) -> Vec<String> {
+    let both_have_devices =
+        prev.iter().all(|m| m.device_id != 0) && next.iter().all(|m| m.device_id != 0);
+    let key_of = |m: &SquadMemberView| -> (u64, u64) {
+        if both_have_devices {
+            (m.account_id, m.device_id)
+        } else {
+            (m.account_id, 0)
+        }
+    };
+
+    let mut prev_map: HashMap<(u64, u64), &SquadMemberView> = HashMap::with_capacity(prev.len());
+    for m in prev {
+        prev_map.insert(key_of(m), m);
+    }
+    let mut next_map: HashMap<(u64, u64), &SquadMemberView> = HashMap::with_capacity(next.len());
+    for m in next {
+        next_map.insert(key_of(m), m);
+    }
+
+    let mut notices = Vec::new();
+    let mut seen_joined = HashSet::new();
+    for m in next {
+        let k = key_of(m);
+        if !prev_map.contains_key(&k) && seen_joined.insert(k) {
+            let nick = resolve_member_nick(
+                m.account_id,
+                m.device_id,
+                peer_nicks,
+                local_nick,
+                own_account_id,
+                own_device_id,
+            );
+            notices.push(format_irc_joinline(
+                nick,
+                m.account_id,
+                &m.handle,
+                m.client_label.as_deref(),
+            ));
+        }
+    }
+    let mut seen_parted = HashSet::new();
+    for m in prev {
+        let k = key_of(m);
+        if !next_map.contains_key(&k) && seen_parted.insert(k) {
+            let nick = resolve_member_nick(
+                m.account_id,
+                m.device_id,
+                peer_nicks,
+                local_nick,
+                own_account_id,
+                own_device_id,
+            );
+            notices.push(format_irc_partline(nick, m.account_id, &m.handle));
+        }
+    }
+    notices
+}
+
+// ---------------------------------------------------------------------------
 // Slash Command Parser
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
+    Me(String),
+    Nick(String),
+    Topic(String),
+    Names,
     Board(String),
     Card(String),
     Invite(Option<String>),
@@ -405,6 +762,10 @@ pub fn parse_user_input(raw: &str) -> UserInputAction {
     };
     let cmd = cmd_raw.to_ascii_lowercase();
     match cmd.as_str() {
+        "me" => UserInputAction::Command(SlashCommand::Me(rest_raw.to_string())),
+        "nick" => UserInputAction::Command(SlashCommand::Nick(rest_raw.to_string())),
+        "topic" => UserInputAction::Command(SlashCommand::Topic(rest_raw.to_string())),
+        "names" => UserInputAction::Command(SlashCommand::Names),
         "board" => UserInputAction::Command(SlashCommand::Board(rest_raw.to_string())),
         "card" => UserInputAction::Command(SlashCommand::Card(rest_raw.to_string())),
         "invite" => {
@@ -1193,10 +1554,18 @@ enum LineStyle {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NickColorSpan {
+    ansi: &'static str,
+    start_byte: usize,
+    end_byte: usize,
+}
+
 #[derive(Debug, Clone)]
 struct TranscriptEntry {
     text: String,
     style: LineStyle,
+    nick_span: Option<NickColorSpan>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1730,12 +2099,13 @@ fn spawn_daemon_poller(
 // Chat Session State & Renderer
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-struct SquadMemberView {
-    account_id: u64,
-    handle: String,
-    client_label: Option<String>,
-    live: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SquadMemberView {
+    pub account_id: u64,
+    pub device_id: u64,
+    pub handle: String,
+    pub client_label: Option<String>,
+    pub live: bool,
 }
 
 struct ChatApp {
@@ -1745,6 +2115,11 @@ struct ChatApp {
     own_account_id: u64,
     own_device_id: u64,
     own_handle: String,
+    local_nick: Option<String>,
+    /// Peer session nicks keyed by numeric `(account_id, device_id)`.
+    peer_nicks: HashMap<(u64, u64), String>,
+    room_topic: Option<String>,
+    prev_roster_initialized: bool,
     connected: bool,
     active_party: Option<ActivePartySummary>,
     members: Vec<SquadMemberView>,
@@ -1810,21 +2185,39 @@ impl ChatApp {
     }
 
     fn push_line(&mut self, text: String, style: LineStyle) {
+        self.push_line_colored(text, style, None);
+    }
+
+    fn push_line_colored(
+        &mut self,
+        text: String,
+        style: LineStyle,
+        nick_span: Option<NickColorSpan>,
+    ) {
         while self.transcript.len() >= MAX_TRANSCRIPT_LINES {
             let _ = self.transcript.pop_front();
         }
         let entry = TranscriptEntry {
             text: text.clone(),
             style,
+            nick_span,
         };
         self.transcript.push_back(entry);
 
         if self.tty {
-            self.append_tty_line(&text, style);
+            self.append_tty_line(&text, style, nick_span);
         } else {
             let mut out = io::stdout();
             let _ = writeln!(out, "{text}");
             let _ = out.flush();
+        }
+    }
+
+    fn push_irc_notice(&mut self, msg: &str) {
+        let ts = format_hhmm_now();
+        let safe = sanitize_terminal_inline(msg);
+        if !safe.is_empty() {
+            self.push_line(format!("[{ts}] {safe}"), LineStyle::System);
         }
     }
 
@@ -1842,6 +2235,16 @@ impl ChatApp {
         self.push_line(format!("[{ts}] [error] {safe}"), LineStyle::Error);
     }
 
+    fn own_display_label(&self) -> String {
+        match &self.local_nick {
+            Some(nick) if !self.own_handle.is_empty() => {
+                format!("{nick} (@{})", sanitize_terminal_inline(&self.own_handle))
+            }
+            Some(nick) => format!("{nick} (you)"),
+            None => "you".to_string(),
+        }
+    }
+
     fn format_header_bar(&self) -> String {
         let conn = if self.connected { "connected" } else { "reconnecting" };
         match &self.active_party {
@@ -1850,6 +2253,11 @@ impl ChatApp {
                     "Party".to_string()
                 } else {
                     sanitize_terminal_inline(&p.room_name)
+                };
+                let e2ee_badge = if p.e2ee_mode == 1 {
+                    format!(" [E2EE e{} T{}]", p.mls_epoch, p.trust_tier)
+                } else {
+                    String::new()
                 };
                 let link_part = if !p.room_code.trim().is_empty() {
                     format!(" · clank.party/{}", sanitize_terminal_inline(&p.room_code))
@@ -1865,13 +2273,19 @@ impl ChatApp {
                     .count()
                     .max(usize::from(p.member_count));
                 let mute_tag = if self.muted { " · muted" } else { "" };
+                let topic_part = match &self.room_topic {
+                    Some(t) if !t.is_empty() => format!(" — {}", sanitize_terminal_inline(t)),
+                    _ => String::new(),
+                };
                 format!(
-                    " ● Party: {name}{link_part} · {live_count} live · {conn}{mute_tag}"
+                    " ● Party: {name}{e2ee_badge}{link_part} · {live_count} live · {conn}{mute_tag}{topic_part}"
                 )
             }
             None => {
                 let who = if self.own_handle.is_empty() {
                     String::new()
+                } else if let Some(ref nick) = self.local_nick {
+                    format!(" · {nick} (@{})", sanitize_terminal_inline(&self.own_handle))
                 } else {
                     format!(" · @{}", sanitize_terminal_inline(&self.own_handle))
                 };
@@ -1891,8 +2305,15 @@ impl ChatApp {
         let mut parts = Vec::with_capacity(self.members.len());
         for m in &self.members {
             let dot = if m.live { "●" } else { "○" };
-            let name = format_member_display(m.account_id, &m.handle);
-            let safe_name = sanitize_terminal_inline(&name);
+            let nick = resolve_member_nick(
+                m.account_id,
+                m.device_id,
+                &self.peer_nicks,
+                self.local_nick.as_deref(),
+                self.own_account_id,
+                self.own_device_id,
+            );
+            let safe_name = format_nick_with_handle(nick, m.account_id, &m.handle);
             let tag = match &m.client_label {
                 Some(lbl) if !lbl.is_empty() => format!(" ({})", sanitize_terminal_inline(lbl)),
                 _ => String::new(),
@@ -1906,7 +2327,7 @@ impl ChatApp {
         if let Some((ref notice, _)) = self.status_notice {
             format!("─── {notice} ───")
         } else {
-            "─── Enter send · /card /board /invite /join /friends /members /copy /help /quit ───"
+            "─── Enter send · /me /nick /topic /names /card /board /invite /join /help /quit ───"
                 .to_string()
         }
     }
@@ -1921,6 +2342,28 @@ impl ChatApp {
             LineStyle::System => "\x1b[90m",
             LineStyle::Error => "\x1b[31m",
         }
+    }
+
+    fn format_tty_colored_line(
+        line: &str,
+        style: LineStyle,
+        nick_span: Option<NickColorSpan>,
+    ) -> String {
+        let prefix = Self::ansi_prefix(style);
+        if let Some(span) = nick_span
+            && span.start_byte <= span.end_byte
+            && span.end_byte <= line.len()
+            && line.is_char_boundary(span.start_byte)
+            && line.is_char_boundary(span.end_byte)
+            && let (Some(before), Some(colored), Some(after)) = (
+                line.get(..span.start_byte),
+                line.get(span.start_byte..span.end_byte),
+                line.get(span.end_byte..),
+            )
+        {
+            return format!("{prefix}{before}{}{colored}\x1b[0m{prefix}{after}", span.ansi);
+        }
+        format!("{prefix}{line}")
     }
 
     fn layout(&self) -> TerminalLayout {
@@ -1951,20 +2394,21 @@ impl ChatApp {
             }
             let viewport_rows = usize::from(bottom.saturating_sub(top).saturating_add(1));
 
-            let mut wrapped: Vec<(String, LineStyle)> = Vec::new();
+            let mut wrapped: Vec<(String, LineStyle, Option<NickColorSpan>)> = Vec::new();
             for entry in &self.transcript {
-                for l in wrap_to_cols(&entry.text, layout.cols) {
-                    wrapped.push((l, entry.style));
+                for (lidx, l) in wrap_to_cols(&entry.text, layout.cols).into_iter().enumerate() {
+                    let span = if lidx == 0 { entry.nick_span } else { None };
+                    wrapped.push((l, entry.style, span));
                 }
             }
             let skip = wrapped.len().saturating_sub(viewport_rows);
-            for (idx, (line, style)) in wrapped.iter().skip(skip).enumerate() {
+            for (idx, (line, style, span)) in wrapped.iter().skip(skip).enumerate() {
                 let row = top.saturating_add(u16::try_from(idx).unwrap_or(0));
                 if row > bottom {
                     break;
                 }
-                let prefix = Self::ansi_prefix(*style);
-                let _ = write!(out, "\x1b[{row};1H{prefix}{line}\x1b[0m\x1b[K");
+                let formatted = Self::format_tty_colored_line(line, *style, *span);
+                let _ = write!(out, "\x1b[{row};1H{formatted}\x1b[0m\x1b[K");
             }
         }
 
@@ -2052,22 +2496,25 @@ impl ChatApp {
         );
     }
 
-    fn append_tty_line(&self, text: &str, style: LineStyle) {
+    fn append_tty_line(&self, text: &str, style: LineStyle, nick_span: Option<NickColorSpan>) {
         let layout = self.layout();
         let mut out = io::stdout();
         let _ = write!(out, "\x1b[?25l");
-        let prefix = Self::ansi_prefix(style);
         if let Some((top, bottom)) = layout.transcript_bounds {
             let wrapped = wrap_to_cols(text, layout.cols);
             if bottom > top {
                 let _ = write!(out, "\x1b[{top};{bottom}r");
-                for line in wrapped {
-                    let _ = write!(out, "\x1b[{bottom};1H\r\n{prefix}{line}\x1b[0m\x1b[K");
+                for (idx, line) in wrapped.iter().enumerate() {
+                    let span = if idx == 0 { nick_span } else { None };
+                    let formatted = Self::format_tty_colored_line(line, style, span);
+                    let _ = write!(out, "\x1b[{bottom};1H\r\n{formatted}\x1b[0m\x1b[K");
                 }
             } else if let Some(last) = wrapped.last() {
                 // Single-row transcript viewport on very short terminals (rows 3..=5):
                 // overwrite the viewport row cleanly without scrolling headers/composer.
-                let _ = write!(out, "\x1b[{top};1H{prefix}{last}\x1b[0m\x1b[K");
+                let span = if wrapped.len() == 1 { nick_span } else { None };
+                let formatted = Self::format_tty_colored_line(last, style, span);
+                let _ = write!(out, "\x1b[{top};1H{formatted}\x1b[0m\x1b[K");
             }
         }
         self.write_composer_to(&mut out, layout);
@@ -2107,7 +2554,7 @@ impl ChatApp {
     }
 
     fn apply_members_from_ipc(&mut self, members: &[MemberInfo]) {
-        self.members = members
+        let next: Vec<SquadMemberView> = members
             .iter()
             .map(|m| {
                 let clean_handle = sanitize_terminal_inline(&m.server_handle);
@@ -2117,20 +2564,40 @@ impl ChatApp {
                     .cloned();
                 SquadMemberView {
                     account_id: m.account_id,
+                    device_id: m.device_id,
                     handle: clean_handle,
                     client_label: hint,
                     live: m.connected_p2p || m.connected_mp1,
                 }
             })
             .collect();
+        let notices = if self.prev_roster_initialized {
+            diff_presence_notices(
+                &self.members,
+                &next,
+                &self.peer_nicks,
+                self.local_nick.as_deref(),
+                self.own_account_id,
+                self.own_device_id,
+            )
+        } else {
+            Vec::new()
+        };
+        self.members = next;
+        if !self.members.is_empty() {
+            self.prev_roster_initialized = true;
+        }
         if self.tty {
             self.render_header_and_squad();
+        }
+        for notice in notices {
+            self.push_irc_notice(&notice);
         }
     }
 
     fn apply_members_from_room_enter(&mut self, members: &[RoomMemberIpc]) {
         self.ingest_room_member_hints(members);
-        self.members = members
+        let next: Vec<SquadMemberView> = members
             .iter()
             .map(|m| {
                 let clean_handle = sanitize_terminal_inline(&m.handle);
@@ -2145,14 +2612,34 @@ impl ChatApp {
                 };
                 SquadMemberView {
                     account_id: m.account_id,
+                    device_id: 0,
                     handle: clean_handle,
                     client_label: label,
                     live: m.status.is_empty() || m.status == "live",
                 }
             })
             .collect();
+        let notices = if self.prev_roster_initialized {
+            diff_presence_notices(
+                &self.members,
+                &next,
+                &self.peer_nicks,
+                self.local_nick.as_deref(),
+                self.own_account_id,
+                self.own_device_id,
+            )
+        } else {
+            Vec::new()
+        };
+        self.members = next;
+        if !self.members.is_empty() {
+            self.prev_roster_initialized = true;
+        }
         if self.tty {
             self.render_header_and_squad();
+        }
+        for notice in notices {
+            self.push_irc_notice(&notice);
         }
     }
 
@@ -2176,6 +2663,9 @@ impl ChatApp {
         self.active_party = Some(party.clone());
         if !same_party {
             self.dedup.reset_for_party(Some(pid));
+            self.room_topic = None;
+            self.peer_nicks.clear();
+            self.prev_roster_initialized = false;
         }
 
         if let Ok(members_resp) = rpc_party_members(&mut self.cmd_client, pid).await
@@ -2291,6 +2781,9 @@ impl ChatApp {
     fn enter_lobby(&mut self, notice: &str) {
         self.active_party = None;
         self.members.clear();
+        self.room_topic = None;
+        self.peer_nicks.clear();
+        self.prev_roster_initialized = false;
         self.dedup.reset_for_party(None);
         self.notify_poller();
         if self.tty {
@@ -2319,45 +2812,155 @@ impl ChatApp {
                     body,
                 } => {
                     let clean_body = sanitize_terminal_text(&body, true);
-                    let is_self = provenance.sender_account_id != 0
+                    let is_self_account = provenance.sender_account_id != 0
                         && provenance.sender_account_id == self.own_account_id;
-                    if is_self
+                    let is_self_device = is_self_account
+                        && (provenance.sender_device_id == 0
+                            || provenance.sender_device_id == self.own_device_id);
+                    if is_self_device
                         && self
                             .dedup
                             .consume_matching_echo(EchoKind::Chat, clean_body.trim(), now)
                     {
                         continue;
                     }
-                    let is_mention =
-                        !is_self && text_mentions_handle(&clean_body, &self.own_handle);
                     let ts = format_hhmm_from_ns(timestamp_ns);
-                    let (base_label, base_style) = if is_self {
-                        if provenance.sender_device_id != 0
-                            && provenance.sender_device_id != self.own_device_id
-                        {
-                            let h = sanitize_terminal_inline(&provenance.sender_handle);
-                            (format!("@{h} (agent)"), LineStyle::AgentChat)
-                        } else {
-                            ("you".to_string(), LineStyle::SelfChat)
+                    let peer_nick = resolve_member_nick(
+                        provenance.sender_account_id,
+                        provenance.sender_device_id,
+                        &self.peer_nicks,
+                        self.local_nick.as_deref(),
+                        self.own_account_id,
+                        self.own_device_id,
+                    )
+                    .map(str::to_string);
+                    let verified_handle = sanitize_terminal_inline(&format_member_display(
+                        provenance.sender_account_id,
+                        &provenance.sender_handle,
+                    ));
+                    let sender_color = deterministic_nick_ansi_color(
+                        provenance.sender_account_id,
+                        provenance.sender_device_id,
+                    );
+
+                    match parse_irc_wire_body(&body) {
+                        IrcWireMessage::Nick(new_nick) => {
+                            if is_self_device {
+                                self.local_nick = Some(new_nick.clone());
+                            } else if provenance.sender_account_id != 0 {
+                                self.peer_nicks.insert(
+                                    (provenance.sender_account_id, provenance.sender_device_id),
+                                    new_nick.clone(),
+                                );
+                            }
+                            if self.tty {
+                                self.render_header_and_squad();
+                            }
+                            self.push_line(
+                                format!("[{ts}] * {verified_handle} is now known as {new_nick}"),
+                                LineStyle::System,
+                            );
                         }
-                    } else {
-                        let disp = format_member_display(
-                            provenance.sender_account_id,
-                            &provenance.sender_handle,
-                        );
-                        (sanitize_terminal_inline(&disp), LineStyle::RemoteChat)
-                    };
-                    let (sender_label, style) = if is_mention {
-                        (format!("[MENTION] {base_label}"), LineStyle::Mention)
-                    } else {
-                        (base_label, base_style)
-                    };
-                    self.emit_multiline(&ts, &sender_label, &clean_body, style);
-                    if !is_history && !is_self {
-                        if is_mention {
-                            mention_bel = true;
-                        } else {
-                            ring_bel = true;
+                        IrcWireMessage::Topic(new_topic) => {
+                            self.room_topic = Some(new_topic.clone());
+                            if self.tty {
+                                self.render_header_and_squad();
+                            }
+                            let who = if is_self_device {
+                                self.own_display_label()
+                            } else {
+                                format_nick_with_handle(
+                                    peer_nick.as_deref(),
+                                    provenance.sender_account_id,
+                                    &provenance.sender_handle,
+                                )
+                            };
+                            self.push_line(
+                                format!("[{ts}] * {who} set topic: {new_topic}"),
+                                LineStyle::System,
+                            );
+                        }
+                        IrcWireMessage::Action(action_text) => {
+                            let is_mention = !is_self_device
+                                && text_mentions_handle(&action_text, &self.own_handle);
+                            let base_label = if is_self_device {
+                                self.own_display_label()
+                            } else if is_self_account {
+                                match peer_nick.as_deref() {
+                                    Some(n) => format!("{n} ({verified_handle})"),
+                                    None => format!("{verified_handle} (agent)"),
+                                }
+                            } else {
+                                format_nick_with_handle(
+                                    peer_nick.as_deref(),
+                                    provenance.sender_account_id,
+                                    &provenance.sender_handle,
+                                )
+                            };
+                            let (label, style, color) = if is_mention {
+                                (
+                                    format!("[MENTION] {base_label}"),
+                                    LineStyle::Mention,
+                                    None,
+                                )
+                            } else if is_self_device {
+                                (base_label, LineStyle::SelfChat, None)
+                            } else if is_self_account {
+                                (base_label, LineStyle::AgentChat, Some(sender_color))
+                            } else {
+                                (base_label, LineStyle::RemoteChat, Some(sender_color))
+                            };
+                            self.emit_action_line(&ts, &label, &action_text, style, color);
+                            if !is_history && !is_self_device {
+                                if is_mention {
+                                    mention_bel = true;
+                                } else {
+                                    ring_bel = true;
+                                }
+                            }
+                        }
+                        IrcWireMessage::Plain(plain_body) => {
+                            let is_mention = !is_self_device
+                                && text_mentions_handle(&plain_body, &self.own_handle);
+                            let (base_label, base_style, base_color) = if is_self_device {
+                                (self.own_display_label(), LineStyle::SelfChat, None)
+                            } else if is_self_account {
+                                let lbl = match peer_nick.as_deref() {
+                                    Some(n) => format!("{n} ({verified_handle})"),
+                                    None => format!("{verified_handle} (agent)"),
+                                };
+                                (lbl, LineStyle::AgentChat, Some(sender_color))
+                            } else {
+                                let lbl = format_nick_with_handle(
+                                    peer_nick.as_deref(),
+                                    provenance.sender_account_id,
+                                    &provenance.sender_handle,
+                                );
+                                (lbl, LineStyle::RemoteChat, Some(sender_color))
+                            };
+                            let (sender_label, style, color) = if is_mention {
+                                (
+                                    format!("[MENTION] {base_label}"),
+                                    LineStyle::Mention,
+                                    None,
+                                )
+                            } else {
+                                (base_label, base_style, base_color)
+                            };
+                            self.emit_multiline_colored(
+                                &ts,
+                                &sender_label,
+                                &plain_body,
+                                style,
+                                color,
+                            );
+                            if !is_history && !is_self_device {
+                                if is_mention {
+                                    mention_bel = true;
+                                } else {
+                                    ring_bel = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -2470,12 +3073,50 @@ impl ChatApp {
     }
 
     fn emit_multiline(&mut self, ts: &str, label: &str, body: &str, style: LineStyle) {
+        self.emit_multiline_colored(ts, label, body, style, None);
+    }
+
+    fn emit_multiline_colored(
+        &mut self,
+        ts: &str,
+        label: &str,
+        body: &str,
+        style: LineStyle,
+        nick_color: Option<&'static str>,
+    ) {
         let mut lines = body.split('\n');
         let first = lines.next().unwrap_or_default();
-        self.push_line(format!("[{ts}] {label}: {first}"), style);
+        let prefix = format!("[{ts}] ");
+        let start_byte = prefix.len();
+        let end_byte = start_byte.saturating_add(label.len());
+        let span = nick_color.map(|ansi| NickColorSpan {
+            ansi,
+            start_byte,
+            end_byte,
+        });
+        self.push_line_colored(format!("{prefix}{label}: {first}"), style, span);
         for cont in lines {
             self.push_line(format!("        {cont}"), style);
         }
+    }
+
+    fn emit_action_line(
+        &mut self,
+        ts: &str,
+        label: &str,
+        action: &str,
+        style: LineStyle,
+        nick_color: Option<&'static str>,
+    ) {
+        let prefix = format!("[{ts}] * ");
+        let start_byte = prefix.len();
+        let end_byte = start_byte.saturating_add(label.len());
+        let span = nick_color.map(|ansi| NickColorSpan {
+            ansi,
+            start_byte,
+            end_byte,
+        });
+        self.push_line_colored(format!("{prefix}{label} {action}"), style, span);
     }
 
     fn emit_card_lines(&mut self, ts: &str, label: &str, lines: &[String], style: LineStyle) {
@@ -2576,7 +3217,8 @@ impl ChatApp {
         match send_res {
             Ok(raw) => match decode_send_result_resp(&raw) {
                 Ok(resp) => {
-                    self.emit_multiline(&ts, "you", &clean_body, LineStyle::SelfChat);
+                    let own_label = self.own_display_label();
+                    self.emit_multiline(&ts, &own_label, &clean_body, LineStyle::SelfChat);
                     if !resp.withheld_unpinned.is_empty() {
                         self.set_status_notice(format!(
                             "Sent (withheld from {} unpinned peer(s))",
@@ -2596,8 +3238,161 @@ impl ChatApp {
         }
     }
 
+    async fn send_irc_wire_chat(&mut self, wire_body: &str) -> Result<(), String> {
+        if let Err(reason) = check_chat_secret_refusal(wire_body, self.local_secret_refs()) {
+            return Err(reason.to_string());
+        }
+        let Some(party_id) = self.active_party.as_ref().map(|p| p.party_id) else {
+            return Err("Not in a party. Run /invite or /join first.".to_string());
+        };
+        let client_msg_id = random_safe_id()?;
+        let req = PartySendChatReq {
+            party_id,
+            client_msg_id,
+            room_scope: "party/main".to_string(),
+            target_device_id: None,
+            body: wire_body.to_string(),
+        };
+        let encoded = encode_party_send_chat_req(&req).map_err(|e| e.to_string())?;
+        let clean_echo = sanitize_terminal_text(wire_body, true);
+        let echo_id = self.dedup.record_local_echo(
+            EchoKind::Chat,
+            clean_echo.trim().to_string(),
+            Instant::now(),
+        );
+        match self
+            .cmd_client
+            .request(IpcOpcode::PartySendChat, encoded)
+            .await
+        {
+            Ok(raw) => match decode_send_result_resp(&raw) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    self.dedup.cancel_local_echo(echo_id);
+                    Err(e.to_string())
+                }
+            },
+            Err(e) => {
+                self.dedup.cancel_local_echo(echo_id);
+                Err(format!("send failed: {e}"))
+            }
+        }
+    }
+
     async fn handle_slash_command(&mut self, cmd: SlashCommand) {
         match cmd {
+            SlashCommand::Me(raw_action) => {
+                let action = sanitize_terminal_inline(&raw_action);
+                if action.is_empty() {
+                    self.push_system("Usage: /me <action>");
+                    return;
+                }
+                let wire = if self.active_party.as_ref().is_some_and(|p| p.e2ee_mode == 1) {
+                    encode_irc_wire_json(&IrcWireMessage::Action(action.clone()))
+                        .unwrap_or_else(|| format!("/me {action}"))
+                } else {
+                    format!("/me {action}")
+                };
+                match self.send_irc_wire_chat(&wire).await {
+                    Ok(()) => {
+                        let ts = format_hhmm_now();
+                        let label = self.own_display_label();
+                        self.emit_action_line(&ts, &label, &action, LineStyle::SelfChat, None);
+                    }
+                    Err(e) => self.push_error(&e),
+                }
+            }
+            SlashCommand::Nick(raw_nick) => {
+                if raw_nick.trim().is_empty() {
+                    match &self.local_nick {
+                        Some(n) => self.push_system(&format!(
+                            "Current session nick: {n} (@{})",
+                            sanitize_terminal_inline(&self.own_handle)
+                        )),
+                        None => self.push_system("Usage: /nick <name> (1..=32 printable chars)"),
+                    }
+                    return;
+                }
+                if let Err(reason) = check_chat_secret_refusal(&raw_nick, self.local_secret_refs())
+                {
+                    self.push_error(reason);
+                    return;
+                }
+                let clean_nick = match validate_session_nick(&raw_nick) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        self.push_error(e);
+                        return;
+                    }
+                };
+                if self.active_party.is_some() {
+                    let wire = encode_irc_wire_json(&IrcWireMessage::Nick(clean_nick.clone()))
+                        .unwrap_or_else(|| format!("/nick {clean_nick}"));
+                    if let Err(e) = self.send_irc_wire_chat(&wire).await {
+                        self.push_error(&e);
+                        return;
+                    }
+                }
+                self.local_nick = Some(clean_nick.clone());
+                if self.tty {
+                    self.render_header_and_squad();
+                }
+                let verified = sanitize_terminal_inline(&format_member_display(
+                    self.own_account_id,
+                    &self.own_handle,
+                ));
+                self.push_irc_notice(&format!("* {verified} is now known as {clean_nick}"));
+            }
+            SlashCommand::Topic(raw_topic) => {
+                let trimmed = raw_topic.trim();
+                if trimmed.is_empty() {
+                    match &self.room_topic {
+                        Some(t) => self.push_irc_notice(&format!("* Topic is: {t}")),
+                        None => self.push_irc_notice("* No topic is set."),
+                    }
+                    return;
+                }
+                if let Err(reason) = check_chat_secret_refusal(trimmed, self.local_secret_refs()) {
+                    self.push_error(reason);
+                    return;
+                }
+                let clean_topic = match validate_room_topic(trimmed) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        self.push_error(e);
+                        return;
+                    }
+                };
+                if self.active_party.is_some() {
+                    let wire = encode_irc_wire_json(&IrcWireMessage::Topic(clean_topic.clone()))
+                        .unwrap_or_else(|| format!("/topic {clean_topic}"));
+                    if let Err(e) = self.send_irc_wire_chat(&wire).await {
+                        self.push_error(&e);
+                        return;
+                    }
+                }
+                self.room_topic = Some(clean_topic.clone());
+                if self.tty {
+                    self.render_header_and_squad();
+                }
+                let who = self.own_display_label();
+                self.push_irc_notice(&format!("* {who} set topic: {clean_topic}"));
+            }
+            SlashCommand::Names => {
+                if self.active_party.is_none() {
+                    self.push_system("Not in a party. Run /invite or /join first.");
+                    return;
+                }
+                self.refresh_members().await;
+                let line = format_irc_names_line(
+                    &self.members,
+                    &self.peer_nicks,
+                    self.local_nick.as_deref(),
+                    self.own_account_id,
+                    self.own_device_id,
+                );
+                self.push_irc_notice(&line);
+            }
             SlashCommand::Board(text) => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
@@ -2794,23 +3589,29 @@ impl ChatApp {
                             sanitize_terminal_inline(&resp.name)
                         };
                         let code = sanitize_terminal_inline(&resp.room_code);
+                        let attached = rpc_party_list(&mut self.cmd_client)
+                            .await
+                            .ok()
+                            .and_then(|list| {
+                                list.parties.into_iter().find(|p| p.party_id == resp.party_id)
+                            });
+                        let security_note = if attached.as_ref().is_some_and(|p| p.e2ee_mode == 1) {
+                            "MLS E2EE enabled"
+                        } else {
+                            "standard room (TLS 1.3)"
+                        };
                         if code.is_empty() {
                             self.push_system(&format!(
-                                "Joined {name} · {} live (mp2 rooms are server-persisted over TLS 1.3, not E2EE)",
+                                "Joined {name} · {} live ({security_note})",
                                 resp.members.len()
                             ));
                         } else {
                             self.push_system(&format!(
-                                "Joined {name} (code {code}) · {} live (mp2 rooms are server-persisted over TLS 1.3, not E2EE)",
+                                "Joined {name} (code {code}) · {} live ({security_note})",
                                 resp.members.len()
                             ));
                         }
-                        if let Ok(list) = rpc_party_list(&mut self.cmd_client).await
-                            && let Some(p) = list
-                                .parties
-                                .into_iter()
-                                .find(|p| p.party_id == resp.party_id)
-                        {
+                        if let Some(p) = attached {
                             self.attach_to_party(p, false).await;
                         } else {
                             let summary = ActivePartySummary {
@@ -2978,7 +3779,7 @@ impl ChatApp {
             }
             SlashCommand::Help => {
                 self.push_system(
-                    "Commands: /board <text> · /card <title> | <summary> · /invite [@handle] · /join [@handle|CODE|url] · /leave · /friends · /add @handle · /members · /copy · /mute · /help · /quit",
+                    "Commands: /me <action> · /nick <name> · /topic [text] · /names · /board <text> · /card <title> | <summary> · /invite [@handle] · /join [@handle|CODE|url] · /leave · /friends · /add @handle · /members · /copy · /mute · /help · /quit",
                 );
             }
             SlashCommand::Quit => {
@@ -3041,6 +3842,10 @@ pub async fn cmd_chat(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
         own_account_id: status.account_id,
         own_device_id: device_id,
         own_handle: sanitize_terminal_inline(&status.handle),
+        local_nick: chat_args.nick.clone(),
+        peer_nicks: HashMap::new(),
+        room_topic: None,
+        prev_roster_initialized: false,
         connected: true,
         active_party: None,
         members: Vec::new(),
@@ -3747,5 +4552,203 @@ mod tests {
         assert!(text_mentions_handle("hey @alice:agent run tests", "alice"));
         assert!(text_mentions_handle("@alice's agent check diff", "alice"));
         assert!(!text_mentions_handle("email foo@alice.com", "alice"));
+    }
+
+    #[test]
+    fn irc_commands_args_wire_json_and_anti_spoofing() -> Result<(), String> {
+        // CLI `--nick` flag parsing + validation
+        let args = parse_chat_args(&[
+            "--nick".to_string(),
+            "build-01".to_string(),
+            "--no-tty".to_string(),
+        ])?;
+        assert_eq!(args.nick.as_deref(), Some("build-01"));
+        assert!(args.no_tty);
+
+        // Anti-spoofing: reject `@handle`, whitespace, brackets/parens, empty, and >32 chars
+        assert!(parse_chat_args(&["--nick".to_string(), "@alice".to_string()]).is_err());
+        assert!(validate_session_nick("@bob").is_err());
+        assert!(validate_session_nick("alice (@bob)").is_err());
+        assert!(validate_session_nick("two words").is_err());
+        assert!(validate_session_nick("").is_err());
+        assert!(validate_session_nick(&"a".repeat(33)).is_err());
+        assert_eq!(validate_session_nick(&"a".repeat(32)), Ok("a".repeat(32)));
+
+        // ANSI / OSC / BiDi injection inside nick is stripped cleanly
+        assert_eq!(
+            validate_session_nick("\x1b[31mcodex-box\x1b[0m\u{202E}"),
+            Ok("codex-box".to_string())
+        );
+
+        // Verified `@handle` is ALWAYS paired with session nick (never spoofs another operator)
+        assert_eq!(
+            format_nick_with_handle(Some("build-01"), 1001, "patrick"),
+            "build-01 (@patrick)"
+        );
+        assert_eq!(
+            format_nick_with_handle(None, 1001, "patrick"),
+            "@patrick"
+        );
+        // Invalid hostile nick falls back to verified `@handle` only
+        assert_eq!(
+            format_nick_with_handle(Some("@evil"), 1001, "patrick"),
+            "@patrick"
+        );
+
+        // Slash command parsing for `/me`, `/nick`, `/topic`, `/names`
+        assert_eq!(
+            parse_user_input("/me builds v0.7.1"),
+            UserInputAction::Command(SlashCommand::Me("builds v0.7.1".to_string()))
+        );
+        assert_eq!(
+            parse_user_input("/nick laptop"),
+            UserInputAction::Command(SlashCommand::Nick("laptop".to_string()))
+        );
+        assert_eq!(
+            parse_user_input("/topic Launch review — Lane C"),
+            UserInputAction::Command(SlashCommand::Topic(
+                "Launch review — Lane C".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_user_input("/topic"),
+            UserInputAction::Command(SlashCommand::Topic(String::new()))
+        );
+        assert_eq!(
+            parse_user_input("/names"),
+            UserInputAction::Command(SlashCommand::Names)
+        );
+
+        // Shared E2EE JSON wire encoding (`{"mp_irc":1,...}` first key for browser `room-app.js` interop!)
+        let nick_json = encode_irc_wire_json(&IrcWireMessage::Nick("codex-box".to_string()));
+        assert_eq!(
+            nick_json.as_deref(),
+            Some("{\"mp_irc\":1,\"t\":\"nick\",\"nick\":\"codex-box\"}")
+        );
+        let me_json = encode_irc_wire_json(&IrcWireMessage::Action("runs cargo test".to_string()));
+        assert_eq!(
+            me_json.as_deref(),
+            Some("{\"mp_irc\":1,\"t\":\"me\",\"text\":\"runs cargo test\"}")
+        );
+        let topic_json = encode_irc_wire_json(&IrcWireMessage::Topic("E2EE Launch".to_string()));
+        assert_eq!(
+            topic_json.as_deref(),
+            Some("{\"mp_irc\":1,\"t\":\"topic\",\"topic\":\"E2EE Launch\"}")
+        );
+
+        // Parsing BOTH shared JSON `mp_irc: 1` AND prefix conventions + sanitizing hostile escapes
+        assert_eq!(
+            parse_irc_wire_body(r#"{"mp_irc":1,"t":"nick","nick":"\u001b[31mbuild-02\u001b[0m"}"#),
+            IrcWireMessage::Nick("build-02".to_string())
+        );
+        assert_eq!(
+            parse_irc_wire_body(r#"{"mp_irc":1,"t":"me","text":"ships \u001b]0;pwn\u0007v0.7.1"}"#),
+            IrcWireMessage::Action("ships v0.7.1".to_string())
+        );
+        assert_eq!(
+            parse_irc_wire_body("{\"mp_irc\":1,\"t\":\"topic\",\"topic\":\"Sprint \u{202E}42\"}"),
+            IrcWireMessage::Topic("Sprint 42".to_string())
+        );
+        assert_eq!(
+            parse_irc_wire_body("/me deploys cleanly"),
+            IrcWireMessage::Action("deploys cleanly".to_string())
+        );
+        // Hostile nick attempting handle spoof inside JSON is rejected as nick (falls through sanitized)
+        assert!(matches!(
+            parse_irc_wire_body("{\"mp_irc\":1,\"t\":\"nick\",\"nick\":\"@admin\"}"),
+            IrcWireMessage::Plain(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn irc_joinlines_partlines_names_and_deterministic_nick_colors() {
+        let mut peer_nicks: HashMap<(u64, u64), String> = HashMap::new();
+        peer_nicks.insert((1001, 2002), "build-01".to_string());
+        peer_nicks.insert((1002, 3001), "bob-mac".to_string());
+
+        let m_self = SquadMemberView {
+            account_id: 1001,
+            device_id: 2001,
+            handle: "patrick".to_string(),
+            client_label: Some("outpost".to_string()),
+            live: true,
+        };
+        let m_sibling = SquadMemberView {
+            account_id: 1001,
+            device_id: 2002,
+            handle: "patrick".to_string(),
+            client_label: Some("codex".to_string()),
+            live: true,
+        };
+        let m_bob = SquadMemberView {
+            account_id: 1002,
+            device_id: 3001,
+            handle: "bob".to_string(),
+            client_label: Some("claude".to_string()),
+            live: true,
+        };
+
+        // Sibling device joins -> joinline pairs nick + verified @handle + client
+        let notices_join = diff_presence_notices(
+            std::slice::from_ref(&m_self),
+            &[m_self.clone(), m_sibling.clone(), m_bob.clone()],
+            &peer_nicks,
+            Some("laptop"),
+            1001,
+            2001,
+        );
+        assert_eq!(
+            notices_join,
+            vec![
+                "--> build-01 (@patrick · codex) has joined".to_string(),
+                "--> bob-mac (@bob · claude) has joined".to_string(),
+            ]
+        );
+
+        // Bob leaves -> partline pairs nick + verified @handle
+        let notices_part = diff_presence_notices(
+            &[m_self.clone(), m_sibling.clone(), m_bob],
+            &[m_self.clone(), m_sibling.clone()],
+            &peer_nicks,
+            Some("laptop"),
+            1001,
+            2001,
+        );
+        assert_eq!(notices_part, vec!["<-- bob-mac (@bob) has left".to_string()]);
+
+        // `/names` formats compact IRC roster line
+        let names = format_irc_names_line(
+            &[m_self, m_sibling],
+            &peer_nicks,
+            Some("laptop"),
+            1001,
+            2001,
+        );
+        assert_eq!(
+            names,
+            "[Users: laptop (@patrick · outpost · live), build-01 (@patrick · codex · live)]"
+        );
+
+        // Deterministic subtle ANSI nick color is stable per (account_id, device_id)
+        let c1 = deterministic_nick_ansi_color(1001, 2001);
+        let c1_again = deterministic_nick_ansi_color(1001, 2001);
+        assert_eq!(c1, c1_again);
+        assert!(c1.starts_with("\x1b[") && c1.ends_with('m'));
+
+        // TTY color helper wraps ONLY the sanitized sender slice safely
+        let rendered = ChatApp::format_tty_colored_line(
+            "[12:34] build-01 (@patrick): hi",
+            LineStyle::RemoteChat,
+            Some(NickColorSpan {
+                ansi: "\x1b[36m",
+                start_byte: 8,
+                end_byte: 27,
+            }),
+        );
+        assert_eq!(
+            rendered,
+            "\x1b[0m[12:34] \x1b[36mbuild-01 (@patrick)\x1b[0m\x1b[0m: hi"
+        );
     }
 }
