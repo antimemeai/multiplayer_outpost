@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 description = "Standalone E2EE sidecar CLI, daemon, and MCP server for multiplayer.tech"
 homepage = "https://multiplayer.tech"
-repository = "https://github.com/antimeme-ai/multiplayer_outpost"
+repository = "https://github.com/antimeme-ai/outpost"
 
 [[bin]]
 name = "mp-outpost"
@@ -21,15 +21,15 @@ test-tls-overrides = ["outpost-daemon/test-tls-overrides"]
 pkg-fmt = "tgz"
 
 [package.metadata.binstall.overrides.aarch64-apple-darwin]
-pkg-url = "https://github.com/antimeme-ai/multiplayer_outpost/releases/download/v{ version }/mp-outpost-v{ version }-darwin-arm64.tar.gz"
+pkg-url = "https://github.com/antimeme-ai/outpost/releases/download/v{ version }/mp-outpost-v{ version }-darwin-arm64.tar.gz"
 bin-dir = "mp-outpost-v{ version }-darwin-arm64/{ bin }{ binary-ext }"
 
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
-pkg-url = "https://github.com/antimeme-ai/multiplayer_outpost/releases/download/v{ version }/mp-outpost-v{ version }-linux-x86_64.tar.gz"
+pkg-url = "https://github.com/antimeme-ai/outpost/releases/download/v{ version }/mp-outpost-v{ version }-linux-x86_64.tar.gz"
 bin-dir = "mp-outpost-v{ version }-linux-x86_64/{ bin }{ binary-ext }"
 
 [package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
-pkg-url = "https://github.com/antimeme-ai/multiplayer_outpost/releases/download/v{ version }/mp-outpost-v{ version }-linux-arm64.tar.gz"
+pkg-url = "https://github.com/antimeme-ai/outpost/releases/download/v{ version }/mp-outpost-v{ version }-linux-arm64.tar.gz"
 bin-dir = "mp-outpost-v{ version }-linux-arm64/{ bin }{ binary-ext }"
 
 [dependencies]
