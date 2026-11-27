@@ -76,7 +76,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --workspace --locked --exclude outpost-p2p
-          cargo test -p outpost-p2p --locked -- --test-threads=2
+          cargo test -p outpost-p2p --locked -- --test-threads=1
           cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build, verify, and package release tarball

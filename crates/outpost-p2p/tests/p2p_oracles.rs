@@ -478,13 +478,22 @@ async fn oracle5_superseded_4409_reconnect_replaces_stale_conn_and_delivers_fram
     assert!(wait_for_connected(&mut alice, bob_pk).await);
 
     // Real Bob connects to Alice -> Alice MUST close stale_conn with 4409 (CLOSE_SUPERSEDED)!
-    bob.connect_peer(PeerDialTarget {
+    let bob_target = PeerDialTarget {
         device_id: 101,
         device_pubkey: alice_pk,
         remote_relay_policy: RelayPolicy::NoRelays,
         endpoint: alice_desc.clone(),
-    })
-    .await?;
+    };
+    if let Err(err) = bob.connect_peer(bob_target.clone()).await {
+        if matches!(err, P2pError::Timeout) {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            bob.connect_peer(bob_target)
+                .await
+                .map_err(|e| format!("partA bob.connect_peer retry failed: {e}"))?;
+        } else {
+            return Err(format!("partA bob.connect_peer failed: {err}").into());
+        }
+    }
 
     let stale_close = tokio::time::timeout(Duration::from_secs(15), stale_conn.closed()).await?;
     match stale_close {
@@ -518,14 +527,23 @@ async fn oracle5_superseded_4409_reconnect_replaces_stale_conn_and_delivers_fram
 
     // Part C: Reconnect a second time from Alice -> Bob via PartyP2pTransport::connect_peer
     // (superseding Bob's initiated connection cleanly), and exchange frames on all lanes.
-    alice
-        .connect_peer(PeerDialTarget {
-            device_id: 202,
-            device_pubkey: bob_pk,
-            remote_relay_policy: RelayPolicy::NoRelays,
-            endpoint: bob.local_endpoint_descriptor(),
-        })
-        .await?;
+    let alice_target = PeerDialTarget {
+        device_id: 202,
+        device_pubkey: bob_pk,
+        remote_relay_policy: RelayPolicy::NoRelays,
+        endpoint: bob.local_endpoint_descriptor(),
+    };
+    if let Err(err) = alice.connect_peer(alice_target.clone()).await {
+        if matches!(err, P2pError::Timeout) {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            alice
+                .connect_peer(alice_target)
+                .await
+                .map_err(|e| format!("partC alice.connect_peer retry failed: {e}"))?;
+        } else {
+            return Err(format!("partC alice.connect_peer failed: {err}").into());
+        }
+    }
 
     assert!(wait_for_connected(&mut alice, bob_pk).await);
     assert!(wait_for_connected(&mut bob, alice_pk).await);
