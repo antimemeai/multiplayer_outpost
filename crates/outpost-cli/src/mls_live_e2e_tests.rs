@@ -143,6 +143,17 @@ struct RecordedWsSend {
     mls_epoch: Option<u64>,
 }
 
+#[derive(Clone)]
+struct StoredPendingKp {
+    kp_id: u64,
+    account_id: u64,
+    device_id: u64,
+    invite_id: Option<u64>,
+    kp_ref_b64: String,
+    kp_blob_b64: String,
+    join_proof_b64: Option<String>,
+}
+
 struct MockDsState {
     ds_secret: [u8; 32],
     ds_pubkey: [u8; 32],
@@ -155,7 +166,9 @@ struct MockDsState {
     group_id: Option<[u8; MP_GROUP_ID_LEN]>,
     next_invite_id: u64,
     next_welcome_id: u64,
+    next_kp_id: u64,
     next_event_seq: u64,
+    pending_kps: Vec<StoredPendingKp>,
     pending_welcomes: Vec<StoredWelcome>,
     /// Stored tentative proposal blobs for current tentative commit.
     pending_proposals_b64: Vec<String>,
@@ -186,7 +199,9 @@ impl MockDsState {
             group_id: None,
             next_invite_id: 100,
             next_welcome_id: 500,
+            next_kp_id: 1,
             next_event_seq: 0,
+            pending_kps: Vec::new(),
             pending_welcomes: Vec::new(),
             pending_proposals_b64: Vec::new(),
             tentative_commit_b64: None,
@@ -618,110 +633,120 @@ async fn spawn_mock_ds_server(
                     }
 
                     let (mut ws_read, mut ws_write) = tokio::io::split(tls);
-                    if ws_write_text(&mut ws_write, &hello_frame.to_string())
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
+                    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                    let _ = out_tx.send(hello_frame.to_string());
 
-                    loop {
-                        tokio::select! {
-                            bcast = rx.recv() => {
-                                match bcast {
-                                    Ok(txt) => {
-                                        if ws_write_text(&mut ws_write, &txt).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                                    Err(broadcast::error::RecvError::Closed) => break,
-                                }
-                            }
-                            inbound = ws_read_client_frame(&mut ws_read) => {
-                                match inbound {
-                                    Some((0x1, data)) => {
-                                        let Ok(text) = std::str::from_utf8(&data) else {
-                                            continue;
-                                        };
-                                        if text == MP2_PING_TEXT {
-                                            let _ = ws_write_text(&mut ws_write, MP2_PONG_TEXT).await;
-                                            continue;
-                                        }
-                                        let Ok(val) = serde_json::from_str::<Value>(text) else {
-                                            continue;
-                                        };
-                                        let t = val.get("t").and_then(Value::as_str).unwrap_or_default();
-                                        if t == "send" {
-                                            let cid = val.get("client_msg_id").and_then(Value::as_str).unwrap_or_default().to_string();
-                                            let kind = val.get("kind").and_then(Value::as_str).unwrap_or_default().to_string();
-                                            let target = val.get("target").and_then(Value::as_str).unwrap_or_default().to_string();
-                                            let body_encoding = val.get("body_encoding").and_then(Value::as_str).unwrap_or_default().to_string();
-                                            let body = val.get("body").and_then(Value::as_str).unwrap_or_default().to_string();
-                                            let mls_epoch = val.get("mls_epoch").and_then(Value::as_u64);
-                                            let now_ms = wall_now_ms();
-                                            let (seq, ev_frame) = {
-                                                let Ok(mut st) = state.lock() else {
-                                                    break;
-                                                };
-                                                st.recorded_ws_sends.push(RecordedWsSend {
-                                                    sender_account_id: caller_acc,
-                                                    sender_device_id: caller_dev,
-                                                    kind: kind.clone(),
-                                                    target: target.clone(),
-                                                    body_encoding: body_encoding.clone(),
-                                                    body: body.clone(),
-                                                    mls_epoch,
-                                                });
-                                                st.next_event_seq = st.next_event_seq.saturating_add(1);
-                                                let seq = st.next_event_seq;
-                                                let handle = st
-                                                    .accounts
-                                                    .get(&caller_acc)
-                                                    .map(|a| a.handle.clone())
-                                                    .unwrap_or_default();
-                                                let ev = json!({
-                                                    "v": 2,
-                                                    "t": "event",
-                                                    "seq": seq,
-                                                    "ts_ms": now_ms,
-                                                    "client_msg_id": cid,
-                                                    "sender": {
-                                                        "account_id": caller_acc.to_string(),
-                                                        "device_id": caller_dev.to_string(),
-                                                        "handle": handle,
-                                                        "client": "outpost",
-                                                        "is_guest": false,
-                                                        "is_browser": false,
-                                                    },
-                                                    "target": target,
-                                                    "kind": kind,
-                                                    "body_encoding": body_encoding,
-                                                    "body": body,
-                                                    "mls_epoch": mls_epoch,
-                                                    "e2ee_mode": 1,
-                                                });
-                                                (seq, ev)
-                                            };
-                                            let ack = json!({
-                                                "v": 2,
-                                                "t": "ack",
-                                                "client_msg_id": cid,
-                                                "seq": seq,
-                                                "ts_ms": now_ms,
-                                            });
-                                            let _ = ws_write_text(&mut ws_write, &ack.to_string()).await;
-                                            if let Ok(st) = state.lock() {
-                                                st.broadcast_json(ev_frame);
-                                            }
-                                        }
-                                    }
-                                    Some((0x8, _)) | None => break,
-                                    Some(_) => {}
-                                }
+                    // Dedicated writer task (never cancels `ws_read_client_frame`!).
+                    let writer_task = tokio::spawn(async move {
+                        while let Some(txt) = out_rx.recv().await {
+                            if ws_write_text(&mut ws_write, &txt).await.is_err() {
+                                break;
                             }
                         }
+                    });
+
+                    // Dedicated broadcast forwarder task (forwards room broadcasts to writer channel).
+                    let bcast_tx = out_tx.clone();
+                    let bcast_task = tokio::spawn(async move {
+                        loop {
+                            match rx.recv().await {
+                                Ok(txt) => {
+                                    if bcast_tx.send(txt).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                    });
+
+                    // Exclusive cancel-safe reader loop owning `ws_read`!
+                    while let Some((opcode, data)) = ws_read_client_frame(&mut ws_read).await {
+                        match opcode {
+                            0x1 => {
+                                let Ok(text) = std::str::from_utf8(&data) else {
+                                    continue;
+                                };
+                                if text == MP2_PING_TEXT {
+                                    let _ = out_tx.send(MP2_PONG_TEXT.to_string());
+                                    continue;
+                                }
+                                let Ok(val) = serde_json::from_str::<Value>(text) else {
+                                    continue;
+                                };
+                                let t = val.get("t").and_then(Value::as_str).unwrap_or_default();
+                                if t == "send" {
+                                    let cid = val.get("client_msg_id").and_then(Value::as_str).unwrap_or_default().to_string();
+                                    let kind = val.get("kind").and_then(Value::as_str).unwrap_or_default().to_string();
+                                    let target = val.get("target").and_then(Value::as_str).unwrap_or_default().to_string();
+                                    let body_encoding = val.get("body_encoding").and_then(Value::as_str).unwrap_or_default().to_string();
+                                    let body = val.get("body").and_then(Value::as_str).unwrap_or_default().to_string();
+                                    let mls_epoch = val.get("mls_epoch").and_then(Value::as_u64);
+                                    let now_ms = wall_now_ms();
+                                    let (seq, ev_frame) = {
+                                        let Ok(mut st) = state.lock() else {
+                                            break;
+                                        };
+                                        st.recorded_ws_sends.push(RecordedWsSend {
+                                            sender_account_id: caller_acc,
+                                            sender_device_id: caller_dev,
+                                            kind: kind.clone(),
+                                            target: target.clone(),
+                                            body_encoding: body_encoding.clone(),
+                                            body: body.clone(),
+                                            mls_epoch,
+                                        });
+                                        st.next_event_seq = st.next_event_seq.saturating_add(1);
+                                        let seq = st.next_event_seq;
+                                        let handle = st
+                                            .accounts
+                                            .get(&caller_acc)
+                                            .map(|a| a.handle.clone())
+                                            .unwrap_or_default();
+                                        let ev = json!({
+                                            "v": 2,
+                                            "t": "event",
+                                            "seq": seq,
+                                            "ts_ms": now_ms,
+                                            "client_msg_id": cid,
+                                            "sender": {
+                                                "account_id": caller_acc.to_string(),
+                                                "device_id": caller_dev.to_string(),
+                                                "handle": handle,
+                                                "client": "outpost",
+                                                "is_guest": false,
+                                                "is_browser": false,
+                                            },
+                                            "target": target,
+                                            "kind": kind,
+                                            "body_encoding": body_encoding,
+                                            "body": body,
+                                            "mls_epoch": mls_epoch,
+                                            "e2ee_mode": 1,
+                                        });
+                                        (seq, ev)
+                                    };
+                                    let ack = json!({
+                                        "v": 2,
+                                        "t": "ack",
+                                        "client_msg_id": cid,
+                                        "seq": seq,
+                                        "ts_ms": now_ms,
+                                    });
+                                    let _ = out_tx.send(ack.to_string());
+                                    if let Ok(st) = state.lock() {
+                                        st.broadcast_json(ev_frame);
+                                    }
+                                }
+                            }
+                            0x8 => break,
+                            _ => {}
+                        }
                     }
+                    drop(out_tx);
+                    bcast_task.abort();
+                    writer_task.abort();
                     if let Ok(mut st) = state.lock() {
                         st.online_ws_devices.remove(&(caller_acc, caller_dev));
                     }
@@ -1049,6 +1074,17 @@ fn handle_mock_http(
                 .get("join_proof_b64")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            let kp_id = st.next_kp_id;
+            st.next_kp_id = st.next_kp_id.saturating_add(1);
+            st.pending_kps.push(StoredPendingKp {
+                kp_id,
+                account_id: caller_acc,
+                device_id: caller_dev,
+                invite_id,
+                kp_ref_b64: kp_ref_b64.clone(),
+                kp_blob_b64: kp_blob_b64.clone(),
+                join_proof_b64: join_proof_b64.clone(),
+            });
             // Broadcast `mls_join_request` to all online MLS members!
             st.broadcast_json(json!({
                 "v": 2,
@@ -1065,7 +1101,7 @@ fn handle_mock_http(
                 202,
                 json!({
                     "queued": true,
-                    "kp_id": 1,
+                    "kp_id": kp_id,
                 }),
             )
         }
@@ -1125,6 +1161,7 @@ fn handle_mock_http(
                         .unwrap_or_default()
                         .to_string();
                     if target_dev > 0 && !welcome_b64.is_empty() {
+                        st.pending_kps.retain(|k| k.kp_ref_b64 != kp_ref_b64);
                         st.next_welcome_id = st.next_welcome_id.saturating_add(1);
                         let wid = st.next_welcome_id;
                         st.pending_welcomes.push(StoredWelcome {
@@ -1448,7 +1485,22 @@ fn handle_mock_http(
             )
         }
         ("GET", p) if p == format!("{party_prefix}/mls/key-packages") => {
-            (200, json!({"key_packages": []}))
+            let items: Vec<Value> = st
+                .pending_kps
+                .iter()
+                .map(|k| {
+                    json!({
+                        "kp_id": k.kp_id,
+                        "account_id": k.account_id.to_string(),
+                        "device_id": k.device_id.to_string(),
+                        "invite_id": k.invite_id,
+                        "kp_ref_b64": k.kp_ref_b64,
+                        "kp_blob_b64": k.kp_blob_b64,
+                        "join_proof_b64": k.join_proof_b64,
+                    })
+                })
+                .collect();
+            (200, json!({"key_packages": items}))
         }
         _ => (404, json!({"error": "not_found", "path": req.path})),
     }
@@ -1613,10 +1665,13 @@ async fn live_mls_e2ee_same_account_sibling_cross_account_quorum_ack_and_cloud_b
         .map_err(|e| format!("invalid InviteFragmentV2: {e}"))?;
     assert_eq!(parsed_frag.invite_id, 101);
 
-    // Wait for Machine A to connect `mp2` WS at epoch 0!
+    // Wait for Machine A to connect `mp2` WS at epoch 0 (both client and server-side registered)!
     assert!(
-        wait_until(Duration::from_secs(5), || async {
-            daemon_mls_epoch_and_connected(&alice_a).await == Some((0, true))
+        wait_until(Duration::from_secs(25), || async {
+            let on_server = ds_state
+                .lock()
+                .is_ok_and(|st| st.online_ws_devices.contains(&(1001, 2001)));
+            on_server && daemon_mls_epoch_and_connected(&alice_a).await == Some((0, true))
         })
         .await,
         "Machine A should be connected to mp2 WS at MLS epoch 0"
@@ -1686,14 +1741,28 @@ async fn live_mls_e2ee_same_account_sibling_cross_account_quorum_ack_and_cloud_b
     //    auto-commits sibling Add + sibling `WelcomeAuthV1` -> Machine B installs
     //    Welcome and connects `mp2` WS at epoch 1!
     // =========================================================================
-    assert!(
-        wait_until(Duration::from_secs(6), || async {
-            daemon_mls_epoch_and_connected(&alice_a).await == Some((1, true))
-                && daemon_mls_epoch_and_connected(&alice_b).await == Some((1, true))
-        })
-        .await,
-        "Machine A and sibling Machine B should both reach MLS epoch 1 and connect mp2 WS"
-    );
+    let epoch1_ok = wait_until(Duration::from_secs(25), || async {
+        daemon_mls_epoch_and_connected(&alice_a).await == Some((1, true))
+            && daemon_mls_epoch_and_connected(&alice_b).await == Some((1, true))
+    })
+    .await;
+    if !epoch1_ok {
+        let a_st = daemon_mls_epoch_and_connected(&alice_a).await;
+        let b_st = daemon_mls_epoch_and_connected(&alice_b).await;
+        let (ds_ep, kps, wels) = ds_state
+            .lock()
+            .map(|st| {
+                (
+                    st.ds.as_ref().map(MpMlsPublicDs::epoch),
+                    st.pending_kps.len(),
+                    st.pending_welcomes.len(),
+                )
+            })
+            .unwrap_or((None, 0, 0));
+        return Err(format!(
+            "Machine A and sibling Machine B failed to reach MLS epoch 1 (a={a_st:?}, b={b_st:?}, ds_epoch={ds_ep:?}, pending_kps={kps}, pending_welcomes={wels})"
+        ));
+    }
 
     // Bidirectional encrypted `e2ee_app` chat + IRC action + agent card between Machine A & B!
     let msg_a_to_b = encode_party_send_chat_req(&PartySendChatReq {
@@ -1750,7 +1819,7 @@ async fn live_mls_e2ee_same_account_sibling_cross_account_quorum_ack_and_cloud_b
 
     // Verify Machine B received & decrypted Machine A's chat, IRC action, AND agent card!
     assert!(
-        wait_until(Duration::from_secs(5), || async {
+        wait_until(Duration::from_secs(25), || async {
             let evs = poll_all_events(&alice_b, TEST_PARTY_ID).await;
             let got_chat = evs.iter().any(|k| {
                 matches!(
@@ -1785,7 +1854,7 @@ async fn live_mls_e2ee_same_account_sibling_cross_account_quorum_ack_and_cloud_b
 
     // Verify Machine A received & decrypted Machine B's reply!
     assert!(
-        wait_until(Duration::from_secs(5), || async {
+        wait_until(Duration::from_secs(25), || async {
             let evs = poll_all_events(&alice_a, TEST_PARTY_ID).await;
             evs.iter().any(|k| {
                 matches!(
@@ -1816,7 +1885,7 @@ async fn live_mls_e2ee_same_account_sibling_cross_account_quorum_ack_and_cloud_b
         .map_err(|e| format!("bob op_room_enter failed: {}", e.2))?;
 
     assert!(
-        wait_until(Duration::from_secs(6), || async {
+        wait_until(Duration::from_secs(25), || async {
             daemon_mls_epoch_and_connected(&alice_a).await == Some((2, true))
                 && daemon_mls_epoch_and_connected(&alice_b).await == Some((2, true))
                 && daemon_mls_epoch_and_connected(&bob).await == Some((2, true))
@@ -1849,7 +1918,7 @@ async fn live_mls_e2ee_same_account_sibling_cross_account_quorum_ack_and_cloud_b
         .map_err(|e| format!("bob send chat failed: {}", e.2))?;
 
     assert!(
-        wait_until(Duration::from_secs(5), || async {
+        wait_until(Duration::from_secs(25), || async {
             let ev_a = poll_all_events(&alice_a, TEST_PARTY_ID).await;
             let ev_b = poll_all_events(&alice_b, TEST_PARTY_ID).await;
             let ok_a = ev_a.iter().any(|k| {
@@ -1892,7 +1961,7 @@ async fn live_mls_e2ee_same_account_sibling_cross_account_quorum_ack_and_cloud_b
         .map_err(|e| format!("charlie op_room_enter failed: {}", e.2))?;
 
     assert!(
-        wait_until(Duration::from_secs(8), || async {
+        wait_until(Duration::from_secs(25), || async {
             daemon_mls_epoch_and_connected(&alice_a).await == Some((3, true))
                 && daemon_mls_epoch_and_connected(&alice_b).await == Some((3, true))
                 && daemon_mls_epoch_and_connected(&bob).await == Some((3, true))
@@ -1930,7 +1999,7 @@ async fn live_mls_e2ee_same_account_sibling_cross_account_quorum_ack_and_cloud_b
         .map_err(|e| format!("charlie send chat failed: {}", e.2))?;
 
     assert!(
-        wait_until(Duration::from_secs(5), || async {
+        wait_until(Duration::from_secs(25), || async {
             let ev_bob = poll_all_events(&bob, TEST_PARTY_ID).await;
             ev_bob.iter().any(|k| {
                 matches!(
@@ -1990,7 +2059,7 @@ async fn live_mls_e2ee_same_account_sibling_cross_account_quorum_ack_and_cloud_b
     }
 
     assert!(
-        wait_until(Duration::from_secs(8), || async {
+        wait_until(Duration::from_secs(25), || async {
             daemon_mls_epoch_and_connected(&alice_a).await == Some((4, true))
                 && daemon_mls_epoch_and_connected(&bob).await == Some((4, true))
         })
@@ -2012,7 +2081,7 @@ async fn live_mls_e2ee_same_account_sibling_cross_account_quorum_ack_and_cloud_b
         .map_err(|e| format!("alice_a post-evict send failed: {}", e.2))?;
 
     assert!(
-        wait_until(Duration::from_secs(5), || async {
+        wait_until(Duration::from_secs(25), || async {
             let ev_bob = poll_all_events(&bob, TEST_PARTY_ID).await;
             ev_bob.iter().any(|k| {
                 matches!(

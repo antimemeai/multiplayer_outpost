@@ -1491,6 +1491,7 @@ impl AppDaemon {
                                                 break;
                                             }
                                         }
+                                        self.poll_pending_key_packages(party_id).await;
                                     }
                                     Ok(Some(Mp2RoomEvent::MlsJoinRequest {
                                         account_id,
@@ -1514,6 +1515,7 @@ impl AppDaemon {
                                     }
                                     Ok(Some(Mp2RoomEvent::MlsCommitDiscarded { .. })) => {
                                         self.handle_mp2_mls_commit_discarded(party_id).await;
+                                        self.poll_pending_key_packages(party_id).await;
                                     }
                                     Ok(Some(Mp2RoomEvent::MlsRekeyNeeded {
                                         elected_committer_device_id,
