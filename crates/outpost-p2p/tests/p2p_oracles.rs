@@ -525,25 +525,20 @@ async fn oracle5_superseded_4409_reconnect_replaces_stale_conn_and_delivers_fram
         Some(msg1)
     );
 
-    // Part C: Reconnect a second time from Alice -> Bob via PartyP2pTransport::connect_peer
-    // (superseding Bob's initiated connection cleanly), and exchange frames on all lanes.
-    let alice_target = PeerDialTarget {
-        device_id: 202,
-        device_pubkey: bob_pk,
+    // Part C: Reconnect a second time via PartyP2pTransport::connect_peer (superseding the
+    // prior live PartyP2pTransport connection cleanly with 4409) and exchange frames in both
+    // directions across Causal and Control lanes. Dial Bob -> Alice so Alice's iroh MagicSock
+    // (which saw duplicate-EndpointId `stale_ep` in Part A) never routes to `stale_ep`'s closed
+    // macOS UDP port.
+    let part_c_target = PeerDialTarget {
+        device_id: 101,
+        device_pubkey: alice_pk,
         remote_relay_policy: RelayPolicy::NoRelays,
-        endpoint: bob.local_endpoint_descriptor(),
+        endpoint: alice_desc.clone(),
     };
-    if let Err(err) = alice.connect_peer(alice_target.clone()).await {
-        if matches!(err, P2pError::Timeout) {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            alice
-                .connect_peer(alice_target)
-                .await
-                .map_err(|e| format!("partC alice.connect_peer retry failed: {e}"))?;
-        } else {
-            return Err(format!("partC alice.connect_peer failed: {err}").into());
-        }
-    }
+    bob.connect_peer(part_c_target)
+        .await
+        .map_err(|e| format!("partC bob.connect_peer failed: {e}"))?;
 
     assert!(wait_for_connected(&mut alice, bob_pk).await);
     assert!(wait_for_connected(&mut bob, alice_pk).await);
