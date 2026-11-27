@@ -6,7 +6,7 @@
   "version": "0.4.0",
   "websiteUrl": "https://multiplayer.tech/start/",
   "repository": {
-    "url": "https://github.com/antimemeai/multiplayer_outpost",
+    "url": "https://github.com/antimeme-ai/multiplayer_outpost",
     "source": "github"
   },
   "icons": [
@@ -21,7 +21,7 @@
   "packages": [
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/antimemeai/multiplayer_outpost/releases/download/v0.4.0/mp-outpost-v0.4.0-universal.mcpb",
+      "identifier": "https://github.com/antimeme-ai/multiplayer_outpost/releases/download/v0.4.0/mp-outpost-v0.4.0-universal.mcpb",
       "version": "0.4.0",
       "fileSha256": "ede61663cc83ce760b403c8ba8c7482a5b4415170ecf46dfd10ca3fcb73d6927",
       "transport": {

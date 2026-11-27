@@ -31,7 +31,7 @@ use outpost_control::{
     Mp2EventKind, Mp2Member, Mp2RoomEvent, RequestSigner, RoomEnterRequest, RoomInviteRequest,
     WsConnectError, sleep_aware_now_ms, wall_now_ms, wall_now_secs,
 };
-use outpost_core::fence::scan_outbound_secrets;
+use outpost_core::fence::{sanitize_peer_text, scan_outbound_secrets};
 use outpost_core::ipc_wire::IpcOpcode;
 use outpost_core::p2p_wire::{
     P2pActivityState, P2pBridgeEnvelope, P2pChatMessage, P2pControlNotice, P2pControlNoticeKind,
@@ -120,6 +120,17 @@ fn now_unix_ns() -> i64 {
         .ok()
         .and_then(|d| i64::try_from(d.as_nanos()).ok())
         .unwrap_or(0)
+}
+
+fn sanitize_validated_friend_handle(raw: &str) -> Option<String> {
+    let cleaned: String = sanitize_peer_text(raw)
+        .chars()
+        .filter(|c| c.is_ascii_graphic())
+        .collect();
+    if cleaned.is_empty() || cleaned.len() > 64 {
+        return None;
+    }
+    Some(cleaned)
 }
 
 // ---------------------------------------------------------------------------
@@ -3587,44 +3598,82 @@ impl AppDaemon {
             st.control.clone()
         };
         if let Ok(rest_friends) = control.list_friends().await {
+            // Refresh local pinned peers from disk so recent `peer trust`/`revoke` updates
+            // are reflected when cross-checking server-reported root public keys.
+            let fresh_peers = {
+                let state_dir_path = self.state_dir_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    let dir = open_state_dir(&state_dir_path).ok()?;
+                    let _lock = lock_state(&dir).ok()?;
+                    load_peers_store(&dir).ok()
+                })
+                .await
+                .ok()
+                .flatten()
+            };
+
             let mut st = self.inner.lock().await;
+            if let Some(peers) = fresh_peers {
+                st.peers = peers;
+            }
+            let auth_hash = api_authority_hash(&st.device.api_authority);
+            let mut active_ids: HashSet<u64> = HashSet::with_capacity(rest_friends.friends.len());
+
             for edge in rest_friends.friends {
-                if let Some(h) = edge.peer_handle.as_deref()
-                    && !h.is_empty()
+                active_ids.insert(edge.peer_account_id);
+                if let Some(raw_h) = edge.peer_handle.as_deref()
+                    && let Some(clean_h) = sanitize_validated_friend_handle(raw_h)
                 {
-                    st.handle_cache.insert(edge.peer_account_id, h.to_string());
+                    st.handle_cache.insert(edge.peer_account_id, clean_h);
                 }
-                let verified_sn: Option<String> = match edge.peer_root_pubkey_b64.as_deref() {
+
+                let verified_sn: String = match edge.peer_root_pubkey_b64.as_deref() {
                     Some(pk_b64) => match B64
                         .decode(pk_b64.as_bytes())
                         .ok()
                         .and_then(|raw| <[u8; 32]>::try_from(raw).ok())
                     {
                         Some(pk) if mp_protocol::validate_ed25519_pubkey_strict(&pk).is_ok() => {
-                            let local_sn =
-                                mp_protocol::compute_safety_number(edge.peer_account_id, &pk);
-                            if let Some(srv_sn) = edge.peer_safety_number.as_deref()
-                                && !srv_sn.is_empty()
-                                && srv_sn != local_sn
-                            {
+                            let pinned_mismatch = st.peers.peers.iter().any(|p| {
+                                p.api_authority_hash == auth_hash
+                                    && p.account_id == edge.peer_account_id
+                                    && p.root_pubkey != [0u8; 32]
+                                    && p.root_pubkey != pk
+                            });
+                            if pinned_mismatch {
                                 log_line(&format!(
-                                    "ignoring mismatched server peer_safety_number for account_id={}; using locally computed SN",
+                                    "WARNING: KEY_MISMATCH for friend account_id={}: server root_pubkey disagrees with locally pinned peers.bin",
                                     edge.peer_account_id
                                 ));
+                                "KEY_MISMATCH".to_string()
+                            } else {
+                                let local_sn =
+                                    compute_safety_number(edge.peer_account_id, &pk);
+                                if let Some(srv_sn) = edge.peer_safety_number.as_deref()
+                                    && !srv_sn.is_empty()
+                                    && srv_sn != local_sn
+                                {
+                                    log_line(&format!(
+                                        "ignoring mismatched server peer_safety_number for account_id={}; using locally computed SN",
+                                        edge.peer_account_id
+                                    ));
+                                }
+                                local_sn
                             }
-                            Some(local_sn)
                         }
                         _ => {
                             // Invalid pubkey: never trust server-provided safety number.
-                            Some(String::new())
+                            String::new()
                         }
                     },
-                    None => None,
+                    // Omitted pubkey (e.g. blocked state == 3): clear any stale safety number.
+                    None => String::new(),
                 };
+
                 let handle = st
                     .handle_cache
                     .get(&edge.peer_account_id)
-                    .cloned()
+                    .and_then(|h| sanitize_validated_friend_handle(h))
                     .unwrap_or_default();
                 let entry = st
                     .friends
@@ -3643,10 +3692,12 @@ impl AppDaemon {
                 if !handle.is_empty() {
                     entry.handle = handle;
                 }
-                if let Some(sn) = verified_sn {
-                    entry.safety_number = sn;
-                }
+                entry.safety_number = verified_sn;
             }
+
+            // Reconcile snapshot: retain ONLY active REST edges while preserving
+            // presence_status / joinable_party_id on surviving edges.
+            st.friends.retain(|aid, _| active_ids.contains(aid));
         }
 
         let st = self.inner.lock().await;
@@ -4004,10 +4055,11 @@ impl AppDaemon {
                         .unwrap_or("unknown");
                     let msg = match pinned_url {
                         Some(pinned) => format!(
-                            "relay_mismatch: party requires pinned relay '{pinned}' (policy={policy_label}); pass --relay-url {pinned} or update device relay config"
+                            "relay_mismatch: party requires pinned relay '{}' (policy={:?}); inspect available relays with `mp-outpost relays` and update your device relay configuration",
+                            pinned, policy
                         ),
                         None => format!(
-                            "relay_mismatch: party relay policy '{policy_label}' is incompatible with your local relay policy; pass --relay-policy or update device relay config"
+                            "relay_mismatch: party relay policy '{policy_label}' is incompatible with your local relay policy; pass --relay-policy or update device relay configuration"
                         ),
                     };
                     return Err(ipc_err(ERR_CONFLICT, false, msg));

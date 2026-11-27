@@ -33,9 +33,9 @@ use crate::storage::{
 };
 
 const DEFAULT_RELEASE_LATEST_BASE: &str =
-    "https://github.com/antimemeai/multiplayer_outpost/releases/latest/download";
+    "https://github.com/antimeme-ai/multiplayer_outpost/releases/latest/download";
 const DEFAULT_RELEASE_TAG_BASE_PREFIX: &str =
-    "https://github.com/antimemeai/multiplayer_outpost/releases/download";
+    "https://github.com/antimeme-ai/multiplayer_outpost/releases/download";
 
 const DEFAULT_ALLOWED_HOSTS: &[&str] = &[
     "github.com",

@@ -9,7 +9,9 @@ publish.workspace = true
 [dependencies]
 base64.workspace = true
 blake3.workspace = true
+ed25519-dalek.workspace = true
 mp-protocol.workspace = true
+ring.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
 

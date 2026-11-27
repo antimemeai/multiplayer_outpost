@@ -2,7 +2,8 @@
 //! bounded ingress, idempotency preservation across retries, and scoped `clock_skew` retry.
 
 use core::fmt;
-use std::net::SocketAddr;
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
@@ -53,6 +54,18 @@ pub const MAX_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_DISCOVERED_RELAYS: usize = 32;
 /// Maximum sanitized Unicode scalar count for `region`/`label` in `GET /v1/relays`.
 pub const MAX_RELAY_METADATA_CHARS: usize = 64;
+/// Hard cap on `GET /v1/accounts/{account_id}/enc-keys` response bodies (`64 KiB`).
+pub const MAX_ENC_KEYS_RESPONSE_BYTES: usize = 64 * 1024;
+/// Hard cap on `POST /v1/inbox/{recipient_account_id}` request bodies (`96 KiB`).
+pub const MAX_INBOX_POST_BODY_BYTES: usize = 96 * 1024;
+/// Hard cap on `GET /v1/inbox` response bodies (`2 MiB` for up to 16 × 64 KiB drops).
+pub const MAX_INBOX_GET_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum number of active encryption-key devices per account (`8`).
+pub const MAX_INBOX_RECIPIENT_DEVICES: usize = 8;
+/// Maximum number of pending dead-drop items returned or acked per call (`16`).
+pub const MAX_INBOX_PENDING_DROPS: usize = 16;
+/// Exact decoded byte length of an E2EE encryption subkey certificate (`161` bytes).
+pub const ENC_CERT_BYTES: usize = 161;
 
 const MAX_ERROR_MESSAGE_CHARS: usize = 256;
 const MAX_FETCH_URL_BYTES: usize = 8 * 1024;
@@ -553,11 +566,34 @@ impl ControlClient {
             .ok_or(ControlError::MissingSigner)
     }
 
+    fn require_strict_device_signer(
+        &self,
+    ) -> Result<(&RequestSigner, AccountId, DeviceId), ControlError> {
+        let signer = self.require_device_signer()?;
+        match *signer.key_id() {
+            KeyId::Device {
+                account_id,
+                device_id,
+            } => Ok((signer, account_id, device_id)),
+            _ => Err(ControlError::InvalidRequest(
+                "endpoint requires an enrolled device RequestSigner (not .root)".to_owned(),
+            )),
+        }
+    }
+
     /// Executes an unsigned HTTP/1.1 GET request (used for `/v1/health`).
     async fn execute_unsigned_get(&self, path: &str) -> Result<RawHttpResponse, ControlError> {
         validate_path_and_query(HttpMethod::Get, path, "?")?;
-        self.send_http1_once(HttpMethod::Get, path, "?", Bytes::new(), None, None)
-            .await
+        self.send_http1_once(
+            HttpMethod::Get,
+            path,
+            "?",
+            Bytes::new(),
+            None,
+            None,
+            MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
     }
 
     /// Executes an unsigned HTTP/1.1 JSON POST request (used for `/v1/auth/session/start` & `poll`).
@@ -567,8 +603,16 @@ impl ControlClient {
         body: Bytes,
     ) -> Result<RawHttpResponse, ControlError> {
         validate_path_and_query(HttpMethod::Post, path, "?")?;
-        self.send_http1_once(HttpMethod::Post, path, "?", body, None, None)
-            .await
+        self.send_http1_once(
+            HttpMethod::Post,
+            path,
+            "?",
+            body,
+            None,
+            None,
+            MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
     }
 
     /// Executes a signed HTTP/1.1 request with automatic single `clock_skew` retry.
@@ -584,6 +628,29 @@ impl ControlClient {
         query: &str,
         body: Bytes,
         idempotency_key: Option<&str>,
+    ) -> Result<RawHttpResponse, ControlError> {
+        self.execute_signed_with_max_response_bytes(
+            signer,
+            method,
+            path,
+            query,
+            body,
+            idempotency_key,
+            MAX_RESPONSE_BODY_BYTES,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_signed_with_max_response_bytes(
+        &self,
+        signer: &RequestSigner,
+        method: HttpMethod,
+        path: &str,
+        query: &str,
+        body: Bytes,
+        idempotency_key: Option<&str>,
+        max_response_bytes: usize,
     ) -> Result<RawHttpResponse, ControlError> {
         if let Some(key) = idempotency_key {
             validate_idempotency_key(key)?;
@@ -609,6 +676,7 @@ impl ControlClient {
                     body.clone(),
                     Some(&signed),
                     idempotency_key,
+                    max_response_bytes,
                 )
                 .await?;
 
@@ -630,6 +698,7 @@ impl ControlClient {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_http1_once(
         &self,
         method: HttpMethod,
@@ -638,6 +707,7 @@ impl ControlClient {
         body: Bytes,
         signed: Option<&SignedHeaders>,
         idempotency_key: Option<&str>,
+        max_response_bytes: usize,
     ) -> Result<RawHttpResponse, ControlError> {
         send_http1_raw(
             &self.config.authority,
@@ -650,6 +720,7 @@ impl ControlClient {
             body,
             signed,
             idempotency_key,
+            max_response_bytes,
         )
         .await
     }
@@ -679,7 +750,8 @@ impl ControlClient {
     ///
     /// Enforces TLS 1.3-only, zero redirects, `<= 16 KiB` body cap, `relays.len() <= 32`,
     /// strict HTTPS public-FQDN relay URL validation on `default_relay_url` and every
-    /// `relay.url`, and `<= 64`-char sanitization on `region` and `label`.
+    /// `relay.url`, canonical URL deduplication (keeping first occurrence), and
+    /// `<= 64`-char sanitization on `region` and `label`.
     pub async fn list_relays(&self) -> Result<RelaysResponse, ControlError> {
         let resp = self.execute_unsigned_get("/v1/relays").await?;
         let mut decoded: RelaysResponse = Self::decode_json_response(resp, &[200])?;
@@ -690,11 +762,18 @@ impl ControlClient {
                 decoded.relays.len()
             )));
         }
-        for relay in &mut decoded.relays {
+        let mut seen_urls = HashSet::with_capacity(decoded.relays.len());
+        let mut deduped = Vec::with_capacity(decoded.relays.len());
+        for mut relay in decoded.relays {
             validate_discovered_relay_url(&relay.url, "relay.url")?;
-            relay.region = sanitize_untrusted_text(&relay.region, MAX_RELAY_METADATA_CHARS);
-            relay.label = sanitize_untrusted_text(&relay.label, MAX_RELAY_METADATA_CHARS);
+            let canonical_url = relay.url.trim_end_matches('/').to_ascii_lowercase();
+            if seen_urls.insert(canonical_url) {
+                relay.region = sanitize_untrusted_text(&relay.region, MAX_RELAY_METADATA_CHARS);
+                relay.label = sanitize_untrusted_text(&relay.label, MAX_RELAY_METADATA_CHARS);
+                deduped.push(relay);
+            }
         }
+        decoded.relays = deduped;
         Ok(decoded)
     }
 
@@ -932,6 +1011,11 @@ impl ControlClient {
         org_id: Option<u64>,
         group_id: Option<u64>,
     ) -> Result<CreatePartyResponse, ControlError> {
+        if group_id.is_some() && org_id.is_none() {
+            return Err(ControlError::InvalidRequest(
+                "group_id requires org_id".to_owned(),
+            ));
+        }
         if let Some(id) = org_id
             && (id == 0 || id > MAX_SAFE_ID)
         {
@@ -1546,6 +1630,191 @@ impl ControlClient {
         Ok(decoded)
     }
 
+    // -----------------------------------------------------------------------
+    // E2EE Dead-Drop Inbox Endpoints (`/v1/devices/*/enc-key`, `/v1/accounts/*/enc-keys`, `/v1/inbox*`)
+    // -----------------------------------------------------------------------
+
+    /// `PUT /v1/devices/{device_id}/enc-key` (enrolled device signer matching `device_id`).
+    pub async fn put_device_enc_key(
+        &self,
+        device_id: u64,
+        enc_cert_b64: &str,
+    ) -> Result<PutDeviceEncKeyResponse, ControlError> {
+        let (signer, _account_id, signer_device_id) = self.require_strict_device_signer()?;
+        let validated_id = DeviceId::new(device_id).map_err(|_| {
+            ControlError::InvalidRequest(format!("device_id must be in 1..={MAX_SAFE_ID}"))
+        })?;
+        if validated_id != signer_device_id {
+            return Err(ControlError::InvalidRequest(
+                "device_id does not match enrolled device signer".to_owned(),
+            ));
+        }
+        let decoded_cert = B64_STD.decode(enc_cert_b64).map_err(|_| {
+            ControlError::InvalidRequest("enc_cert_b64 is not valid base64".to_owned())
+        })?;
+        if decoded_cert.len() != ENC_CERT_BYTES {
+            return Err(ControlError::InvalidRequest(format!(
+                "enc_cert_b64 must decode to {ENC_CERT_BYTES} bytes"
+            )));
+        }
+        let path = format!("/v1/devices/{validated_id}/enc-key");
+        let body = encode_json(&PutDeviceEncKeyWire { enc_cert_b64 })?;
+        let resp = self
+            .execute_signed(signer, HttpMethod::Put, &path, "?", body, None)
+            .await?;
+        let decoded: PutDeviceEncKeyResponse = Self::decode_json_response(resp, &[200])?;
+        validate_device_id(decoded.device_id, "put_device_enc_key")?;
+        Ok(decoded)
+    }
+
+    /// `GET /v1/accounts/{account_id}/enc-keys` (enrolled device signer; `<= 64 KiB` response cap).
+    pub async fn get_account_enc_keys(
+        &self,
+        account_id: u64,
+    ) -> Result<AccountEncKeysResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        let validated_id = AccountId::new(account_id).map_err(|_| {
+            ControlError::InvalidRequest(format!("account_id must be in 1..={MAX_SAFE_ID}"))
+        })?;
+        let path = format!("/v1/accounts/{validated_id}/enc-keys");
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Get,
+                &path,
+                "?",
+                Bytes::new(),
+                None,
+                MAX_ENC_KEYS_RESPONSE_BYTES,
+            )
+            .await?;
+        let decoded: AccountEncKeysResponse = Self::decode_json_response(resp, &[200])?;
+        validate_account_id(decoded.account_id, "get_account_enc_keys")?;
+        if decoded.devices.len() > MAX_INBOX_RECIPIENT_DEVICES {
+            return Err(ControlError::Protocol(format!(
+                "GET /v1/accounts/{validated_id}/enc-keys returned {} devices (max {MAX_INBOX_RECIPIENT_DEVICES})",
+                decoded.devices.len()
+            )));
+        }
+        for dev in &decoded.devices {
+            validate_device_id(dev.device_id, "get_account_enc_keys")?;
+        }
+        Ok(decoded)
+    }
+
+    /// `POST /v1/inbox/{recipient_account_id}` (enrolled device signer; `<= 96 KiB` body cap;
+    /// accepts HTTP `200` idempotent or `201` created).
+    pub async fn post_inbox_drop(
+        &self,
+        recipient_account_id: u64,
+        req: &PostInboxDropRequest,
+    ) -> Result<PostInboxDropResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        let validated_recipient = AccountId::new(recipient_account_id).map_err(|_| {
+            ControlError::InvalidRequest(format!(
+                "recipient_account_id must be in 1..={MAX_SAFE_ID}"
+            ))
+        })?;
+        if req.suite != 1 {
+            return Err(ControlError::InvalidRequest(
+                "inbox dead-drop suite must be 1".to_owned(),
+            ));
+        }
+        if req.wrapped_keys.is_empty() || req.wrapped_keys.len() > MAX_INBOX_RECIPIENT_DEVICES {
+            return Err(ControlError::InvalidRequest(format!(
+                "wrapped_keys must contain 1..={MAX_INBOX_RECIPIENT_DEVICES} entries"
+            )));
+        }
+        let mut seen_devices = HashSet::with_capacity(req.wrapped_keys.len());
+        for wk in &req.wrapped_keys {
+            DeviceId::new(wk.device_id).map_err(|_| {
+                ControlError::InvalidRequest(format!(
+                    "wrapped_keys device_id must be in 1..={MAX_SAFE_ID}"
+                ))
+            })?;
+            if !seen_devices.insert(wk.device_id) {
+                return Err(ControlError::InvalidRequest(
+                    "wrapped_keys contains duplicate device_id".to_owned(),
+                ));
+            }
+            if wk.wrapped_key_b64.is_empty() {
+                return Err(ControlError::InvalidRequest(
+                    "wrapped_key_b64 must be non-empty".to_owned(),
+                ));
+            }
+        }
+        if req.expires_at_ms == 0 || req.expires_at_ms > MAX_SAFE_ID {
+            return Err(ControlError::InvalidRequest(format!(
+                "expires_at_ms must be in 1..={MAX_SAFE_ID}"
+            )));
+        }
+        let body = encode_json(req)?;
+        if body.len() > MAX_INBOX_POST_BODY_BYTES {
+            return Err(ControlError::InvalidRequest(format!(
+                "POST /v1/inbox body ({} bytes) exceeds {MAX_INBOX_POST_BODY_BYTES}-byte cap",
+                body.len()
+            )));
+        }
+        let path = format!("/v1/inbox/{validated_recipient}");
+        let resp = self
+            .execute_signed(signer, HttpMethod::Post, &path, "?", body, None)
+            .await?;
+        let decoded: PostInboxDropResponse = Self::decode_json_response(resp, &[200, 201])?;
+        validate_drop_id(decoded.drop_id, "post_inbox_drop")?;
+        Ok(decoded)
+    }
+
+    /// `GET /v1/inbox` (enrolled device signer; dedicated `2 MiB` response cap for up to 16 drops).
+    pub async fn get_inbox_drops(&self) -> Result<InboxDropsResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Get,
+                "/v1/inbox",
+                "?",
+                Bytes::new(),
+                None,
+                MAX_INBOX_GET_RESPONSE_BYTES,
+            )
+            .await?;
+        let decoded: InboxDropsResponse = Self::decode_json_response(resp, &[200])?;
+        if decoded.drops.len() > MAX_INBOX_PENDING_DROPS {
+            return Err(ControlError::Protocol(format!(
+                "GET /v1/inbox returned {} drops (max {MAX_INBOX_PENDING_DROPS})",
+                decoded.drops.len()
+            )));
+        }
+        for item in &decoded.drops {
+            validate_drop_id(item.drop_id, "get_inbox_drops")?;
+            validate_account_id(item.sender_account_id, "get_inbox_drops")?;
+            validate_device_id(item.sender_device_id, "get_inbox_drops")?;
+        }
+        Ok(decoded)
+    }
+
+    /// `POST /v1/inbox/ack` (enrolled device signer; `1..=16` positive 53-bit `drop_ids`).
+    pub async fn ack_inbox_drops(&self, drop_ids: &[u64]) -> Result<AckInboxResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        if drop_ids.is_empty() || drop_ids.len() > MAX_INBOX_PENDING_DROPS {
+            return Err(ControlError::InvalidRequest(format!(
+                "drop_ids must contain 1..={MAX_INBOX_PENDING_DROPS} entries"
+            )));
+        }
+        for &id in drop_ids {
+            if id == 0 || id > MAX_SAFE_ID {
+                return Err(ControlError::InvalidRequest(format!(
+                    "drop_id ({id}) must be in 1..={MAX_SAFE_ID}"
+                )));
+            }
+        }
+        let body = encode_json(&AckInboxWire { drop_ids })?;
+        let resp = self
+            .execute_signed(signer, HttpMethod::Post, "/v1/inbox/ack", "?", body, None)
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
     /// Downloads bounded bytes over TLS 1.3 + HTTP/1.1 with strict host-allowlisted
     /// HTTPS-only redirect following (at most 3 redirects, 60-second overall deadline).
     ///
@@ -1570,26 +1839,71 @@ impl ControlClient {
 
     /// Probes `<relay_url>/ping` over TLS 1.3 + HTTP/1.1 using this client's TLS config and
     /// timeout, returning the measured round-trip duration on HTTP 200 or 204.
+    ///
+    /// Enforces strict public-FQDN relay URL validation and (when `connect_addr` is `None`)
+    /// DNS-rebinding SSRF protection by resolving the host first, rejecting any non-public
+    /// IP address via [`is_public_routable_ip`], and dialing the validated numeric `SocketAddr`
+    /// directly while pinning TLS 1.3 SNI & certificate verification to the hostname.
     pub async fn probe_relay_ping(&self, relay_url: &str) -> Result<Duration, ControlError> {
         let trimmed = relay_url.trim_end_matches('/');
-        let Some(after_scheme) = trimmed.strip_prefix("https://") else {
-            return Err(ControlError::InvalidRequest(
-                "relay_url must be a valid https:// origin".to_owned(),
-            ));
-        };
-        if after_scheme.contains('/') || after_scheme.contains('?') || after_scheme.contains('#') {
-            return Err(ControlError::InvalidRequest(
-                "relay_url must be an origin without path, query, or fragment".to_owned(),
-            ));
-        }
+        validate_discovered_relay_url(trimmed, "relay_url")
+            .map_err(|e| ControlError::InvalidRequest(e.to_string()))?;
         let ping_url = format!("{trimmed}/ping");
-        let (status, rtt) = probe_https_get_with_transport(
-            &ping_url,
+        let (canonical_authority, path) = parse_https_url(&ping_url)?;
+        let (_, host, port) = parse_authority(&canonical_authority)?;
+
+        let deadline = Instant::now() + self.config.request_timeout;
+        let dial_addr = if let Some(override_addr) = self.config.connect_addr {
+            Some(override_addr)
+        } else {
+            let resolved = tokio::time::timeout(
+                self.config.request_timeout,
+                tokio::net::lookup_host((host.as_str(), port)),
+            )
+            .await
+            .map_err(|_| ControlError::Timeout)?
+            .map_err(ControlError::Io)?;
+            let mut first_public: Option<SocketAddr> = None;
+            for addr in resolved {
+                if !is_public_routable_ip(addr.ip()) {
+                    return Err(ControlError::InvalidRequest(
+                        "relay host resolved to non-public IP".to_owned(),
+                    ));
+                }
+                if first_public.is_none() {
+                    first_public = Some(addr);
+                }
+            }
+            let Some(validated_addr) = first_public else {
+                return Err(ControlError::InvalidRequest(
+                    "relay host resolved to no addresses".to_owned(),
+                ));
+            };
+            Some(validated_addr)
+        };
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ControlError::Timeout);
+        }
+
+        let started = Instant::now();
+        let resp = send_http1_raw(
+            &canonical_authority,
+            dial_addr,
             &self.config.tls_config,
-            self.config.connect_addr,
-            self.config.request_timeout,
+            remaining,
+            HttpMethod::Get,
+            &path,
+            "?",
+            Bytes::new(),
+            None,
+            None,
+            MAX_RESPONSE_BODY_BYTES,
         )
         .await?;
+        let status = resp.status;
+        let rtt = started.elapsed();
         if status == 200 || status == 204 {
             Ok(rtt)
         } else {
@@ -1917,6 +2231,7 @@ async fn probe_https_get_with_transport(
         Bytes::new(),
         None,
         None,
+        MAX_RESPONSE_BODY_BYTES,
     )
     .await?;
     Ok((resp.status, started.elapsed()))
@@ -1954,6 +2269,7 @@ async fn send_http1_raw(
     body: Bytes,
     signed: Option<&SignedHeaders>,
     idempotency_key: Option<&str>,
+    max_response_bytes: usize,
 ) -> Result<RawHttpResponse, ControlError> {
     tokio::time::timeout(timeout, async {
         let tls = connect_tls13(authority, connect_addr, tls_config, timeout).await?;
@@ -2039,7 +2355,7 @@ async fn send_http1_raw(
                 .ok()
                 .and_then(|s| s.trim().parse::<usize>().ok());
             match parsed {
-                Some(n) if n <= MAX_RESPONSE_BODY_BYTES => {}
+                Some(n) if n <= max_response_bytes => {}
                 _ => {
                     return Err(ControlError::ResponseTooLarge);
                 }
@@ -2051,7 +2367,7 @@ async fn send_http1_raw(
         while let Some(frame_res) = incoming.frame().await {
             let frame = frame_res.map_err(ControlError::Http)?;
             if let Some(data) = frame.data_ref() {
-                if buf.len().saturating_add(data.len()) > MAX_RESPONSE_BODY_BYTES {
+                if buf.len().saturating_add(data.len()) > max_response_bytes {
                     return Err(ControlError::ResponseTooLarge);
                 }
                 buf.extend_from_slice(data);
@@ -2147,6 +2463,76 @@ fn validate_device_id(id: u64, context: &'static str) -> Result<(), ControlError
         ControlError::Protocol(format!("invalid device_id ({id}) in {context} response"))
     })?;
     Ok(())
+}
+
+fn validate_drop_id(id: u64, context: &'static str) -> Result<(), ControlError> {
+    if id == 0 || id > MAX_SAFE_ID {
+        return Err(ControlError::Protocol(format!(
+            "invalid drop_id ({id}) in {context} response"
+        )));
+    }
+    Ok(())
+}
+
+fn is_public_routable_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _d] = ip.octets();
+    let is_zero_net = a == 0;
+    let is_loopback = a == 127;
+    let is_private =
+        a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168);
+    let is_cgnat = a == 100 && (64..=127).contains(&b);
+    let is_link_local = a == 169 && b == 254;
+    let is_ietf_protocol = a == 192 && b == 0 && c == 0;
+    let is_documentation = (a == 192 && b == 0 && c == 2)
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113);
+    let is_benchmarking = a == 198 && (b == 18 || b == 19);
+    let is_multicast_or_reserved = a >= 224;
+    !(is_zero_net
+        || is_loopback
+        || is_private
+        || is_cgnat
+        || is_link_local
+        || is_ietf_protocol
+        || is_documentation
+        || is_benchmarking
+        || is_multicast_or_reserved)
+}
+
+fn is_public_routable_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_public_routable_ipv4(v4);
+    }
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return false;
+    }
+    let [s0, s1, s2, s3, s4, s5, s6, s7] = ip.segments();
+    // NAT64 well-known prefix `64:ff9b::/96` embeds an IPv4 address in the low 32 bits.
+    if s0 == 0x0064 && s1 == 0xff9b && s2 == 0 && s3 == 0 && s4 == 0 && s5 == 0 {
+        let embedded = Ipv4Addr::new(
+            (s6 >> 8) as u8,
+            (s6 & 0xff) as u8,
+            (s7 >> 8) as u8,
+            (s7 & 0xff) as u8,
+        );
+        return is_public_routable_ipv4(embedded);
+    }
+    let is_link_local = (s0 & 0xffc0) == 0xfe80;
+    let is_site_local = (s0 & 0xffc0) == 0xfec0;
+    let is_ula = (s0 & 0xfe00) == 0xfc00;
+    let is_documentation = s0 == 0x2001 && s1 == 0x0db8;
+    let is_discard_only = s0 == 0x0100 && s1 == 0 && s2 == 0 && s3 == 0;
+    !(is_link_local || is_site_local || is_ula || is_documentation || is_discard_only)
+}
+
+/// Returns `true` iff `ip` is a globally routable public unicast IPv4 or IPv6 address
+/// (rejecting loopback, private RFC 1918, link-local, CGNAT, unspecified, multicast,
+/// broadcast/reserved, benchmarking, documentation, ULA, and IPv4-mapped non-public ranges).
+pub fn is_public_routable_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_routable_ipv4(v4),
+        IpAddr::V6(v6) => is_public_routable_ipv6(v6),
+    }
 }
 
 fn is_forbidden_error_scalar(ch: char) -> bool {
@@ -3262,4 +3648,133 @@ impl fmt::Debug for RenewMyDeviceResponse {
             .field("cwt_expires_ms", &self.cwt_expires_ms)
             .finish()
     }
+}
+
+// ---------------------------------------------------------------------------
+// E2EE Dead-Drop Inbox Request / Response Models (Exact `api.multiplayer.tech` schema)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct PutDeviceEncKeyWire<'a> {
+    enc_cert_b64: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PutDeviceEncKeyResponse {
+    pub device_id: u64,
+    pub enc_pk_b64: String,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DeviceEncKeyInfo {
+    pub device_id: u64,
+    pub device_pubkey_b64: String,
+    pub device_cwt_b64: String,
+    pub enc_pk_b64: String,
+    pub enc_cert_b64: String,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AccountEncKeysResponse {
+    pub account_id: u64,
+    pub root_pubkey_b64: String,
+    pub devices: Vec<DeviceEncKeyInfo>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct WrappedDeviceKey {
+    pub device_id: u64,
+    pub wrapped_key_b64: String,
+}
+
+impl fmt::Debug for WrappedDeviceKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WrappedDeviceKey")
+            .field("device_id", &self.device_id)
+            .field("wrapped_key_b64", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct PostInboxDropRequest {
+    pub msg_id_b64: String,
+    pub suite: u8,
+    pub sender_cwt_b64: String,
+    pub sender_enc_cert_b64: String,
+    pub ciphertext_b64: String,
+    pub wrapped_keys: Vec<WrappedDeviceKey>,
+    pub expires_at_ms: u64,
+}
+
+impl fmt::Debug for PostInboxDropRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostInboxDropRequest")
+            .field("msg_id_b64", &self.msg_id_b64)
+            .field("suite", &self.suite)
+            .field("sender_cwt_b64", &"[REDACTED]")
+            .field("sender_enc_cert_b64", &self.sender_enc_cert_b64)
+            .field("ciphertext_b64", &"[REDACTED]")
+            .field("wrapped_keys", &self.wrapped_keys)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PostInboxDropResponse {
+    pub drop_id: u64,
+    pub delivered_devices: u64,
+    pub idempotent: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct InboxDropItem {
+    pub drop_id: u64,
+    pub sender_account_id: u64,
+    pub sender_device_id: u64,
+    pub msg_id_b64: String,
+    pub suite: u8,
+    pub sender_cwt_b64: String,
+    pub sender_enc_cert_b64: String,
+    pub ciphertext_b64: String,
+    pub wrapped_key_b64: String,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+impl fmt::Debug for InboxDropItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InboxDropItem")
+            .field("drop_id", &self.drop_id)
+            .field("sender_account_id", &self.sender_account_id)
+            .field("sender_device_id", &self.sender_device_id)
+            .field("msg_id_b64", &self.msg_id_b64)
+            .field("suite", &self.suite)
+            .field("sender_cwt_b64", &"[REDACTED]")
+            .field("sender_enc_cert_b64", &self.sender_enc_cert_b64)
+            .field("ciphertext_b64", &"[REDACTED]")
+            .field("wrapped_key_b64", &"[REDACTED]")
+            .field("created_at_ms", &self.created_at_ms)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct InboxDropsResponse {
+    pub drops: Vec<InboxDropItem>,
+}
+
+#[derive(Serialize)]
+struct AckInboxWire<'a> {
+    drop_ids: &'a [u64],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AckInboxResponse {
+    pub acked: u64,
+    pub pruned_drops: u64,
 }

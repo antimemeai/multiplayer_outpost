@@ -6,9 +6,10 @@
 //! `src/lan_party_protocol.cpp`, `src/lan_mdns.cpp`) and enforces all 6 Operator
 //! Security Mandates without exception.
 
+use core::fmt;
 use std::cell::UnsafeCell;
-use std::collections::{BTreeMap, HashMap};
-use std::ffi::CString;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ffi::{CString, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::mem::MaybeUninit;
@@ -16,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,30 +28,34 @@ use mp_protocol::{RelayPolicy, validate_ed25519_pubkey_strict};
 use outpost_control::wall_now_ms;
 use outpost_core::fence::{fence_peer_text, sanitize_peer_text, scan_outbound_secrets};
 use outpost_core::lan_protocol::{
-    DEFAULT_LAN_IDLE_TIMEOUT_SEC, DEFAULT_LAN_SCAN_TIMEOUT_SEC, DEFAULT_SYSTEM_LAN_POLICY_PATH,
-    DNS_CLASS_IN, DNS_TYPE_PTR, LAN_BEACON_ALPN, LAN_BEACON_VERSION, LAN_MAX_MEMBERS,
-    LAN_MDNS_DEFAULT_PORT, LAN_MDNS_DEFAULT_TTL_SEC, LAN_MDNS_MAX_DIRECT_ADDRS,
-    LAN_MDNS_MAX_PACKET_BYTES, LAN_MDNS_MULTICAST_GROUP, LAN_MDNS_SERVICE_TYPE,
-    LAN_PARTY_ID_BYTES, LanBeaconRecord, LanHandshakeMessage, LanHelloMessage, LanJoinMessage,
-    LanMdnsAnnouncement, LanMemberInfo, LanPinLockoutStatus, LanPinPeerKey, LanPinRateLimitConfig,
-    LanPinRateLimiter, LanPolicyConfig, LanRosterMessage, LanWelcomeMessage,
-    MAX_LAN_IDLE_TIMEOUT_SEC, MAX_LAN_POLICY_FILE_BYTES, MAX_LAN_SCAN_TIMEOUT_SEC,
-    compute_lan_pin_proof, compute_lan_safety_number, decode_lan_mdns_packet,
-    decode_lan_pubkey_base64url, dns_names_equal_ci, encode_lan_announcement, encode_lan_goodbye,
-    encode_lan_ptr_query, encode_lan_pubkey_base64url, format_lan_direct_target,
-    format_lan_party_id_hex, is_valid_lan_name, merge_lan_policy_floor, parse_lan_direct_target,
-    parse_lan_party_id_hex, parse_lan_policy_toml, sanitize_lan_display_name, validate_lan_pin,
-    verify_lan_pin_proof,
+    DEFAULT_SYSTEM_LAN_POLICY_PATH, DNS_CLASS_IN, DNS_TYPE_PTR, EffectiveLanPolicy,
+    LAN_BEACON_ALPN, LAN_BEACON_VERSION, LAN_MAX_MEMBERS, LAN_MDNS_DEFAULT_PORT,
+    LAN_MDNS_DEFAULT_TTL_SEC, LAN_MDNS_MAX_DIRECT_ADDRS, LAN_MDNS_MAX_PACKET_BYTES,
+    LAN_MDNS_MULTICAST_GROUP, LAN_MDNS_SERVICE_TYPE, LAN_PARTY_ID_BYTES, LanBeaconRecord,
+    LanHandshakeMessage, LanHelloMessage, LanJoinMessage, LanMdnsAnnouncement, LanMemberInfo,
+    LanPinLockoutStatus, LanPinPeerKey, LanPinRateLimitConfig, LanPinRateLimiter, LanPolicyConfig,
+    LanRosterMessage, LanWelcomeMessage, MAX_LAN_IDLE_TIMEOUT_SEC, MAX_LAN_POLICY_FILE_BYTES,
+    MAX_LAN_SCAN_TIMEOUT_SEC, PartialLanPolicy, compute_lan_pin_proof, compute_lan_safety_number,
+    decode_lan_mdns_packet, decode_lan_pubkey_base64url, dns_names_equal_ci,
+    encode_lan_announcement, encode_lan_goodbye, encode_lan_ptr_query, encode_lan_pubkey_base64url,
+    format_lan_direct_target, format_lan_party_id_hex, is_valid_lan_name, parse_lan_direct_target,
+    parse_lan_party_id_hex, parse_partial_lan_policy_toml, resolve_lan_policy,
+    sanitize_lan_display_name, validate_lan_pin, verify_lan_pin_proof,
 };
 use outpost_core::p2p_wire::{
     MAX_CHAT_BODY_BYTES, MAX_CONTROL_NOTICE_BYTES, MAX_EPHEMERAL_STATUS_BYTES,
     MAX_ROOM_SCOPE_BYTES, MAX_TARGET_SELECTOR_BYTES, P2pBridgeEnvelope, P2pChatMessage,
     P2pControlNotice, P2pEphemeralPulse, P2pPartyFrame,
 };
-use outpost_core::storage_codec::TrustState;
+use outpost_core::policy::{
+    DEFAULT_SYSTEM_POLICY_PATH, UnifiedPolicyFile, merge_unified_policy_floor,
+    parse_unified_policy_toml,
+};
+use outpost_core::storage_codec::{PeersStoreRecord, TrustState, decode_peers_store};
 use outpost_core::trust::verify_safety_number;
 use outpost_daemon::{
-    VerifiedDir, atomic_write_in_dir, fill_random, open_dir_nofollow, open_or_create_private_dir,
+    DaemonError, StateLock, VerifiedDir, atomic_write_in_dir, atomic_write_in_dir_no_replace,
+    fill_random, open_dir_nofollow, open_or_create_private_dir,
 };
 use outpost_p2p::{
     CLOSE_UNAUTHORIZED, LanTransportConfig, P2pEventStream, P2pTransportEvent, PartyP2pConfig,
@@ -65,8 +70,7 @@ use zeroize::{Zeroize as _, Zeroizing};
 use crate::build_info::encode_hex;
 use crate::cli::GlobalOpts;
 use crate::storage::{
-    load_device_record, load_peers_store, open_state_dir, resolve_active_device_id,
-    resolve_effective_state_dir,
+    PEERS_FILE, load_device_record, resolve_active_device_id, resolve_effective_state_dir,
 };
 
 // ---------------------------------------------------------------------------
@@ -78,13 +82,19 @@ const LAN_IDENTITY_FILE: &str = "identity.json";
 const LAN_PEERS_FILE: &str = "lan_peers.json";
 const MAX_LAN_IDENTITY_FILE_BYTES: usize = 16 * 1024;
 const MAX_LAN_PEERS_FILE_BYTES: usize = 512 * 1024;
+const MAX_PEERS_BIN_BYTES: usize = 2 * 1024 * 1024;
 const MAX_LAN_PINNED_PEERS: usize = 1024;
 const MAX_PIN_INPUT_BYTES: usize = 256;
 const LAN_PENDING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const LAN_JOIN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const LAN_APPROVAL_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_PENDING_APPROVAL_QUEUE: usize = 8;
 const LAN_REJECT_FLUSH_GRACE: Duration = Duration::from_millis(25);
 const LAN_MDNS_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
 const LAN_MDNS_SCAN_QUERY_INTERVAL: Duration = Duration::from_secs(2);
+const LAN_MDNS_REPLY_COOLDOWN: Duration = Duration::from_secs(1);
+const MAX_MDNS_UNICAST_COOLDOWN_ENTRIES: usize = 256;
+const MAX_DISCOVERED_LAN_LOBBIES: usize = 64;
 const DNS_TYPE_ANY: u16 = 255;
 
 // ---------------------------------------------------------------------------
@@ -93,7 +103,9 @@ const DNS_TYPE_ANY: u16 = 255;
 
 #[derive(Debug, Clone)]
 pub(crate) struct LanPolicyPaths {
+    pub system_unified_policy_path: Option<PathBuf>,
     pub system_policy_path: PathBuf,
+    pub user_unified_policy_path: Option<PathBuf>,
     pub user_policy_path: Option<PathBuf>,
     pub expected_system_uid: u32,
     pub expected_user_uid: Option<u32>,
@@ -102,7 +114,9 @@ pub(crate) struct LanPolicyPaths {
 impl Default for LanPolicyPaths {
     fn default() -> Self {
         Self {
+            system_unified_policy_path: Some(PathBuf::from(DEFAULT_SYSTEM_POLICY_PATH)),
             system_policy_path: PathBuf::from(DEFAULT_SYSTEM_LAN_POLICY_PATH),
+            user_unified_policy_path: None,
             user_policy_path: None,
             expected_system_uid: 0,
             expected_user_uid: None,
@@ -113,27 +127,39 @@ impl Default for LanPolicyPaths {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EffectivePolicyReport {
     pub policy: LanPolicyConfig,
+    pub effective: EffectiveLanPolicy,
+    pub system_unified_policy_loaded: bool,
+    pub system_unified_policy_path: Option<PathBuf>,
     pub system_policy_loaded: bool,
     pub system_policy_path: PathBuf,
+    pub user_unified_policy_loaded: bool,
+    pub user_unified_policy_path: Option<PathBuf>,
     pub user_policy_loaded: bool,
     pub user_policy_path: Option<PathBuf>,
     pub env_disabled: bool,
 }
 
-fn env_kill_switch_active(lookup: &dyn Fn(&str) -> Option<String>, var_name: &str) -> bool {
-    let Some(raw) = lookup(var_name) else {
+fn env_kill_switch_active(lookup: &dyn Fn(&str) -> Option<OsString>, var_name: &str) -> bool {
+    let Some(raw_os) = lookup(var_name) else {
         return false;
+    };
+    let Some(raw) = raw_os.to_str() else {
+        // Non-UTF-8 value in kill-switch env var MUST fail closed.
+        return true;
     };
     let lower = raw.trim_matches([' ', '\t']).to_ascii_lowercase();
     // Honor 1/true/yes and fail closed on any other non-empty value.
     !(lower.is_empty() || lower == "0" || lower == "false" || lower == "no")
 }
 
-fn default_user_policy_path(lookup: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+fn default_user_config_path(
+    lookup: &dyn Fn(&str) -> Option<OsString>,
+    filename: &str,
+) -> Option<PathBuf> {
     if let Some(xdg) = lookup("XDG_CONFIG_HOME")
         && !xdg.is_empty()
     {
-        return Some(PathBuf::from(xdg).join("mp-outpost").join("lan.toml"));
+        return Some(PathBuf::from(xdg).join("mp-outpost").join(filename));
     }
     if let Some(home) = lookup("HOME")
         && !home.is_empty()
@@ -142,7 +168,7 @@ fn default_user_policy_path(lookup: &dyn Fn(&str) -> Option<String>) -> Option<P
             PathBuf::from(home)
                 .join(".config")
                 .join("mp-outpost")
-                .join("lan.toml"),
+                .join(filename),
         );
     }
     None
@@ -157,53 +183,111 @@ fn read_verified_policy_file(
     if raw_bytes.is_empty() {
         return Err("LAN policy path must not be empty".to_string());
     }
-    let cpath = CString::new(raw_bytes)
-        .map_err(|_| format!("LAN policy path '{}' contains NUL byte", path.display()))?;
+    let Some(parent) = path.parent() else {
+        return Err(format!(
+            "LAN policy path '{}' has no parent directory",
+            path.display()
+        ));
+    };
+    let Some(leaf) = path.file_name() else {
+        return Err(format!(
+            "LAN policy path '{}' has no filename",
+            path.display()
+        ));
+    };
 
-    let mut lst: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::lstat(cpath.as_ptr(), &mut lst) } != 0 {
-        let err = io::Error::last_os_error();
-        if err.kind() == io::ErrorKind::NotFound {
-            return Ok(None);
+    let mut parent_bytes = parent.as_os_str().as_bytes();
+    if parent_bytes.is_empty() {
+        parent_bytes = b".";
+    }
+    while parent_bytes.len() > 1 && parent_bytes.ends_with(b"/") {
+        if let Some(prefix) = parent_bytes.strip_suffix(b"/") {
+            parent_bytes = prefix;
+        } else {
+            break;
         }
-        return Err(format!(
-            "failed to stat LAN policy '{}': {err}",
-            path.display()
-        ));
     }
+    let cparent = CString::new(parent_bytes)
+        .map_err(|_| format!("policy parent path '{}' contains NUL byte", parent.display()))?;
+    let cleaf = CString::new(leaf.as_bytes())
+        .map_err(|_| format!("LAN policy filename '{}' contains NUL byte", path.display()))?;
 
-    let ltype = lst.st_mode & libc::S_IFMT;
-    if ltype == libc::S_IFLNK {
+    // Verify parent directory via O_DIRECTORY | O_NOFOLLOW BEFORE treating ENOENT leaf as absent!
+    let parent_raw_fd = loop {
+        let fd = unsafe {
+            libc::open(
+                cparent.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.kind() == io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                return Err(format!(
+                    "refusing symlinked policy parent directory '{}' (fail closed)",
+                    parent.display()
+                ));
+            }
+            if err.raw_os_error() == Some(libc::ENOTDIR) {
+                let mut lst: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::lstat(cparent.as_ptr(), &mut lst) } == 0
+                    && (lst.st_mode & libc::S_IFMT) == libc::S_IFLNK
+                {
+                    return Err(format!(
+                        "refusing symlinked policy parent directory '{}' (fail closed)",
+                        parent.display()
+                    ));
+                }
+            }
+            return Err(format!(
+                "failed opening policy parent directory '{}': {err}",
+                parent.display()
+            ));
+        }
+        break fd;
+    };
+    let parent_fd = unsafe { OwnedFd::from_raw_fd(parent_raw_fd) };
+
+    let mut pst: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(parent_fd.as_raw_fd(), &mut pst) } != 0 {
         return Err(format!(
-            "refusing symlinked LAN policy '{}' (fail closed)",
-            path.display()
+            "failed to fstat policy parent directory '{}': {}",
+            parent.display(),
+            io::Error::last_os_error()
         ));
     }
-    if ltype != libc::S_IFREG {
+    if (pst.st_mode & libc::S_IFMT) != libc::S_IFDIR {
         return Err(format!(
-            "refusing non-regular LAN policy '{}' (fail closed)",
-            path.display()
+            "refusing non-directory policy parent '{}' (fail closed)",
+            parent.display()
         ));
     }
-    if lst.st_uid != expected_uid {
+    if pst.st_uid != expected_uid {
         return Err(format!(
-            "refusing LAN policy '{}': expected owner uid={expected_uid}, got uid={}",
-            path.display(),
-            lst.st_uid
+            "refusing policy parent '{}': expected owner uid={expected_uid}, got uid={}",
+            parent.display(),
+            pst.st_uid
         ));
     }
-    if forbid_group_world_write && (lst.st_mode & 0o022) != 0 {
+    if forbid_group_world_write && (pst.st_mode & 0o022) != 0 {
         return Err(format!(
-            "refusing group/world-writable LAN policy '{}' (mode {:04o})",
-            path.display(),
-            lst.st_mode & 0o7777
+            "refusing group/world-writable policy parent '{}' (mode {:04o})",
+            parent.display(),
+            pst.st_mode & 0o7777
         ));
     }
 
     let raw_fd = loop {
         let fd = unsafe {
-            libc::open(
-                cpath.as_ptr(),
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                cleaf.as_ptr(),
                 libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
             )
         };
@@ -211,6 +295,9 @@ fn read_verified_policy_file(
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
+            }
+            if err.kind() == io::ErrorKind::NotFound {
+                return Ok(None);
             }
             if err.raw_os_error() == Some(libc::ELOOP) {
                 return Err(format!(
@@ -235,20 +322,24 @@ fn read_verified_policy_file(
             io::Error::last_os_error()
         ));
     }
-    if (fst.st_mode & libc::S_IFMT) != libc::S_IFREG
-        || fst.st_dev != lst.st_dev
-        || fst.st_ino != lst.st_ino
-        || fst.st_uid != expected_uid
-    {
+    if (fst.st_mode & libc::S_IFMT) != libc::S_IFREG {
         return Err(format!(
-            "LAN policy '{}' changed or failed ownership check (fail closed)",
+            "refusing non-regular LAN policy '{}' (fail closed)",
             path.display()
+        ));
+    }
+    if fst.st_uid != expected_uid {
+        return Err(format!(
+            "refusing LAN policy '{}': expected owner uid={expected_uid}, got uid={}",
+            path.display(),
+            fst.st_uid
         ));
     }
     if forbid_group_world_write && (fst.st_mode & 0o022) != 0 {
         return Err(format!(
-            "refusing group/world-writable LAN policy '{}'",
-            path.display()
+            "refusing group/world-writable LAN policy '{}' (mode {:04o})",
+            path.display(),
+            fst.st_mode & 0o7777
         ));
     }
     if fst.st_size < 0 || (fst.st_size as u64) > (MAX_LAN_POLICY_FILE_BYTES as u64) {
@@ -277,60 +368,111 @@ fn read_verified_policy_file(
 
 pub(crate) fn load_effective_lan_policy(
     paths: &LanPolicyPaths,
-    env_lookup: &dyn Fn(&str) -> Option<String>,
+    env_lookup: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<EffectivePolicyReport, String> {
-    let mut sys_policy: Option<LanPolicyConfig> = None;
+    let mut sys_unified: Option<UnifiedPolicyFile> = None;
+    if let Some(ref upath) = paths.system_unified_policy_path
+        && !upath.as_os_str().is_empty()
+        && let Some(text) = read_verified_policy_file(upath, paths.expected_system_uid, true)?
+    {
+        let parsed = parse_unified_policy_toml(&text).map_err(|e| {
+            format!(
+                "malformed system unified policy '{}' (fail closed): {e}",
+                upath.display()
+            )
+        })?;
+        sys_unified = Some(parsed);
+    }
+
+    let mut sys_legacy: Option<PartialLanPolicy> = None;
     if !paths.system_policy_path.as_os_str().is_empty()
         && let Some(sys_text) =
             read_verified_policy_file(&paths.system_policy_path, paths.expected_system_uid, true)?
     {
-        let parsed = parse_lan_policy_toml(&sys_text).map_err(|e| {
+        let parsed = parse_partial_lan_policy_toml(&sys_text).map_err(|e| {
             format!(
                 "malformed system LAN policy '{}' (fail closed): {e}",
                 paths.system_policy_path.display()
             )
         })?;
-        sys_policy = Some(parsed);
+        sys_legacy = Some(parsed);
+    }
+
+    let expected_user_uid = paths
+        .expected_user_uid
+        .unwrap_or_else(|| unsafe { libc::geteuid() });
+
+    let resolved_user_unified_path = paths
+        .user_unified_policy_path
+        .clone()
+        .or_else(|| default_user_config_path(env_lookup, "policy.toml"));
+    let mut user_unified: Option<UnifiedPolicyFile> = None;
+    if let Some(ref upath) = resolved_user_unified_path
+        && !upath.as_os_str().is_empty()
+        && let Some(text) = read_verified_policy_file(upath, expected_user_uid, true)?
+    {
+        let parsed = parse_unified_policy_toml(&text).map_err(|e| {
+            format!(
+                "malformed user unified policy '{}' (fail closed): {e}",
+                upath.display()
+            )
+        })?;
+        user_unified = Some(parsed);
     }
 
     let resolved_user_path = paths
         .user_policy_path
         .clone()
-        .or_else(|| default_user_policy_path(env_lookup));
-    let mut user_policy: Option<LanPolicyConfig> = None;
+        .or_else(|| default_user_config_path(env_lookup, "lan.toml"));
+    let mut user_legacy: Option<PartialLanPolicy> = None;
     if let Some(ref upath) = resolved_user_path
         && !upath.as_os_str().is_empty()
+        && let Some(user_text) = read_verified_policy_file(upath, expected_user_uid, true)?
     {
-        let expected_uid = paths
-            .expected_user_uid
-            .unwrap_or_else(|| unsafe { libc::geteuid() });
-        if let Some(user_text) = read_verified_policy_file(upath, expected_uid, true)? {
-            let parsed = parse_lan_policy_toml(&user_text).map_err(|e| {
-                format!(
-                    "malformed user LAN policy '{}' (fail closed): {e}",
-                    upath.display()
-                )
-            })?;
-            user_policy = Some(parsed);
-        }
+        let parsed = parse_partial_lan_policy_toml(&user_text).map_err(|e| {
+            format!(
+                "malformed user LAN policy '{}' (fail closed): {e}",
+                upath.display()
+            )
+        })?;
+        user_legacy = Some(parsed);
     }
 
     let env_disabled = env_kill_switch_active(env_lookup, "MP_DISABLE_LAN")
         || env_kill_switch_active(env_lookup, "BLACKBIRD_DISABLE_LAN");
 
-    let policy = merge_lan_policy_floor(sys_policy.as_ref(), user_policy.as_ref(), env_disabled);
+    let effective = if sys_unified.is_some() || user_unified.is_some() {
+        merge_unified_policy_floor(
+            sys_unified.as_ref(),
+            sys_legacy.as_ref(),
+            user_unified.as_ref(),
+            user_legacy.as_ref(),
+            env_disabled,
+            None,
+        )
+        .map_err(|e| format!("failed merging unified policy floor (fail closed): {e}"))?
+        .lan
+    } else {
+        resolve_lan_policy(sys_legacy.as_ref(), user_legacy.as_ref(), env_disabled)
+    };
+
     Ok(EffectivePolicyReport {
-        policy,
-        system_policy_loaded: sys_policy.is_some(),
+        policy: effective.config,
+        effective,
+        system_unified_policy_loaded: sys_unified.is_some(),
+        system_unified_policy_path: paths.system_unified_policy_path.clone(),
+        system_policy_loaded: sys_legacy.is_some(),
         system_policy_path: paths.system_policy_path.clone(),
-        user_policy_loaded: user_policy.is_some(),
+        user_unified_policy_loaded: user_unified.is_some(),
+        user_unified_policy_path: resolved_user_unified_path,
+        user_policy_loaded: user_legacy.is_some(),
         user_policy_path: resolved_user_path,
         env_disabled,
     })
 }
 
-fn process_env_lookup(key: &str) -> Option<String> {
-    std::env::var(key).ok()
+fn process_env_lookup(key: &str) -> Option<OsString> {
+    std::env::var_os(key)
 }
 
 fn enforce_lan_enabled_and_local_auth(
@@ -350,24 +492,33 @@ fn enforce_lan_enabled_and_local_auth(
 }
 
 // ---------------------------------------------------------------------------
-// 2. Local OS Presence Guard (Mandate #6: macOS LAContext dlopen + sudo -k/-v)
+// 2. Local OS Presence Guard (Mandate #6: macOS LAContext dlopen + sudo -k -v)
 // ---------------------------------------------------------------------------
 
 fn verify_via_sudo() -> Result<(), String> {
-    // Always invalidate cached sudo timestamp FIRST so a walk-up attacker cannot reuse grace windows.
-    let k_status = Command::new("/usr/bin/sudo")
-        .arg("-k")
+    // Mandate #6: probe non-interactively after invalidating any cached timestamp.
+    // If sudo succeeds without prompting (NOPASSWD), fail closed!
+    let nopasswd_probe = Command::new("/usr/bin/sudo")
+        .args(["-k", "-n", "-v"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
-        .map_err(|e| format!("local OS presence guard failed executing /usr/bin/sudo -k: {e}"))?;
-    if !k_status.success() {
-        return Err("local OS presence guard failed: /usr/bin/sudo -k returned non-zero".to_string());
+        .map_err(|e| {
+            format!("local OS presence guard failed executing /usr/bin/sudo -k -n -v: {e}")
+        })?;
+    if nopasswd_probe.success() {
+        return Err("refusing NOPASSWD sudo for local OS presence check".to_string());
     }
+
+    // Single invocation invalidates cached credentials and immediately prompts interactively,
+    // eliminating any two-process `-k` then `-v` race window.
     let v_status = Command::new("/usr/bin/sudo")
-        .arg("-v")
+        .args(["-k", "-v"])
         .status()
-        .map_err(|e| format!("local OS presence guard failed executing /usr/bin/sudo -v: {e}"))?;
+        .map_err(|e| format!("local OS presence guard failed executing /usr/bin/sudo -k -v: {e}"))?;
     if !v_status.success() {
-        return Err("local OS presence authentication denied (/usr/bin/sudo -v)".to_string());
+        return Err("local OS presence authentication denied (/usr/bin/sudo -k -v)".to_string());
     }
     Ok(())
 }
@@ -375,33 +526,122 @@ fn verify_via_sudo() -> Result<(), String> {
 #[cfg(target_os = "macos")]
 mod macos_local_auth {
     use std::ffi::{CString, c_char, c_int, c_long, c_void};
-    use std::sync::{Condvar, Mutex};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    const LA_POLICY_DEVICE_OWNER_AUTHENTICATION: c_long = 2;
+    const BLOCK_HAS_COPY_DISPOSE: c_int = 1 << 25;
+    const LA_EVAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+    type ObjcGetClassFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+    type SelRegisterNameFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+    type MsgSendIdFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
+    type MsgSendVoidFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
+    type MsgSendIdCStrFn =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char) -> *mut c_void;
+    type MsgSendCanEvalFn =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, c_long, *mut *mut c_void) -> i8;
+    type MsgSendEvalFn =
+        unsafe extern "C" fn(*mut c_void, *mut c_void, c_long, *mut c_void, *mut c_void);
+    type ObjcAutoreleasePoolPushFn = unsafe extern "C" fn() -> *mut c_void;
+    type ObjcAutoreleasePoolPopFn = unsafe extern "C" fn(*mut c_void);
+
+    struct LaSymbols {
+        get_class: ObjcGetClassFn,
+        reg_sel: SelRegisterNameFn,
+        msg_id: MsgSendIdFn,
+        msg_void: MsgSendVoidFn,
+        msg_id_cstr: MsgSendIdCStrFn,
+        msg_can_eval: MsgSendCanEvalFn,
+        msg_eval: MsgSendEvalFn,
+        pool_push: ObjcAutoreleasePoolPushFn,
+        pool_pop: ObjcAutoreleasePoolPopFn,
+        stack_block_isa: *mut c_void,
+    }
+
+    // SAFETY: Function pointers and `_NSConcreteStackBlock` class pointer loaded with
+    // `RTLD_NODELETE` remain valid and immutable for the entire process lifetime.
+    unsafe impl Send for LaSymbols {}
+    unsafe impl Sync for LaSymbols {}
+
+    static LA_SYMBOLS: OnceLock<Option<LaSymbols>> = OnceLock::new();
+
+    fn load_la_symbols() -> Option<&'static LaSymbols> {
+        LA_SYMBOLS
+            .get_or_init(|| {
+                let la_path =
+                    c"/System/Library/Frameworks/LocalAuthentication.framework/LocalAuthentication";
+                let fnd_path = c"/System/Library/Frameworks/Foundation.framework/Foundation";
+                let objc_path = c"/usr/lib/libobjc.A.dylib";
+
+                let flags = libc::RTLD_LAZY | libc::RTLD_LOCAL | libc::RTLD_NODELETE;
+                let la_fw = unsafe { libc::dlopen(la_path.as_ptr(), flags) };
+                let fnd_fw = unsafe { libc::dlopen(fnd_path.as_ptr(), flags) };
+                let objc_lib = unsafe { libc::dlopen(objc_path.as_ptr(), flags) };
+                if la_fw.is_null() || fnd_fw.is_null() || objc_lib.is_null() {
+                    return None;
+                }
+
+                let sym_get_class = unsafe { libc::dlsym(objc_lib, c"objc_getClass".as_ptr()) };
+                let sym_reg_sel = unsafe { libc::dlsym(objc_lib, c"sel_registerName".as_ptr()) };
+                let sym_msg_send = unsafe { libc::dlsym(objc_lib, c"objc_msgSend".as_ptr()) };
+                let sym_pool_push =
+                    unsafe { libc::dlsym(objc_lib, c"objc_autoreleasePoolPush".as_ptr()) };
+                let sym_pool_pop =
+                    unsafe { libc::dlsym(objc_lib, c"objc_autoreleasePoolPop".as_ptr()) };
+                let stack_block_isa =
+                    unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"_NSConcreteStackBlock".as_ptr()) };
+                if sym_get_class.is_null()
+                    || sym_reg_sel.is_null()
+                    || sym_msg_send.is_null()
+                    || sym_pool_push.is_null()
+                    || sym_pool_pop.is_null()
+                    || stack_block_isa.is_null()
+                {
+                    return None;
+                }
+
+                Some(LaSymbols {
+                    get_class: unsafe { std::mem::transmute::<*mut c_void, ObjcGetClassFn>(sym_get_class) },
+                    reg_sel: unsafe { std::mem::transmute::<*mut c_void, SelRegisterNameFn>(sym_reg_sel) },
+                    msg_id: unsafe { std::mem::transmute::<*mut c_void, MsgSendIdFn>(sym_msg_send) },
+                    msg_void: unsafe { std::mem::transmute::<*mut c_void, MsgSendVoidFn>(sym_msg_send) },
+                    msg_id_cstr: unsafe { std::mem::transmute::<*mut c_void, MsgSendIdCStrFn>(sym_msg_send) },
+                    msg_can_eval: unsafe { std::mem::transmute::<*mut c_void, MsgSendCanEvalFn>(sym_msg_send) },
+                    msg_eval: unsafe { std::mem::transmute::<*mut c_void, MsgSendEvalFn>(sym_msg_send) },
+                    pool_push: unsafe {
+                        std::mem::transmute::<*mut c_void, ObjcAutoreleasePoolPushFn>(sym_pool_push)
+                    },
+                    pool_pop: unsafe {
+                        std::mem::transmute::<*mut c_void, ObjcAutoreleasePoolPopFn>(sym_pool_pop)
+                    },
+                    stack_block_isa,
+                })
+            })
+            .as_ref()
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum LocalAuthOutcome {
         Authorized,
         Denied,
+        TimedOut,
         Unavailable,
     }
 
-    pub(super) fn is_headless_ssh() -> bool {
-        for key in ["SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"] {
-            if std::env::var_os(key).is_some_and(|v| !v.is_empty()) {
-                return true;
-            }
-        }
-        false
-    }
-
-    #[repr(C)]
-    struct ObjcBlockDescriptor {
-        reserved: libc::c_ulong,
-        size: libc::c_ulong,
-    }
-
-    struct WaitState {
+    struct LaWaitState {
         done: bool,
         succeeded: bool,
+    }
+
+    type LaWaitPair = (Mutex<LaWaitState>, Condvar);
+
+    #[repr(C)]
+    struct LaBlockDescriptor {
+        reserved: libc::c_ulong,
+        size: libc::c_ulong,
+        copy_helper: unsafe extern "C" fn(*mut c_void, *const c_void),
+        dispose_helper: unsafe extern "C" fn(*mut c_void),
     }
 
     #[repr(C)]
@@ -409,12 +649,40 @@ mod macos_local_auth {
         isa: *mut c_void,
         flags: c_int,
         reserved: c_int,
-        invoke: extern "C" fn(*mut LaReplyBlock, i8, *mut c_void),
-        descriptor: *const ObjcBlockDescriptor,
-        pair: *const (Mutex<WaitState>, Condvar),
+        invoke: unsafe extern "C" fn(*mut LaReplyBlock, i8, *mut c_void),
+        descriptor: *const LaBlockDescriptor,
+        pair: *const LaWaitPair,
     }
 
-    extern "C" fn la_reply_invoke(block: *mut LaReplyBlock, success: i8, _err: *mut c_void) {
+    unsafe extern "C" fn la_block_copy_helper(dst: *mut c_void, src: *const c_void) {
+        if dst.is_null() || src.is_null() {
+            return;
+        }
+        let src_block = unsafe { &*(src.cast::<LaReplyBlock>()) };
+        let dst_block = unsafe { &mut *(dst.cast::<LaReplyBlock>()) };
+        if !src_block.pair.is_null() {
+            unsafe {
+                Arc::increment_strong_count(src_block.pair);
+            }
+            dst_block.pair = src_block.pair;
+        }
+    }
+
+    unsafe extern "C" fn la_block_dispose_helper(src: *mut c_void) {
+        if src.is_null() {
+            return;
+        }
+        let block = unsafe { &mut *(src.cast::<LaReplyBlock>()) };
+        if !block.pair.is_null() {
+            let ptr = block.pair;
+            block.pair = std::ptr::null();
+            unsafe {
+                drop(Arc::from_raw(ptr));
+            }
+        }
+    }
+
+    unsafe extern "C" fn la_reply_invoke(block: *mut LaReplyBlock, success: i8, _err: *mut c_void) {
         if block.is_null() {
             return;
         }
@@ -429,13 +697,34 @@ mod macos_local_auth {
         };
         guard.succeeded = success != 0;
         guard.done = true;
-        // Notify while holding mutex so stack-allocated Condvar stays alive until notify finishes.
         cv.notify_one();
+    }
+
+    struct AutoreleasePoolGuard {
+        pool: *mut c_void,
+        pop: ObjcAutoreleasePoolPopFn,
+    }
+
+    impl AutoreleasePoolGuard {
+        fn new(push: ObjcAutoreleasePoolPushFn, pop: ObjcAutoreleasePoolPopFn) -> Self {
+            let pool = unsafe { push() };
+            Self { pool, pop }
+        }
+    }
+
+    impl Drop for AutoreleasePoolGuard {
+        fn drop(&mut self) {
+            if !self.pool.is_null() {
+                unsafe {
+                    (self.pop)(self.pool);
+                }
+            }
+        }
     }
 
     struct ObjcReleaseGuard {
         obj: *mut c_void,
-        send_void: unsafe extern "C" fn(*mut c_void, *mut c_void),
+        send_void: MsgSendVoidFn,
         release_sel: *mut c_void,
     }
 
@@ -449,134 +738,120 @@ mod macos_local_auth {
         }
     }
 
-    pub(super) fn verify_via_lacontext(reason: &str) -> LocalAuthOutcome {
-        const LA_POLICY_DEVICE_OWNER_AUTHENTICATION: c_long = 2;
+    struct StackBlockArcGuard(*const LaWaitPair);
 
+    impl Drop for StackBlockArcGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    drop(Arc::from_raw(self.0));
+                }
+            }
+        }
+    }
+
+    pub(super) fn verify_via_lacontext(reason: &str) -> LocalAuthOutcome {
         let Ok(reason_c) = CString::new(reason) else {
             return LocalAuthOutcome::Unavailable;
         };
-
-        let la_path = c"/System/Library/Frameworks/LocalAuthentication.framework/LocalAuthentication";
-        let fnd_path = c"/System/Library/Frameworks/Foundation.framework/Foundation";
-        let objc_path = c"/usr/lib/libobjc.A.dylib";
-
-        let flags = libc::RTLD_LAZY | libc::RTLD_LOCAL | libc::RTLD_NODELETE;
-        let la_fw = unsafe { libc::dlopen(la_path.as_ptr(), flags) };
-        let fnd_fw = unsafe { libc::dlopen(fnd_path.as_ptr(), flags) };
-        let objc_lib = unsafe { libc::dlopen(objc_path.as_ptr(), flags) };
-        if la_fw.is_null() || fnd_fw.is_null() || objc_lib.is_null() {
+        let Some(syms) = load_la_symbols() else {
             return LocalAuthOutcome::Unavailable;
-        }
+        };
 
-        let sym_get_class = unsafe { libc::dlsym(objc_lib, c"objc_getClass".as_ptr()) };
-        let sym_reg_sel = unsafe { libc::dlsym(objc_lib, c"sel_registerName".as_ptr()) };
-        let sym_msg_send = unsafe { libc::dlsym(objc_lib, c"objc_msgSend".as_ptr()) };
-        let stack_block_isa =
-            unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"_NSConcreteStackBlock".as_ptr()) };
-        if sym_get_class.is_null()
-            || sym_reg_sel.is_null()
-            || sym_msg_send.is_null()
-            || stack_block_isa.is_null()
-        {
-            return LocalAuthOutcome::Unavailable;
-        }
+        // Wrap ALL Objective-C calls in an RAII autorelease pool.
+        let _pool = AutoreleasePoolGuard::new(syms.pool_push, syms.pool_pop);
 
-        type ObjcGetClassFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
-        type SelRegisterNameFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
-        type MsgSendIdFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
-        type MsgSendVoidFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
-        type MsgSendIdCStrFn =
-            unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char) -> *mut c_void;
-        type MsgSendCanEvalFn =
-            unsafe extern "C" fn(*mut c_void, *mut c_void, c_long, *mut *mut c_void) -> i8;
-        type MsgSendEvalFn =
-            unsafe extern "C" fn(*mut c_void, *mut c_void, c_long, *mut c_void, *mut c_void);
-
-        let get_class: ObjcGetClassFn = unsafe { std::mem::transmute(sym_get_class) };
-        let reg_sel: SelRegisterNameFn = unsafe { std::mem::transmute(sym_reg_sel) };
-        let msg_id: MsgSendIdFn = unsafe { std::mem::transmute(sym_msg_send) };
-        let msg_void: MsgSendVoidFn = unsafe { std::mem::transmute(sym_msg_send) };
-        let msg_id_cstr: MsgSendIdCStrFn = unsafe { std::mem::transmute(sym_msg_send) };
-        let msg_can_eval: MsgSendCanEvalFn = unsafe { std::mem::transmute(sym_msg_send) };
-        let msg_eval: MsgSendEvalFn = unsafe { std::mem::transmute(sym_msg_send) };
-
-        let la_ctx_cls = unsafe { get_class(c"LAContext".as_ptr()) };
-        let ns_string_cls = unsafe { get_class(c"NSString".as_ptr()) };
+        let la_ctx_cls = unsafe { (syms.get_class)(c"LAContext".as_ptr()) };
+        let ns_string_cls = unsafe { (syms.get_class)(c"NSString".as_ptr()) };
         if la_ctx_cls.is_null() || ns_string_cls.is_null() {
             return LocalAuthOutcome::Unavailable;
         }
 
-        let sel_alloc = unsafe { reg_sel(c"alloc".as_ptr()) };
-        let sel_init = unsafe { reg_sel(c"init".as_ptr()) };
-        let sel_release = unsafe { reg_sel(c"release".as_ptr()) };
-        let sel_init_utf8 = unsafe { reg_sel(c"initWithUTF8String:".as_ptr()) };
-        let sel_can_eval = unsafe { reg_sel(c"canEvaluatePolicy:error:".as_ptr()) };
-        let sel_eval = unsafe { reg_sel(c"evaluatePolicy:localizedReason:reply:".as_ptr()) };
+        let sel_alloc = unsafe { (syms.reg_sel)(c"alloc".as_ptr()) };
+        let sel_init = unsafe { (syms.reg_sel)(c"init".as_ptr()) };
+        let sel_release = unsafe { (syms.reg_sel)(c"release".as_ptr()) };
+        let sel_invalidate = unsafe { (syms.reg_sel)(c"invalidate".as_ptr()) };
+        let sel_init_utf8 = unsafe { (syms.reg_sel)(c"initWithUTF8String:".as_ptr()) };
+        let sel_can_eval = unsafe { (syms.reg_sel)(c"canEvaluatePolicy:error:".as_ptr()) };
+        let sel_eval =
+            unsafe { (syms.reg_sel)(c"evaluatePolicy:localizedReason:reply:".as_ptr()) };
 
-        let ctx_alloc = unsafe { msg_id(la_ctx_cls, sel_alloc) };
+        let ctx_alloc = unsafe { (syms.msg_id)(la_ctx_cls, sel_alloc) };
         if ctx_alloc.is_null() {
             return LocalAuthOutcome::Unavailable;
         }
-        let ctx = unsafe { msg_id(ctx_alloc, sel_init) };
+        let ctx = unsafe { (syms.msg_id)(ctx_alloc, sel_init) };
         if ctx.is_null() {
+            unsafe {
+                (syms.msg_void)(ctx_alloc, sel_release);
+            }
             return LocalAuthOutcome::Unavailable;
         }
         let _ctx_guard = ObjcReleaseGuard {
             obj: ctx,
-            send_void: msg_void,
+            send_void: syms.msg_void,
             release_sel: sel_release,
         };
 
-        let mut ns_err: *mut c_void = std::ptr::null_mut();
+        // Pass NULL for the nullable `NSError **` out-param so no autoreleased NSError is
+        // allocated (zero leak, zero double-release under `_pool`).
         let can_eval = unsafe {
-            msg_can_eval(
+            (syms.msg_can_eval)(
                 ctx,
                 sel_can_eval,
                 LA_POLICY_DEVICE_OWNER_AUTHENTICATION,
-                &mut ns_err,
+                std::ptr::null_mut(),
             )
         };
         if can_eval == 0 {
             return LocalAuthOutcome::Unavailable;
         }
 
-        let str_alloc = unsafe { msg_id(ns_string_cls, sel_alloc) };
+        let str_alloc = unsafe { (syms.msg_id)(ns_string_cls, sel_alloc) };
         if str_alloc.is_null() {
             return LocalAuthOutcome::Unavailable;
         }
-        let ns_reason = unsafe { msg_id_cstr(str_alloc, sel_init_utf8, reason_c.as_ptr()) };
+        let ns_reason = unsafe { (syms.msg_id_cstr)(str_alloc, sel_init_utf8, reason_c.as_ptr()) };
         if ns_reason.is_null() {
+            unsafe {
+                (syms.msg_void)(str_alloc, sel_release);
+            }
             return LocalAuthOutcome::Unavailable;
         }
         let _reason_guard = ObjcReleaseGuard {
             obj: ns_reason,
-            send_void: msg_void,
+            send_void: syms.msg_void,
             release_sel: sel_release,
         };
 
-        static BLOCK_DESC: ObjcBlockDescriptor = ObjcBlockDescriptor {
+        static BLOCK_DESC: LaBlockDescriptor = LaBlockDescriptor {
             reserved: 0,
             size: std::mem::size_of::<LaReplyBlock>() as libc::c_ulong,
+            copy_helper: la_block_copy_helper,
+            dispose_helper: la_block_dispose_helper,
         };
 
-        let wait_pair = (
-            Mutex::new(WaitState {
+        let wait_pair: Arc<LaWaitPair> = Arc::new((
+            Mutex::new(LaWaitState {
                 done: false,
                 succeeded: false,
             }),
             Condvar::new(),
-        );
+        ));
+        let stack_pair_raw = Arc::into_raw(Arc::clone(&wait_pair));
+        let _stack_arc_guard = StackBlockArcGuard(stack_pair_raw);
+
         let mut reply_block = LaReplyBlock {
-            isa: stack_block_isa,
-            flags: 0,
+            isa: syms.stack_block_isa,
+            flags: BLOCK_HAS_COPY_DISPOSE,
             reserved: 0,
             invoke: la_reply_invoke,
             descriptor: &BLOCK_DESC,
-            pair: &wait_pair,
+            pair: stack_pair_raw,
         };
 
         unsafe {
-            msg_eval(
+            (syms.msg_eval)(
                 ctx,
                 sel_eval,
                 LA_POLICY_DEVICE_OWNER_AUTHENTICATION,
@@ -585,16 +860,31 @@ mod macos_local_auth {
             );
         }
 
-        let (mu, cv) = &wait_pair;
+        let (mu, cv) = &*wait_pair;
+        let deadline = Instant::now() + LA_EVAL_TIMEOUT;
         let mut guard = match mu.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         while !guard.done {
-            guard = match cv.wait(guard) {
-                Ok(g) => g,
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let (next_guard, wait_res) = match cv.wait_timeout(guard, remaining) {
+                Ok(pair) => pair,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            guard = next_guard;
+            if wait_res.timed_out() {
+                break;
+            }
+        }
+        if !guard.done {
+            drop(guard);
+            unsafe {
+                (syms.msg_void)(ctx, sel_invalidate);
+            }
+            return LocalAuthOutcome::TimedOut;
         }
         if guard.succeeded {
             LocalAuthOutcome::Authorized
@@ -604,7 +894,10 @@ mod macos_local_auth {
     }
 }
 
-pub(crate) fn verify_local_os_presence(reason: &str) -> Result<(), String> {
+fn verify_local_os_presence_paused(
+    _pause: &TtyPromptPauseGuard,
+    reason: &str,
+) -> Result<(), String> {
     if reason.is_empty()
         || reason.len() > 256
         || reason.chars().any(|c| (c as u32) < 0x20 || c == '\x7f')
@@ -614,15 +907,20 @@ pub(crate) fn verify_local_os_presence(reason: &str) -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     {
-        if !macos_local_auth::is_headless_ssh() {
-            match macos_local_auth::verify_via_lacontext(reason) {
-                macos_local_auth::LocalAuthOutcome::Authorized => return Ok(()),
-                macos_local_auth::LocalAuthOutcome::Denied => {
-                    return Err("local OS presence authentication denied (Touch ID / macOS password)".to_string());
-                }
-                macos_local_auth::LocalAuthOutcome::Unavailable => {
-                    // Fall back to sudo -k && sudo -v.
-                }
+        // Attempt LAContext unconditionally first; never skip based on spoofable SSH_* env vars.
+        match macos_local_auth::verify_via_lacontext(reason) {
+            macos_local_auth::LocalAuthOutcome::Authorized => return Ok(()),
+            macos_local_auth::LocalAuthOutcome::Denied => {
+                return Err(
+                    "local OS presence authentication denied (Touch ID / macOS password)"
+                        .to_string(),
+                );
+            }
+            macos_local_auth::LocalAuthOutcome::TimedOut => {
+                return Err("local authentication timed out".to_string());
+            }
+            macos_local_auth::LocalAuthOutcome::Unavailable => {
+                // Fall back to sudo -k -n -v probe + sudo -k -v only when LAContext is unavailable.
             }
         }
         verify_via_sudo()
@@ -632,6 +930,11 @@ pub(crate) fn verify_local_os_presence(reason: &str) -> Result<(), String> {
     {
         verify_via_sudo()
     }
+}
+
+pub(crate) fn verify_local_os_presence(reason: &str) -> Result<(), String> {
+    let pause = TtyPromptPauseGuard::acquire();
+    verify_local_os_presence_paused(&pause, reason)
 }
 
 // ---------------------------------------------------------------------------
@@ -730,10 +1033,14 @@ impl LanTermiosEchoGuard {
 
 impl Drop for LanTermiosEchoGuard {
     fn drop(&mut self) {
+        // Restore termios BEFORE clearing the static signal-recovery slot so a late
+        // SIGINT/SIGTERM during drop still restores terminal echo.
+        unsafe {
+            let _ = libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.saved);
+        }
         LAN_SAVED_TERMIOS_VALID.store(false, Ordering::Release);
         LAN_SAVED_TTY_FD.store(-1, Ordering::Release);
         unsafe {
-            let _ = libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.saved);
             if self.signals_installed {
                 let _ = libc::sigaction(libc::SIGINT, &self.prev_sigint, std::ptr::null_mut());
                 let _ = libc::sigaction(libc::SIGTERM, &self.prev_sigterm, std::ptr::null_mut());
@@ -760,10 +1067,40 @@ pub(crate) fn normalize_and_validate_pin(raw: Zeroizing<String>) -> Result<Zeroi
     Ok(normalized)
 }
 
-fn read_line_unbuffered_fd(fd: RawFd, max_bytes: usize) -> Result<Zeroizing<String>, String> {
-    let mut buf = Zeroizing::new(Vec::with_capacity(64));
+fn read_line_unbuffered_fd_timeout(
+    fd: RawFd,
+    max_bytes: usize,
+    timeout: Option<Duration>,
+) -> Result<Zeroizing<String>, String> {
+    // Pre-allocate full capacity so secret bytes are never copied across heap reallocations.
+    let mut buf = Zeroizing::new(Vec::with_capacity(max_bytes.saturating_add(1)));
     let mut byte = [0u8; 1];
+    let deadline = timeout.map(|d| Instant::now() + d);
     loop {
+        if let Some(dl) = deadline {
+            let Some(rem) = dl.checked_duration_since(Instant::now()) else {
+                byte.zeroize();
+                return Err("timed out waiting for /dev/tty input".to_string());
+            };
+            let poll_ms = i32::try_from(rem.as_millis().min(250)).unwrap_or(250).max(1);
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let prc = unsafe { libc::poll(&mut pfd, 1, poll_ms) };
+            if prc == 0 {
+                continue;
+            }
+            if prc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                byte.zeroize();
+                return Err(format!("failed polling secret input: {err}"));
+            }
+        }
         let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
         if n < 0 {
             let err = io::Error::last_os_error();
@@ -805,6 +1142,10 @@ fn read_line_unbuffered_fd(fd: RawFd, max_bytes: usize) -> Result<Zeroizing<Stri
     Ok(s)
 }
 
+fn read_line_unbuffered_fd(fd: RawFd, max_bytes: usize) -> Result<Zeroizing<String>, String> {
+    read_line_unbuffered_fd_timeout(fd, max_bytes, None)
+}
+
 fn read_pin_from_stdin() -> Result<Zeroizing<String>, String> {
     if unsafe { libc::isatty(libc::STDIN_FILENO) == 1 } {
         return Err(
@@ -817,6 +1158,7 @@ fn read_pin_from_stdin() -> Result<Zeroizing<String>, String> {
 }
 
 fn read_pin_from_tty(prompt: &str) -> Result<Zeroizing<String>, String> {
+    let _pause = TtyPromptPauseGuard::acquire();
     let mut tty = OpenOptions::new()
         .read(true)
         .write(true)
@@ -827,6 +1169,9 @@ fn read_pin_from_tty(prompt: &str) -> Result<Zeroizing<String>, String> {
             )
         })?;
     let guard = LanTermiosEchoGuard::disable_echo(tty.as_raw_fd())?;
+    unsafe {
+        let _ = libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH);
+    }
     tty.write_all(prompt.as_bytes())
         .map_err(|e| format!("failed writing prompt to /dev/tty: {e}"))?;
     tty.flush()
@@ -842,7 +1187,7 @@ fn read_pin_from_tty(prompt: &str) -> Result<Zeroizing<String>, String> {
 // 4. Local-Only & Online-Reuse LAN Identity (`0600` atomic `identity.json`)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct LanIdentity {
     pub account_id: u64,
     pub is_online_identity: bool,
@@ -852,6 +1197,24 @@ pub(crate) struct LanIdentity {
     pub safety_number: String,
     pub device_cwt: Vec<u8>,
     pub lan_dir: PathBuf,
+}
+
+impl fmt::Debug for LanIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LanIdentity")
+            .field("account_id", &self.account_id)
+            .field("is_online_identity", &self.is_online_identity)
+            .field("display_name", &self.display_name)
+            .field("public_key", &encode_lan_pubkey_base64url(&self.public_key))
+            .field("signing_seed", &"[REDACTED]")
+            .field("safety_number", &self.safety_number)
+            .field(
+                "device_cwt",
+                &format!("[REDACTED {} bytes]", self.device_cwt.len()),
+            )
+            .field("lan_dir", &self.lan_dir)
+            .finish()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -921,6 +1284,45 @@ fn decode_hex_32(hex: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+/// Opens an existing private directory without following a symlink at the target component
+/// (only `ENOENT` maps to `Ok(None)`) and verifies `fstat` ownership (`st_uid == euid`) and
+/// strict `0700` permissions (`(st_mode & 0o077) == 0`).
+fn open_verified_private_dir_readonly(path: &Path) -> Result<Option<OwnedFd>, String> {
+    let fd = match open_dir_nofollow(path) {
+        Ok(fd) => fd,
+        Err(DaemonError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(format!(
+                "refusing private directory '{}' (fail closed): {e}",
+                path.display()
+            ));
+        }
+    };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(format!(
+            "failed fstat on private directory '{}': {}",
+            path.display(),
+            io::Error::last_os_error()
+        ));
+    }
+    let euid = unsafe { libc::geteuid() };
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR
+        || st.st_uid != euid
+        || (st.st_mode & 0o077) != 0
+    {
+        return Err(format!(
+            "refusing insecure private directory '{}' (must be owned by uid={euid} with mode 0700, got uid={} mode {:04o})",
+            path.display(),
+            st.st_uid,
+            st.st_mode & 0o7777
+        ));
+    }
+    Ok(Some(fd))
+}
+
 fn read_strict_0600_file_in_dir(
     dir_fd: RawFd,
     name: &str,
@@ -932,7 +1334,7 @@ fn read_strict_0600_file_in_dir(
             libc::openat(
                 dir_fd,
                 cname.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
             )
         };
         if fd < 0 {
@@ -973,7 +1375,8 @@ fn read_strict_0600_file_in_dir(
         return Err(format!("LAN file '{name}' exceeds max {max_bytes} bytes"));
     }
 
-    let mut out = Zeroizing::new(Vec::new());
+    let initial_cap = usize::try_from(st.st_size).unwrap_or(0).min(max_bytes);
+    let mut out = Zeroizing::new(Vec::with_capacity(initial_cap));
     let file = File::from(fd);
     let limit = (max_bytes as u64).saturating_add(1);
     file.take(limit)
@@ -995,7 +1398,7 @@ fn try_load_online_lan_identity(
     let Ok(state_dir_path) = resolve_effective_state_dir(opts.state_dir.as_deref()) else {
         return Ok(None);
     };
-    if !state_dir_path.exists() {
+    if open_verified_private_dir_readonly(&state_dir_path)?.is_none() {
         return Ok(None);
     }
     let Ok(device_id) = resolve_active_device_id(&state_dir_path, opts.device_id) else {
@@ -1127,17 +1530,29 @@ pub(crate) fn load_or_create_lan_identity(
         seed_hex: (*seed_hex).clone(),
         public_key_hex: Some(pk_hex),
     };
-    let serialized = Zeroizing::new(
-        serde_json::to_string(&stored)
-            .map_err(|e| format!("failed serializing identity.json: {e}"))?
-            + "\n",
-    );
+    // Serialize directly into a pre-allocated Zeroizing buffer so seed_hex never copies across reallocs.
+    let mut serialized = Zeroizing::new(Vec::with_capacity(512));
+    serde_json::to_writer(&mut *serialized, &stored)
+        .map_err(|e| format!("failed serializing identity.json: {e}"))?;
+    serialized.push(b'\n');
     stored.seed_hex.zeroize();
     drop(stored);
     drop(seed_hex);
 
-    atomic_write_in_dir(dir.as_raw_fd(), LAN_IDENTITY_FILE, serialized.as_bytes())
-        .map_err(|e| format!("failed writing LAN identity.json: {e}"))?;
+    match atomic_write_in_dir_no_replace(dir.as_raw_fd(), LAN_IDENTITY_FILE, &serialized, 0o600) {
+        Ok(()) => {}
+        Err(DaemonError::Io { source, .. }) if source.kind() == io::ErrorKind::AlreadyExists => {
+            // Concurrent writer won the race: reload the winning identity.json atomically.
+            let raw = read_strict_0600_file_in_dir(
+                dir.as_raw_fd(),
+                LAN_IDENTITY_FILE,
+                MAX_LAN_IDENTITY_FILE_BYTES,
+            )?
+            .ok_or_else(|| "LAN identity.json vanished after AlreadyExists".to_string())?;
+            return parse_stored_lan_identity(raw, preferred_display_name, &lan_dir);
+        }
+        Err(e) => return Err(format!("failed writing LAN identity.json: {e}")),
+    }
 
     Ok(LanIdentity {
         account_id: 0,
@@ -1161,11 +1576,9 @@ fn inspect_lan_identity_readonly(
     {
         return Ok((lan_dir, Some(online)));
     }
-    if !lan_dir.exists() {
+    let Some(dir_fd) = open_verified_private_dir_readonly(&lan_dir)? else {
         return Ok((lan_dir, None));
-    }
-    let dir_fd = open_dir_nofollow(&lan_dir)
-        .map_err(|e| format!("failed inspecting LAN dir '{}': {e}", lan_dir.display()))?;
+    };
     if let Some(raw) = read_strict_0600_file_in_dir(
         dir_fd.as_raw_fd(),
         LAN_IDENTITY_FILE,
@@ -1222,6 +1635,7 @@ pub(crate) enum TrustMode {
     AlwaysReject,
 }
 
+#[derive(Clone)]
 struct LanPeerPinStore {
     lan_dir: PathBuf,
     online_state_dir: Option<PathBuf>,
@@ -1244,21 +1658,9 @@ impl LanPeerPinStore {
         }
     }
 
-    fn load_lan_peers_file(&self) -> Result<PinnedLanPeersFile, String> {
-        if !self.lan_dir.exists() {
-            return Ok(PinnedLanPeersFile::default());
-        }
-        let dir_fd = open_dir_nofollow(&self.lan_dir).map_err(|e| {
-            format!(
-                "refusing LAN peer store dir '{}': {e}",
-                self.lan_dir.display()
-            )
-        })?;
-        let Some(raw) = read_strict_0600_file_in_dir(
-            dir_fd.as_raw_fd(),
-            LAN_PEERS_FILE,
-            MAX_LAN_PEERS_FILE_BYTES,
-        )?
+    fn load_lan_peers_file_from_fd(dir_fd: RawFd) -> Result<PinnedLanPeersFile, String> {
+        let Some(raw) =
+            read_strict_0600_file_in_dir(dir_fd, LAN_PEERS_FILE, MAX_LAN_PEERS_FILE_BYTES)?
         else {
             return Ok(PinnedLanPeersFile::default());
         };
@@ -1270,6 +1672,30 @@ impl LanPeerPinStore {
         Ok(parsed)
     }
 
+    fn load_lan_peers_file(&self) -> Result<PinnedLanPeersFile, String> {
+        let Some(dir_fd) = open_verified_private_dir_readonly(&self.lan_dir)? else {
+            return Ok(PinnedLanPeersFile::default());
+        };
+        Self::load_lan_peers_file_from_fd(dir_fd.as_raw_fd())
+    }
+
+    fn load_online_peers_readonly(&self) -> Result<Option<PeersStoreRecord>, String> {
+        let Some(ref st_path) = self.online_state_dir else {
+            return Ok(None);
+        };
+        let Some(st_fd) = open_verified_private_dir_readonly(st_path)? else {
+            return Ok(None);
+        };
+        let Some(raw) =
+            read_strict_0600_file_in_dir(st_fd.as_raw_fd(), PEERS_FILE, MAX_PEERS_BIN_BYTES)?
+        else {
+            return Ok(None);
+        };
+        let store = decode_peers_store(&raw)
+            .map_err(|e| format!("corrupt {PEERS_FILE} (fail closed): {e}"))?;
+        Ok(Some(store))
+    }
+
     fn count_pinned(&self) -> usize {
         self.load_lan_peers_file()
             .map(|f| f.peers.iter().filter(|p| !p.revoked).count())
@@ -1277,41 +1703,94 @@ impl LanPeerPinStore {
     }
 
     fn lookup_peer(&self, account_id: u64, pubkey: &[u8; 32]) -> Result<PeerTrustStatus, String> {
-        // 1. Check online peers.bin first if present.
-        if let Some(ref st_path) = self.online_state_dir
-            && st_path.exists()
-            && let Ok(vdir) = open_state_dir(st_path)
-            && let Ok(online_store) = load_peers_store(&vdir)
-        {
+        let expected_sn = compute_lan_safety_number(account_id, pubkey)
+            .map_err(|e| format!("invalid peer pubkey: {e}"))?;
+        let pk_hex = encode_hex(pubkey);
+
+        let mut revoked = false;
+        let mut trusted = false;
+
+        // 1. Check online peers.bin (fail closed on corrupt peers.bin or symlink/insecure state dir).
+        if let Some(online_store) = self.load_online_peers_readonly()? {
             for p in &online_store.peers {
                 if p.root_pubkey == *pubkey {
-                    return Ok(match p.trust_state {
-                        TrustState::PinnedTrusted => PeerTrustStatus::PinnedTrusted,
-                        TrustState::RevokedBlocked => PeerTrustStatus::RevokedBlocked,
-                        TrustState::Unpinned => PeerTrustStatus::Unpinned,
-                    });
+                    match p.trust_state {
+                        TrustState::RevokedBlocked => revoked = true,
+                        TrustState::PinnedTrusted if p.account_id == account_id => trusted = true,
+                        TrustState::PinnedTrusted | TrustState::Unpinned => {}
+                    }
                 }
             }
         }
 
         // 2. Check dedicated 0600 lan_peers.json.
         let file = self.load_lan_peers_file()?;
-        let pk_hex = encode_hex(pubkey);
-        let expected_sn = compute_lan_safety_number(account_id, pubkey)
-            .map_err(|e| format!("invalid peer pubkey: {e}"))?;
         for entry in &file.peers {
             if entry.pubkey_hex == pk_hex {
                 if entry.revoked {
-                    return Ok(PeerTrustStatus::RevokedBlocked);
+                    revoked = true;
+                } else if entry.account_id == account_id && entry.safety_number == expected_sn {
+                    trusted = true;
                 }
-                if entry.account_id == account_id && entry.safety_number == expected_sn {
-                    return Ok(PeerTrustStatus::PinnedTrusted);
-                }
-                // Same key pinned under a different account_id requires fresh confirmation.
-                return Ok(PeerTrustStatus::Unpinned);
             }
         }
+
+        // Revocation in EITHER store ALWAYS dominates PinnedTrusted / Unpinned!
+        if revoked {
+            return Ok(PeerTrustStatus::RevokedBlocked);
+        }
+        if trusted {
+            return Ok(PeerTrustStatus::PinnedTrusted);
+        }
         Ok(PeerTrustStatus::Unpinned)
+    }
+
+    fn find_key_change_conflict(
+        &self,
+        account_id: u64,
+        display_name: &str,
+        pubkey: &[u8; 32],
+    ) -> Result<Option<String>, String> {
+        let pk_hex = encode_hex(pubkey);
+        let file = self.load_lan_peers_file()?;
+        for entry in &file.peers {
+            if entry.pubkey_hex != pk_hex {
+                if account_id != 0 && entry.account_id == account_id {
+                    return Ok(Some(format!(
+                        "account_id={account_id} was previously pinned under a DIFFERENT key (SN {})",
+                        entry.safety_number
+                    )));
+                }
+                if !display_name.is_empty() && entry.display_name.eq_ignore_ascii_case(display_name)
+                {
+                    return Ok(Some(format!(
+                        "display_name '{}' was previously pinned under a DIFFERENT key (SN {})",
+                        entry.display_name, entry.safety_number
+                    )));
+                }
+            }
+        }
+        if let Some(online_store) = self.load_online_peers_readonly()? {
+            for p in &online_store.peers {
+                if p.root_pubkey != *pubkey && p.trust_state == TrustState::PinnedTrusted {
+                    if account_id != 0 && p.account_id == account_id {
+                        return Ok(Some(format!(
+                            "online account_id={account_id} is pinned in peers.bin under a DIFFERENT key"
+                        )));
+                    }
+                    if !display_name.is_empty()
+                        && !p.handle_prop.is_empty()
+                        && p.handle_prop.eq_ignore_ascii_case(display_name)
+                    {
+                        return Ok(Some(format!(
+                            "online peer '{}' is pinned in peers.bin under a DIFFERENT key",
+                            sanitize_lan_display_name(&p.handle_prop)
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn pin_peer(
@@ -1323,7 +1802,9 @@ impl LanPeerPinStore {
     ) -> Result<(), String> {
         let dir = open_or_create_private_dir(&self.lan_dir)
             .map_err(|e| format!("failed opening LAN dir for pinning: {e}"))?;
-        let mut file = self.load_lan_peers_file()?;
+        let _lock = StateLock::lock(&dir, Duration::from_secs(5))
+            .map_err(|e| format!("failed locking LAN peer store: {e}"))?;
+        let mut file = Self::load_lan_peers_file_from_fd(dir.as_raw_fd())?;
         let pk_hex = encode_hex(pubkey);
         let now_ms = wall_now_ms();
         let clean_name = sanitize_lan_display_name(display_name);
@@ -1379,6 +1860,15 @@ impl LanPeerPinStore {
 
         let clean_name = sanitize_lan_display_name(display_name);
         let pk_b64u = encode_lan_pubkey_base64url(pubkey);
+        let key_change_warning =
+            self.find_key_change_conflict(account_id, &clean_name, pubkey)?;
+
+        // G3-L3-1: Hold ONE non-reentrant TtyPromptPauseGuard across the ENTIRE unpinned
+        // prompt + local OS presence authentication sequence so spawn_stdin_line_reader can
+        // NEVER wake between them and steal a sudo password into LAN chat!
+        let needs_tty_guard =
+            matches!(self.trust_mode, TrustMode::InteractiveTty) || self.require_local_auth_on_pin;
+        let pause_guard = needs_tty_guard.then(TtyPromptPauseGuard::acquire);
 
         let approved = match &self.trust_mode {
             TrustMode::ExpectedSafetyNumber(candidate) => {
@@ -1392,13 +1882,19 @@ impl LanPeerPinStore {
             #[cfg(test)]
             TrustMode::AlwaysReject => false,
             TrustMode::InteractiveTty => {
-                prompt_tty_safety_number_confirm(
+                let Some(ref pause) = pause_guard else {
+                    return Err("internal error: missing TTY prompt pause guard".to_string());
+                };
+                prompt_tty_safety_number_confirm_paused(
+                    pause,
                     role_label,
                     &clean_name,
                     account_id,
                     &pk_b64u,
                     &sn,
                     source_addr,
+                    key_change_warning.as_deref(),
+                    Some(LAN_APPROVAL_TIMEOUT),
                 )?
             }
         };
@@ -1409,10 +1905,16 @@ impl LanPeerPinStore {
             ));
         }
 
-        // Mandate #6: enforce local OS presence guard before pinning a new LAN peer when configured.
+        // Mandate #6: enforce local OS presence guard under the SAME TtyPromptPauseGuard
+        // before pinning a new LAN peer when configured.
         if self.require_local_auth_on_pin {
-            verify_local_os_presence("Authorize pinning new LAN Party peer")?;
+            let Some(ref pause) = pause_guard else {
+                return Err("internal error: missing TTY prompt pause guard".to_string());
+            };
+            verify_local_os_presence_paused(pause, "Authorize pinning new LAN Party peer")?;
         }
+
+        drop(pause_guard);
 
         self.pin_peer(account_id, pubkey, &clean_name, &sn)?;
         Ok(sn)
@@ -1422,6 +1924,8 @@ impl LanPeerPinStore {
 static TTY_PROMPT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static STDIN_READ_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Non-reentrant RAII guard that pauses `spawn_stdin_line_reader` across `/dev/tty` prompts
+/// and local OS presence checks (`LAContext` / `sudo -k -v`).
 struct TtyPromptPauseGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
 }
@@ -1442,15 +1946,18 @@ impl Drop for TtyPromptPauseGuard {
     }
 }
 
-fn prompt_tty_safety_number_confirm(
+#[allow(clippy::too_many_arguments)]
+fn prompt_tty_safety_number_confirm_paused(
+    _pause: &TtyPromptPauseGuard,
     role_label: &str,
     display_name: &str,
     account_id: u64,
     pk_b64u: &str,
     safety_number: &str,
     source_addr: &str,
+    key_change_warning: Option<&str>,
+    timeout: Option<Duration>,
 ) -> Result<bool, String> {
-    let _pause = TtyPromptPauseGuard::acquire();
     let mut tty = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1460,21 +1967,38 @@ fn prompt_tty_safety_number_confirm(
                 "unpinned {role_label} '{display_name}' (Safety Number {safety_number}) requires interactive /dev/tty confirmation or --yes-safety-number <SN>"
             )
         })?;
+    // Flush any pre-typed chat bytes immediately after acquiring TtyPromptPauseGuard and
+    // BEFORE writing the trust prompt so queued input cannot accidentally confirm a peer.
+    unsafe {
+        let _ = libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH);
+    }
     let acct_label = if account_id == 0 {
         "local-only".to_string()
     } else {
         account_id.to_string()
     };
+    let warning_block = match key_change_warning {
+        Some(detail) => format!(
+            "\n[WARNING: KEY CHANGED] {detail}\n  Verify this peer's Safety Number out-of-band before trusting!"
+        ),
+        None => String::new(),
+    };
     let banner = format!(
-        "\n[LAN Trust Check] Unpinned {role_label} attempting connection:\n  Name:          {display_name}\n  Account ID:    {acct_label}\n  Source:        {source_addr}\n  Host/Peer PK:  {pk_b64u}\n  Safety Number: {safety_number}\nType 'yes' to trust and pin this peer (anything else rejects): "
+        "{warning_block}\n[LAN Trust Check] Unpinned {role_label} attempting connection:\n  Name:          {display_name}\n  Account ID:    {acct_label}\n  Source:        {source_addr}\n  Host/Peer PK:  {pk_b64u}\n  Safety Number: {safety_number}\nType 'yes' to trust and pin this peer (anything else rejects): "
     );
     tty.write_all(banner.as_bytes())
         .map_err(|e| format!("failed writing trust prompt to /dev/tty: {e}"))?;
     tty.flush()
         .map_err(|e| format!("failed flushing /dev/tty: {e}"))?;
 
-    let raw_line = read_line_unbuffered_fd(tty.as_raw_fd(), 64)
-        .map_err(|e| format!("failed reading confirmation from /dev/tty: {e}"))?;
+    let raw_line = match read_line_unbuffered_fd_timeout(tty.as_raw_fd(), 64, timeout) {
+        Ok(line) => line,
+        Err(e) => {
+            let _ = tty.write_all(b"\n[LAN Trust Check] confirmation aborted/timed out.\n");
+            let _ = tty.flush();
+            return Err(format!("failed reading confirmation from /dev/tty: {e}"));
+        }
+    };
     Ok(raw_line.trim().eq_ignore_ascii_case("yes"))
 }
 
@@ -1727,6 +2251,16 @@ fn mdns_multicast_dest() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(ip), LAN_MDNS_DEFAULT_PORT)
 }
 
+fn is_valid_mdns_unicast_target(addr: SocketAddr) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+    match addr.ip().to_canonical() {
+        IpAddr::V4(v4) => !(v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast()),
+        IpAddr::V6(v6) => !(v6.is_unspecified() || v6.is_multicast()),
+    }
+}
+
 struct MdnsAdvertiserHandle {
     stop_tx: Option<oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -1768,6 +2302,8 @@ impl MdnsAdvertiserHandle {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await; // consume immediate first tick
 
+            let mut last_mcast_reply: Option<Instant> = None;
+            let mut last_unicast_reply: HashMap<IpAddr, Instant> = HashMap::new();
             let mut recv_buf = vec![0u8; LAN_MDNS_MAX_PACKET_BYTES];
             loop {
                 tokio::select! {
@@ -1791,8 +2327,39 @@ impl MdnsAdvertiserHandle {
                                     && (q.qtype == DNS_TYPE_PTR || q.qtype == DNS_TYPE_ANY)
                                     && dns_names_equal_ci(&q.qname, LAN_MDNS_SERVICE_TYPE)
                                 {
-                                    let target = if q.unicast_response { src } else { mcast_dest };
-                                    let _ = sock.send_to(&announce_pkt, target).await;
+                                    let now = Instant::now();
+                                    if q.unicast_response {
+                                        if !is_valid_mdns_unicast_target(src) {
+                                            break;
+                                        }
+                                        let src_ip = src.ip().to_canonical();
+                                        if last_unicast_reply
+                                            .get(&src_ip)
+                                            .is_some_and(|t| now.duration_since(*t) < LAN_MDNS_REPLY_COOLDOWN)
+                                        {
+                                            break;
+                                        }
+                                        if last_unicast_reply.len() >= MAX_MDNS_UNICAST_COOLDOWN_ENTRIES {
+                                            last_unicast_reply.retain(|_, t| {
+                                                now.duration_since(*t) < LAN_MDNS_REPLY_COOLDOWN
+                                            });
+                                        }
+                                        if last_unicast_reply.len() >= MAX_MDNS_UNICAST_COOLDOWN_ENTRIES
+                                            && !last_unicast_reply.contains_key(&src_ip)
+                                        {
+                                            break;
+                                        }
+                                        last_unicast_reply.insert(src_ip, now);
+                                        let _ = sock.send_to(&announce_pkt, src).await;
+                                    } else {
+                                        if last_mcast_reply
+                                            .is_some_and(|t| now.duration_since(t) < LAN_MDNS_REPLY_COOLDOWN)
+                                        {
+                                            break;
+                                        }
+                                        last_mcast_reply = Some(now);
+                                        let _ = sock.send_to(&announce_pkt, mcast_dest).await;
+                                    }
                                     break;
                                 }
                             }
@@ -1896,6 +2463,14 @@ async fn scan_lan_mdns(
                         if ann.is_goodbye() {
                             lobbies.remove(&ann.beacon.lan_party_id);
                         } else if let Ok(sn) = compute_lan_safety_number(0, &ann.beacon.host_pubkey) {
+                            let id = ann.beacon.lan_party_id.clone();
+                            let is_target = stop_on_party_id == Some(id.as_str());
+                            if !is_target
+                                && !lobbies.contains_key(&id)
+                                && lobbies.len() >= MAX_DISCOVERED_LAN_LOBBIES
+                            {
+                                continue;
+                            }
                             let mut addrs = ann.addrs;
                             if addrs.is_empty() && ann.service_port != 0 {
                                 let fallback = SocketAddr::new(src.ip(), ann.service_port);
@@ -1903,7 +2478,6 @@ async fn scan_lan_mdns(
                                     addrs.push(fallback);
                                 }
                             }
-                            let id = ann.beacon.lan_party_id.clone();
                             lobbies.insert(
                                 id.clone(),
                                 DiscoveredLobby {
@@ -1914,9 +2488,7 @@ async fn scan_lan_mdns(
                                     last_seen_ms: wall_now_ms(),
                                 },
                             );
-                            if let Some(want) = stop_on_party_id
-                                && id == want
-                            {
+                            if is_target {
                                 break;
                             }
                         }
@@ -2066,6 +2638,26 @@ struct PendingLanPeer {
     host_nonce: [u8; 32],
     connected_at: Instant,
     source_ip: String,
+    awaiting_approval: bool,
+}
+
+#[derive(Clone)]
+struct PendingApprovalRequest {
+    peer_pubkey: [u8; 32],
+    account_id: u64,
+    display_name: String,
+    source_ip: String,
+    peer_key: LanPinPeerKey,
+}
+
+pub(crate) struct CompletedApproval {
+    req: PendingApprovalRequest,
+    result: Result<String, String>,
+}
+
+pub(crate) enum HostInput {
+    Transport(P2pTransportEvent),
+    Approval(CompletedApproval),
 }
 
 #[derive(Debug, Clone)]
@@ -2123,6 +2715,7 @@ pub(crate) struct LanHostConfig {
     pub pin: Option<Zeroizing<String>>,
     pub idle_timeout_sec: u32,
     pub enable_mdns: bool,
+    pub start_locked: bool,
     pub bind_port: Option<u16>,
     pub max_members: u8,
     pub pin_rate_limit: LanPinRateLimitConfig,
@@ -2139,8 +2732,8 @@ pub(crate) struct LanHostSession {
     pin: Option<Zeroizing<String>>,
     max_members: usize,
     idle_timeout_sec: u32,
-    started_at: Instant,
-    has_peer_joined: bool,
+    idle_deadline: Option<Instant>,
+    mdns_deadline: Option<Instant>,
     locked: bool,
     lobby_closed: bool,
     service_port: u16,
@@ -2151,6 +2744,10 @@ pub(crate) struct LanHostSession {
     pin_store: LanPeerPinStore,
     pin_limiter: LanPinRateLimiter,
     pending_peers: HashMap<[u8; 32], PendingLanPeer>,
+    approval_queue: VecDeque<PendingApprovalRequest>,
+    approval_in_flight: Option<[u8; 32]>,
+    approval_tx: mpsc::Sender<CompletedApproval>,
+    approval_rx: mpsc::Receiver<CompletedApproval>,
     members: Vec<LanMemberInfo>,
     roster_epoch: u64,
 }
@@ -2189,7 +2786,7 @@ impl LanHostSession {
             },
             Some(LanTransportConfig {
                 no_relays: true,
-                lan_open_admission: true,
+                lan_open_admission: !cfg.start_locked,
                 lan_bind_port: cfg.bind_port,
             }),
         )
@@ -2211,7 +2808,7 @@ impl LanHostSession {
             direct_addrs.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), service_port));
         }
 
-        let mdns = if cfg.enable_mdns {
+        let mdns = if cfg.enable_mdns && !cfg.start_locked {
             let beacon = LanBeaconRecord {
                 version: LAN_BEACON_VERSION,
                 lan_party_id: lan_party_id.clone(),
@@ -2246,6 +2843,12 @@ impl LanHostSession {
             is_host: true,
         };
 
+        let now = Instant::now();
+        let idle_dur = Duration::from_secs(u64::from(cfg.idle_timeout_sec));
+        let mdns_deadline = mdns.as_ref().map(|_| now + idle_dur);
+        let idle_deadline = Some(now + idle_dur);
+        let (approval_tx, approval_rx) = mpsc::channel(4);
+
         Ok(Self {
             identity: cfg.identity,
             lan_party_id,
@@ -2254,9 +2857,9 @@ impl LanHostSession {
             pin: cfg.pin,
             max_members,
             idle_timeout_sec: cfg.idle_timeout_sec,
-            started_at: Instant::now(),
-            has_peer_joined: false,
-            locked: false,
+            idle_deadline,
+            mdns_deadline,
+            locked: cfg.start_locked,
             lobby_closed: false,
             service_port,
             direct_addrs,
@@ -2266,6 +2869,10 @@ impl LanHostSession {
             pin_store,
             pin_limiter: LanPinRateLimiter::new(cfg.pin_rate_limit),
             pending_peers: HashMap::new(),
+            approval_queue: VecDeque::new(),
+            approval_in_flight: None,
+            approval_tx,
+            approval_rx,
             members: vec![host_member],
             roster_epoch: 1,
         })
@@ -2299,20 +2906,35 @@ impl LanHostSession {
         self.lobby_closed
     }
 
-    fn idle_deadline(&self) -> Option<Instant> {
-        if self.has_peer_joined || self.locked {
-            None
-        } else {
-            Some(self.started_at + Duration::from_secs(u64::from(self.idle_timeout_sec)))
+    pub(crate) fn idle_deadline(&self) -> Option<Instant> {
+        self.idle_deadline
+    }
+
+    pub(crate) fn mdns_deadline(&self) -> Option<Instant> {
+        self.mdns_deadline
+    }
+
+    pub(crate) async fn stop_mdns(&mut self) {
+        if let Some(ref mut mdns) = self.mdns {
+            mdns.stop().await;
         }
+        self.mdns = None;
+        self.mdns_deadline = None;
     }
 
     fn find_member(&self, pubkey: &[u8; 32]) -> Option<&LanMemberInfo> {
         self.members.iter().find(|m| &m.pubkey == pubkey)
     }
 
+    fn has_display_name_collision(&self, clean_name: &str) -> bool {
+        self.members
+            .iter()
+            .any(|m| m.display_name.eq_ignore_ascii_case(clean_name))
+    }
+
     async fn reject_pending(&mut self, peer_pubkey: [u8; 32], reason: &str) -> LanSessionEvent {
         self.pending_peers.remove(&peer_pubkey);
+        self.approval_queue.retain(|r| r.peer_pubkey != peer_pubkey);
         let welcome = LanHandshakeMessage::Welcome(LanWelcomeMessage {
             lan_party_id: self.lan_party_id.clone(),
             accepted: false,
@@ -2335,6 +2957,87 @@ impl LanHostSession {
         }
     }
 
+    async fn admit_pending_peer(
+        &mut self,
+        peer_pubkey: [u8; 32],
+        account_id: u64,
+        clean_name: String,
+        safety_number: String,
+        peer_key: &LanPinPeerKey,
+    ) -> LanSessionEvent {
+        // Promote peer in iroh allowlist (unlocks Lanes 1 & 2) and admit!
+        if self.handle.allow_peer(peer_pubkey).await.is_err() {
+            return self.reject_pending(peer_pubkey, "rejected").await;
+        }
+
+        self.pin_limiter.record_success(peer_key);
+        self.pending_peers.remove(&peer_pubkey);
+        self.idle_deadline = None;
+
+        let member = LanMemberInfo {
+            account_id,
+            display_name: clean_name,
+            pubkey: peer_pubkey,
+            is_host: false,
+        };
+        self.members.push(member.clone());
+        self.roster_epoch = self.roster_epoch.saturating_add(1);
+
+        let welcome = LanHandshakeMessage::Welcome(LanWelcomeMessage {
+            lan_party_id: self.lan_party_id.clone(),
+            accepted: true,
+            reason: String::new(),
+            roster_epoch: self.roster_epoch,
+            members: self.members.clone(),
+        });
+        let _ = self.handle.send_lan_handshake(peer_pubkey, &welcome).await;
+        self.broadcast_roster(Some(peer_pubkey)).await;
+
+        LanSessionEvent::PeerJoined {
+            member,
+            safety_number,
+            roster_epoch: self.roster_epoch,
+            members: self.members.clone(),
+        }
+    }
+
+    fn maybe_start_next_approval(&mut self) {
+        while self.approval_in_flight.is_none() {
+            let Some(req) = self.approval_queue.pop_front() else {
+                break;
+            };
+            if self.lobby_closed
+                || self.locked
+                || !self.pending_peers.contains_key(&req.peer_pubkey)
+                || !self.handle.is_peer_connected(&req.peer_pubkey)
+            {
+                self.pending_peers.remove(&req.peer_pubkey);
+                continue;
+            }
+            self.approval_in_flight = Some(req.peer_pubkey);
+            let pin_store = self.pin_store.clone();
+            let tx = self.approval_tx.clone();
+            tokio::spawn(async move {
+                let req_blocking = req.clone();
+                let blocking = tokio::task::spawn_blocking(move || {
+                    pin_store.verify_or_pin_peer(
+                        "LAN joiner",
+                        &req_blocking.display_name,
+                        req_blocking.account_id,
+                        &req_blocking.peer_pubkey,
+                        &req_blocking.source_ip,
+                    )
+                });
+                let result = match tokio::time::timeout(LAN_APPROVAL_TIMEOUT, blocking).await {
+                    Ok(Ok(res)) => res,
+                    Ok(Err(join_err)) => Err(format!("peer approval task failed: {join_err}")),
+                    Err(_) => Err("peer approval timed out (30s)".to_string()),
+                };
+                let _ = tx.send(CompletedApproval { req, result }).await;
+            });
+        }
+    }
+
     async fn broadcast_roster(&self, exclude_pubkey: Option<[u8; 32]>) {
         let roster = LanHandshakeMessage::Roster(LanRosterMessage {
             lan_party_id: self.lan_party_id.clone(),
@@ -2352,14 +3055,16 @@ impl LanHostSession {
 
     pub(crate) async fn lock_lobby(&mut self) -> LanSessionEvent {
         self.locked = true;
-        if let Some(ref mut mdns) = self.mdns {
-            mdns.stop().await;
-        }
-        self.mdns = None;
+        self.stop_mdns().await;
         self.handle.set_lan_open_admission(false).await;
+        self.approval_queue.clear();
         let pending_keys: Vec<[u8; 32]> = self.pending_peers.keys().copied().collect();
         for pk in pending_keys {
             let _ = self.reject_pending(pk, "locked").await;
+        }
+        if self.members.len() <= 1 && self.idle_deadline.is_none() {
+            self.idle_deadline =
+                Some(Instant::now() + Duration::from_secs(u64::from(self.idle_timeout_sec)));
         }
         self.roster_epoch = self.roster_epoch.saturating_add(1);
         self.broadcast_roster(None).await;
@@ -2369,8 +3074,9 @@ impl LanHostSession {
     }
 
     pub(crate) async fn send_chat(&self, body: &str) -> Result<(), String> {
+        let clean_body = sanitize_bounded(body, MAX_CHAT_BODY_BYTES);
         if let Some(kind) = scan_outbound_secrets(
-            body.as_bytes(),
+            clean_body.as_bytes(),
             &self.identity.signing_seed,
             &self.identity.device_cwt,
         ) {
@@ -2378,12 +3084,26 @@ impl LanHostSession {
                 "blocked outbound message: detected secret material ({kind:?})"
             ));
         }
+        if let Some(ref pin) = self.pin
+            && !pin.is_empty()
+        {
+            let normalizer = ComposingNormalizerBorrowed::new_nfc();
+            let normalized_body = normalizer.normalize(&clean_body);
+            if clean_body.contains(pin.as_str())
+                || body.contains(pin.as_str())
+                || normalized_body.contains(pin.as_str())
+            {
+                return Err(
+                    "blocked outbound message: contains active LAN lobby PIN".to_string(),
+                );
+            }
+        }
         let frame = P2pPartyFrame::ChatMessage(P2pChatMessage {
             room_scope: LAN_DEFAULT_ROOM_SCOPE.to_string(),
             target_selector: "@all".to_string(),
             sender_handle: self.identity.display_name.clone(),
             timestamp_ns: now_unix_ns(),
-            body: sanitize_bounded(body, MAX_CHAT_BODY_BYTES),
+            body: clean_body,
         });
         for m in &self.members {
             if m.is_host {
@@ -2396,10 +3116,8 @@ impl LanHostSession {
 
     pub(crate) async fn shutdown(&mut self, reason: &str) -> LanSessionEvent {
         self.lobby_closed = true;
-        if let Some(ref mut mdns) = self.mdns {
-            mdns.stop().await;
-        }
-        self.mdns = None;
+        self.stop_mdns().await;
+        self.approval_queue.clear();
         self.pin = None;
         let _ = tokio::time::timeout(Duration::from_millis(500), self.handle.close()).await;
         LanSessionEvent::LobbyClosed {
@@ -2412,7 +3130,10 @@ impl LanHostSession {
         let stalled: Vec<[u8; 32]> = self
             .pending_peers
             .iter()
-            .filter(|(_, p)| now.duration_since(p.connected_at) >= LAN_PENDING_HANDSHAKE_TIMEOUT)
+            .filter(|(_, p)| {
+                !p.awaiting_approval
+                    && now.duration_since(p.connected_at) >= LAN_PENDING_HANDSHAKE_TIMEOUT
+            })
             .map(|(pk, _)| *pk)
             .collect();
         let mut out = Vec::with_capacity(stalled.len());
@@ -2420,6 +3141,74 @@ impl LanHostSession {
             out.push(self.reject_pending(pk, "handshake_timeout").await);
         }
         out
+    }
+
+    /// Cancel-safe pure channel receive over transport events and completed async approvals.
+    pub(crate) async fn recv_next_input(&mut self) -> Option<HostInput> {
+        if self.lobby_closed {
+            return None;
+        }
+        tokio::select! {
+            ev = self.events.recv_event() => ev.map(HostInput::Transport),
+            app = self.approval_rx.recv() => app.map(HostInput::Approval),
+        }
+    }
+
+    pub(crate) async fn handle_completed_approval(
+        &mut self,
+        completed: CompletedApproval,
+    ) -> Vec<LanSessionEvent> {
+        let mut emitted = Vec::new();
+        self.approval_in_flight = None;
+
+        let req = completed.req;
+        let pk = req.peer_pubkey;
+
+        if self.lobby_closed {
+            self.pending_peers.remove(&pk);
+            return emitted;
+        }
+        if !self.pending_peers.contains_key(&pk) || !self.handle.is_peer_connected(&pk) {
+            self.pending_peers.remove(&pk);
+            self.maybe_start_next_approval();
+            return emitted;
+        }
+        if self.locked {
+            emitted.push(self.reject_pending(pk, "locked").await);
+            self.maybe_start_next_approval();
+            return emitted;
+        }
+        if self.members.len() >= self.max_members {
+            emitted.push(self.reject_pending(pk, "full").await);
+            self.maybe_start_next_approval();
+            return emitted;
+        }
+        if self.has_display_name_collision(&req.display_name) {
+            emitted.push(self.reject_pending(pk, "display_name_in_use").await);
+            self.maybe_start_next_approval();
+            return emitted;
+        }
+
+        match completed.result {
+            Ok(safety_number) => {
+                emitted.push(
+                    self.admit_pending_peer(
+                        pk,
+                        req.account_id,
+                        req.display_name,
+                        safety_number,
+                        &req.peer_key,
+                    )
+                    .await,
+                );
+            }
+            Err(_) => {
+                emitted.push(self.reject_pending(pk, "rejected").await);
+            }
+        }
+
+        self.maybe_start_next_approval();
+        emitted
     }
 
     pub(crate) async fn handle_transport_event(
@@ -2433,7 +3222,7 @@ impl LanHostSession {
                 {
                     return emitted;
                 }
-                if self.locked || self.pin_limiter.is_lobby_locked() {
+                if self.lobby_closed || self.locked || self.pin_limiter.is_lobby_locked() {
                     self.handle.revoke_peer(peer_pubkey, CLOSE_UNAUTHORIZED);
                     return emitted;
                 }
@@ -2441,7 +3230,7 @@ impl LanHostSession {
                     .handle
                     .peer_remote_addr(peer_pubkey)
                     .await
-                    .map(|a| a.ip().to_string())
+                    .map(|a| a.ip().to_canonical().to_string())
                     .unwrap_or_else(|| "lan-direct".to_string());
                 let peer_key = LanPinPeerKey {
                     joiner_pubkey: peer_pubkey,
@@ -2463,6 +3252,7 @@ impl LanHostSession {
                         host_nonce,
                         connected_at: Instant::now(),
                         source_ip,
+                        awaiting_approval: false,
                     },
                 );
 
@@ -2496,6 +3286,10 @@ impl LanHostSession {
                     }
                     return emitted;
                 };
+                if pending.awaiting_approval {
+                    // Already queued or in-flight for interactive approval; ignore duplicate join.
+                    return emitted;
+                }
                 let host_nonce = pending.host_nonce;
                 let source_ip = pending.source_ip.clone();
 
@@ -2514,6 +3308,10 @@ impl LanHostSession {
                 };
                 match self.pin_limiter.check(&peer_key) {
                     LanPinLockoutStatus::LobbyLocked => {
+                        // G3-L3-2: Commit lobby teardown & close admission BEFORE any best-effort rejection!
+                        self.lobby_closed = true;
+                        self.pin = None;
+                        self.handle.set_lan_open_admission(false).await;
                         emitted.push(self.reject_pending(peer_pubkey, "locked").await);
                         emitted.push(self.shutdown("pin_lobby_locked").await);
                         return emitted;
@@ -2541,6 +3339,16 @@ impl LanHostSession {
                     };
                     if !pin_ok {
                         let post = self.pin_limiter.record_failure(&peer_key);
+                        if post == LanPinLockoutStatus::LobbyLocked {
+                            // G3-L3-2: Immediately commit lockout & stop open admission BEFORE
+                            // any best-effort rejection send!
+                            self.lobby_closed = true;
+                            self.pin = None;
+                            self.handle.set_lan_open_admission(false).await;
+                            emitted.push(self.reject_pending(peer_pubkey, "locked").await);
+                            emitted.push(self.shutdown("pin_lobby_locked").await);
+                            return emitted;
+                        }
                         let reason = match post {
                             LanPinLockoutStatus::Allowed => "invalid_pin",
                             LanPinLockoutStatus::PeerLocked | LanPinLockoutStatus::LobbyLocked => {
@@ -2548,14 +3356,11 @@ impl LanHostSession {
                             }
                         };
                         emitted.push(self.reject_pending(peer_pubkey, reason).await);
-                        if post == LanPinLockoutStatus::LobbyLocked {
-                            emitted.push(self.shutdown("pin_lobby_locked").await);
-                        }
                         return emitted;
                     }
                 }
 
-                // 2. Check lock & lobby capacity.
+                // 2. Check lock, lobby capacity, and display-name uniqueness.
                 if self.locked {
                     emitted.push(self.reject_pending(peer_pubkey, "locked").await);
                     return emitted;
@@ -2564,58 +3369,94 @@ impl LanHostSession {
                     emitted.push(self.reject_pending(peer_pubkey, "full").await);
                     return emitted;
                 }
+                let clean_name = sanitize_lan_display_name(&join.display_name);
+                if self.has_display_name_collision(&clean_name) {
+                    emitted.push(
+                        self.reject_pending(peer_pubkey, "display_name_in_use")
+                            .await,
+                    );
+                    return emitted;
+                }
 
                 // 3. Mandatory Safety Number pinning / confirmation (Mandate #5).
-                let clean_name = sanitize_lan_display_name(&join.display_name);
-                let safety_number = match self.pin_store.verify_or_pin_peer(
-                    "LAN joiner",
-                    &clean_name,
-                    join.account_id,
-                    &peer_pubkey,
-                    &source_ip,
-                ) {
-                    Ok(sn) => sn,
+                let trust_status = match self.pin_store.lookup_peer(join.account_id, &peer_pubkey) {
+                    Ok(status) => status,
                     Err(_) => {
                         emitted.push(self.reject_pending(peer_pubkey, "rejected").await);
                         return emitted;
                     }
                 };
-
-                // 4. Promote peer in iroh allowlist (unlocks Lanes 1 & 2) and admit!
-                if self.handle.allow_peer(peer_pubkey).await.is_err() {
-                    emitted.push(self.reject_pending(peer_pubkey, "rejected").await);
-                    return emitted;
+                match trust_status {
+                    PeerTrustStatus::PinnedTrusted => {
+                        let Ok(sn) = compute_lan_safety_number(join.account_id, &peer_pubkey)
+                        else {
+                            emitted.push(self.reject_pending(peer_pubkey, "rejected").await);
+                            return emitted;
+                        };
+                        emitted.push(
+                            self.admit_pending_peer(
+                                peer_pubkey,
+                                join.account_id,
+                                clean_name,
+                                sn,
+                                &peer_key,
+                            )
+                            .await,
+                        );
+                    }
+                    PeerTrustStatus::RevokedBlocked => {
+                        emitted.push(self.reject_pending(peer_pubkey, "rejected").await);
+                    }
+                    PeerTrustStatus::Unpinned => {
+                        let needs_blocking_prompt =
+                            matches!(self.pin_store.trust_mode, TrustMode::InteractiveTty)
+                                || self.pin_store.require_local_auth_on_pin;
+                        if needs_blocking_prompt {
+                            // G3-L3-2: Offload interactive /dev/tty confirmation & OS presence
+                            // guard onto spawn_blocking with a bounded 1-at-a-time queue so chat
+                            // relay, eviction, timers, and signals NEVER freeze!
+                            if self.approval_queue.len() >= MAX_PENDING_APPROVAL_QUEUE {
+                                emitted.push(self.reject_pending(peer_pubkey, "busy").await);
+                                return emitted;
+                            }
+                            if let Some(p) = self.pending_peers.get_mut(&peer_pubkey) {
+                                p.awaiting_approval = true;
+                            }
+                            self.approval_queue.push_back(PendingApprovalRequest {
+                                peer_pubkey,
+                                account_id: join.account_id,
+                                display_name: clean_name,
+                                source_ip,
+                                peer_key,
+                            });
+                            self.maybe_start_next_approval();
+                        } else {
+                            let safety_number = match self.pin_store.verify_or_pin_peer(
+                                "LAN joiner",
+                                &clean_name,
+                                join.account_id,
+                                &peer_pubkey,
+                                &source_ip,
+                            ) {
+                                Ok(sn) => sn,
+                                Err(_) => {
+                                    emitted.push(self.reject_pending(peer_pubkey, "rejected").await);
+                                    return emitted;
+                                }
+                            };
+                            emitted.push(
+                                self.admit_pending_peer(
+                                    peer_pubkey,
+                                    join.account_id,
+                                    clean_name,
+                                    safety_number,
+                                    &peer_key,
+                                )
+                                .await,
+                            );
+                        }
+                    }
                 }
-
-                self.pin_limiter.record_success(&peer_key);
-                self.pending_peers.remove(&peer_pubkey);
-                self.has_peer_joined = true;
-
-                let member = LanMemberInfo {
-                    account_id: join.account_id,
-                    display_name: clean_name,
-                    pubkey: peer_pubkey,
-                    is_host: false,
-                };
-                self.members.push(member.clone());
-                self.roster_epoch = self.roster_epoch.saturating_add(1);
-
-                let welcome = LanHandshakeMessage::Welcome(LanWelcomeMessage {
-                    lan_party_id: self.lan_party_id.clone(),
-                    accepted: true,
-                    reason: String::new(),
-                    roster_epoch: self.roster_epoch,
-                    members: self.members.clone(),
-                });
-                let _ = self.handle.send_lan_handshake(peer_pubkey, &welcome).await;
-                self.broadcast_roster(Some(peer_pubkey)).await;
-
-                emitted.push(LanSessionEvent::PeerJoined {
-                    member,
-                    safety_number,
-                    roster_epoch: self.roster_epoch,
-                    members: self.members.clone(),
-                });
             }
             P2pTransportEvent::FrameReceived {
                 peer_pubkey, frame, ..
@@ -2703,12 +3544,21 @@ impl LanHostSession {
                 reason_code,
             } => {
                 self.pending_peers.remove(&peer_pubkey);
+                self.approval_queue.retain(|r| r.peer_pubkey != peer_pubkey);
                 if let Some(pos) = self
                     .members
                     .iter()
                     .position(|m| !m.is_host && m.pubkey == peer_pubkey)
                 {
                     let left = self.members.remove(pos);
+                    // Revoke peer from transport allowlist so a disconnected member cannot
+                    // reconnect directly to party lanes while the lobby is /lock'ed!
+                    self.handle.revoke_peer(peer_pubkey, CLOSE_UNAUTHORIZED);
+                    if self.members.len() <= 1 {
+                        self.idle_deadline = Some(
+                            Instant::now() + Duration::from_secs(u64::from(self.idle_timeout_sec)),
+                        );
+                    }
                     self.roster_epoch = self.roster_epoch.saturating_add(1);
                     self.broadcast_roster(None).await;
                     emitted.push(LanSessionEvent::PeerLeft {
@@ -2723,12 +3573,12 @@ impl LanHostSession {
         emitted
     }
 
+    #[cfg(test)]
     pub(crate) async fn next_event(&mut self) -> Option<Vec<LanSessionEvent>> {
-        if self.lobby_closed {
-            return None;
+        match self.recv_next_input().await? {
+            HostInput::Transport(ev) => Some(self.handle_transport_event(ev).await),
+            HostInput::Approval(app) => Some(self.handle_completed_approval(app).await),
         }
-        let ev = self.events.recv_event().await?;
-        Some(self.handle_transport_event(ev).await)
     }
 }
 
@@ -3024,8 +3874,9 @@ impl LanJoinSession {
     }
 
     pub(crate) async fn send_chat(&self, body: &str) -> Result<(), String> {
+        let clean_body = sanitize_bounded(body, MAX_CHAT_BODY_BYTES);
         if let Some(kind) = scan_outbound_secrets(
-            body.as_bytes(),
+            clean_body.as_bytes(),
             &self.identity.signing_seed,
             &self.identity.device_cwt,
         ) {
@@ -3038,7 +3889,7 @@ impl LanJoinSession {
             target_selector: "@all".to_string(),
             sender_handle: self.identity.display_name.clone(),
             timestamp_ns: now_unix_ns(),
-            body: sanitize_bounded(body, MAX_CHAT_BODY_BYTES),
+            body: clean_body,
         });
         self.handle
             .send_frame(self.host_pubkey, &frame)
@@ -3265,11 +4116,17 @@ fn cmd_lan_status(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                 "require_pin": report.policy.require_pin,
                 "require_local_auth": report.policy.require_local_auth,
                 "idle_timeout_sec": report.policy.idle_timeout_sec,
+                "max_idle_timeout_sec": report.effective.max_idle_timeout_sec,
                 "scan_timeout_sec": report.policy.scan_timeout_sec,
+                "max_scan_timeout_sec": report.effective.max_scan_timeout_sec,
             },
             "sources": {
+                "system_unified_policy_path": report.system_unified_policy_path.as_ref().map(|p| p.display().to_string()),
+                "system_unified_policy_loaded": report.system_unified_policy_loaded,
                 "system_policy_path": report.system_policy_path.display().to_string(),
                 "system_policy_loaded": report.system_policy_loaded,
+                "user_unified_policy_path": report.user_unified_policy_path.as_ref().map(|p| p.display().to_string()),
+                "user_unified_policy_loaded": report.user_unified_policy_loaded,
                 "user_policy_path": report.user_policy_path.as_ref().map(|p| p.display().to_string()),
                 "user_policy_loaded": report.user_policy_loaded,
                 "env_disabled": report.env_disabled,
@@ -3295,13 +4152,24 @@ fn cmd_lan_status(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
         println!("  require_pin:        {}", report.policy.require_pin);
         println!("  require_local_auth: {}", report.policy.require_local_auth);
         println!(
-            "  idle_timeout_sec:   {} (max {MAX_LAN_IDLE_TIMEOUT_SEC})",
-            report.policy.idle_timeout_sec
+            "  idle_timeout_sec:   {} (ceiling {})",
+            report.policy.idle_timeout_sec, report.effective.max_idle_timeout_sec
         );
         println!(
-            "  scan_timeout_sec:   {} (max {MAX_LAN_SCAN_TIMEOUT_SEC})",
-            report.policy.scan_timeout_sec
+            "  scan_timeout_sec:   {} (ceiling {})",
+            report.policy.scan_timeout_sec, report.effective.max_scan_timeout_sec
         );
+        if let Some(ref sup) = report.system_unified_policy_path {
+            println!(
+                "  system unified:     {} ({})",
+                sup.display(),
+                if report.system_unified_policy_loaded {
+                    "loaded"
+                } else {
+                    "not present"
+                }
+            );
+        }
         println!(
             "  system policy:      {} ({})",
             report.system_policy_path.display(),
@@ -3311,6 +4179,11 @@ fn cmd_lan_status(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                 "not present"
             }
         );
+        if let Some(ref uup) = report.user_unified_policy_path
+            && report.user_unified_policy_loaded
+        {
+            println!("  user unified:       {} (loaded)", uup.display());
+        }
         if let Some(ref up) = report.user_policy_path {
             println!(
                 "  user policy:        {} ({})",
@@ -3391,10 +4264,7 @@ async fn cmd_lan_scan(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
     let report = load_effective_lan_policy(&LanPolicyPaths::default(), &process_env_lookup)?;
     enforce_lan_enabled_and_local_auth(&report, "Authorize mp-outpost LAN Party scan")?;
 
-    let requested = timeout_override.unwrap_or(DEFAULT_LAN_SCAN_TIMEOUT_SEC);
-    let effective_timeout = requested
-        .min(report.policy.scan_timeout_sec)
-        .clamp(1, MAX_LAN_SCAN_TIMEOUT_SEC);
+    let effective_timeout = report.effective.effective_scan_timeout(timeout_override);
 
     let lobbies = scan_lan_mdns(effective_timeout, None).await?;
 
@@ -3412,6 +4282,7 @@ async fn cmd_lan_scan(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
                     "lobby_name": l.beacon.lobby_name,
                     "host_name": l.beacon.host_name,
                     "host_pubkey_b64u": encode_lan_pubkey_base64url(&l.beacon.host_pubkey),
+                    "lan_sn": l.safety_number,
                     "safety_number": l.safety_number,
                     "require_pin": l.beacon.require_pin,
                     "service_port": l.service_port,
@@ -3441,7 +4312,7 @@ async fn cmd_lan_scan(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
                 .map(|a| format_lan_direct_target(*a))
                 .collect();
             println!(
-                "  id={}  name=\"{}\"  host=\"{}\"  pin={}  addrs=[{}]  sn={}",
+                "  id={}  name=\"{}\"  host=\"{}\"  pin={}  addrs=[{}]  lan_sn={}",
                 l.beacon.lan_party_id,
                 l.beacon.lobby_name,
                 l.beacon.host_name,
@@ -3450,6 +4321,9 @@ async fn cmd_lan_scan(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
                 l.safety_number
             );
         }
+        println!(
+            "  (Note: lan_sn assumes local-only account_id=0; online-enrolled hosts verify their account Safety Number during TLS LAN_HELLO)"
+        );
     }
     Ok(())
 }
@@ -3549,10 +4423,7 @@ async fn cmd_lan_host(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
     let report = load_effective_lan_policy(&LanPolicyPaths::default(), &process_env_lookup)?;
     enforce_lan_enabled_and_local_auth(&report, "Authorize mp-outpost LAN Party host")?;
 
-    let effective_idle = timeout_override
-        .unwrap_or(DEFAULT_LAN_IDLE_TIMEOUT_SEC)
-        .min(report.policy.idle_timeout_sec)
-        .clamp(1, MAX_LAN_IDLE_TIMEOUT_SEC);
+    let effective_idle = report.effective.effective_idle_timeout(timeout_override);
     let require_pin = report.policy.require_pin || cli_require_pin || pin_stdin;
 
     let pin = if require_pin {
@@ -3587,6 +4458,7 @@ async fn cmd_lan_host(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
         pin,
         idle_timeout_sec: effective_idle,
         enable_mdns: !no_mdns && !start_locked,
+        start_locked,
         bind_port,
         max_members: LAN_MAX_MEMBERS as u8,
         pin_rate_limit: LanPinRateLimitConfig::default(),
@@ -3595,10 +4467,6 @@ async fn cmd_lan_host(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
         trust_mode,
     })
     .await?;
-
-    if start_locked {
-        let _ = host.lock_lobby().await;
-    }
 
     let host_pk_b64u = encode_lan_pubkey_base64url(&identity.public_key);
     let primary_addr = host
@@ -3666,8 +4534,21 @@ async fn cmd_lan_host(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
 
     while !host.is_closed() {
         let idle_deadline = host.idle_deadline();
+        let mdns_deadline = host.mdns_deadline();
         let idle_sleep = async move {
             match idle_deadline {
+                Some(dl) => {
+                    let now = Instant::now();
+                    if dl <= now {
+                        return;
+                    }
+                    tokio::time::sleep(dl - now).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let mdns_sleep = async move {
+            match mdns_deadline {
                 Some(dl) => {
                     let now = Instant::now();
                     if dl <= now {
@@ -3692,67 +4573,93 @@ async fn cmd_lan_host(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
             }
         };
 
-        tokio::select! {
-            _ = idle_sleep => {
+        enum HostSelectAction {
+            IdleTimeout,
+            MdnsTimeout,
+            Signal,
+            EvictTick,
+            Stdin(Option<String>),
+            HostInput(Option<HostInput>),
+        }
+
+        // G3-L3-2: Select ONLY on cancel-safe primitives (timers, signals, pure channel recv).
+        // All multi-step async mutations/rejections/teardown execute outside `select!`.
+        let action = tokio::select! {
+            _ = idle_sleep => HostSelectAction::IdleTimeout,
+            _ = mdns_sleep => HostSelectAction::MdnsTimeout,
+            _ = wait_signal => HostSelectAction::Signal,
+            _ = evict_tick.tick() => HostSelectAction::EvictTick,
+            maybe_line = stdin_rx.recv(), if stdin_open => HostSelectAction::Stdin(maybe_line),
+            maybe_input = host.recv_next_input() => HostSelectAction::HostInput(maybe_input),
+        };
+
+        match action {
+            HostSelectAction::IdleTimeout => {
                 let closed_ev = host.shutdown("lan_host_timeout").await;
                 print_lan_event(&closed_ev, json_out);
                 break;
             }
-            _ = wait_signal => {
+            HostSelectAction::MdnsTimeout => {
+                host.stop_mdns().await;
+            }
+            HostSelectAction::Signal => {
                 let closed_ev = host.shutdown("signal").await;
                 print_lan_event(&closed_ev, json_out);
                 break;
             }
-            _ = evict_tick.tick() => {
+            HostSelectAction::EvictTick => {
                 for ev in host.evict_stalled_pending().await {
                     print_lan_event(&ev, json_out);
                 }
             }
-            maybe_line = stdin_rx.recv(), if stdin_open => {
-                match maybe_line {
-                    Some(line) => {
-                        let trimmed = line.trim();
-                        if trimmed == "/quit" || trimmed == "/exit" {
-                            let closed_ev = host.shutdown("quit").await;
-                            print_lan_event(&closed_ev, json_out);
-                            break;
-                        } else if trimmed == "/lock" {
-                            let locked_ev = host.lock_lobby().await;
-                            print_lan_event(&locked_ev, json_out);
-                        } else if trimmed == "/members" {
-                            if json_out {
-                                emit_jsonl(&json!({
-                                    "event": "roster",
-                                    "members": members_to_json(host.members()),
-                                }));
-                            } else {
-                                println!("Members ({}):", host.members().len());
-                                for m in host.members() {
-                                    println!(
-                                        "  - {}{}",
-                                        m.display_name,
-                                        if m.is_host { " (host)" } else { "" }
-                                    );
-                                }
+            HostSelectAction::Stdin(maybe_line) => match maybe_line {
+                Some(line) => {
+                    let trimmed = line.trim();
+                    if trimmed == "/quit" || trimmed == "/exit" {
+                        let closed_ev = host.shutdown("quit").await;
+                        print_lan_event(&closed_ev, json_out);
+                        break;
+                    } else if trimmed == "/lock" {
+                        let locked_ev = host.lock_lobby().await;
+                        print_lan_event(&locked_ev, json_out);
+                    } else if trimmed == "/members" {
+                        if json_out {
+                            emit_jsonl(&json!({
+                                "event": "roster",
+                                "members": members_to_json(host.members()),
+                            }));
+                        } else {
+                            println!("Members ({}):", host.members().len());
+                            for m in host.members() {
+                                println!(
+                                    "  - {}{}",
+                                    m.display_name,
+                                    if m.is_host { " (host)" } else { "" }
+                                );
                             }
-                        } else if !trimmed.is_empty()
-                            && let Err(err) = host.send_chat(trimmed).await
-                        {
-                            eprintln!("warning: {err}");
                         }
-                    }
-                    None => {
-                        // Stdin closed (e.g. after --pin-stdin pipe): keep hosting until timeout/signal.
-                        stdin_open = false;
+                    } else if !trimmed.is_empty()
+                        && let Err(err) = host.send_chat(trimmed).await
+                    {
+                        eprintln!("warning: {err}");
                     }
                 }
-            }
-            maybe_events = host.next_event() => {
-                let Some(evs) = maybe_events else {
+                None => {
+                    // Stdin closed (e.g. after --pin-stdin pipe): keep hosting until timeout/signal.
+                    stdin_open = false;
+                }
+            },
+            HostSelectAction::HostInput(maybe_input) => {
+                let Some(input) = maybe_input else {
                     break;
                 };
+                let evs = match input {
+                    HostInput::Transport(raw_ev) => host.handle_transport_event(raw_ev).await,
+                    HostInput::Approval(approval) => host.handle_completed_approval(approval).await,
+                };
                 for ev in evs {
-                    if matches!(ev, LanSessionEvent::LobbyClosed { ref reason } if reason == "pin_lobby_locked") {
+                    if matches!(ev, LanSessionEvent::LobbyClosed { ref reason } if reason == "pin_lobby_locked")
+                    {
                         exit_err = Some("LAN lobby torn down after 15 failed PIN attempts".to_string());
                     }
                     print_lan_event(&ev, json_out);
@@ -3868,10 +4775,7 @@ async fn cmd_lan_join(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
             })?;
             (pk, vec![direct_sock], None)
         } else if parse_lan_party_id_hex(&target).is_ok() {
-            let effective_scan = scan_timeout_override
-                .unwrap_or(DEFAULT_LAN_SCAN_TIMEOUT_SEC)
-                .min(report.policy.scan_timeout_sec)
-                .clamp(1, MAX_LAN_SCAN_TIMEOUT_SEC);
+            let effective_scan = report.effective.effective_scan_timeout(scan_timeout_override);
             let found = scan_lan_mdns(effective_scan, Some(&target)).await?;
             let lobby = found
                 .into_iter()
@@ -4049,6 +4953,10 @@ async fn cmd_lan_join(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
     Ok(())
 }
 
+fn format_fenced_text_body(body: &str) -> String {
+    body.replace('\n', "\n  | ")
+}
+
 fn print_lan_event(ev: &LanSessionEvent, json_out: bool) {
     match ev {
         LanSessionEvent::PeerJoined {
@@ -4150,7 +5058,11 @@ fn print_lan_event(ev: &LanSessionEvent, json_out: bool) {
                     "fenced_body": fenced,
                 }));
             } else {
-                println!("[{}] {}", chat.sender_handle, chat.body);
+                println!(
+                    "[{}] {}",
+                    chat.sender_handle,
+                    format_fenced_text_body(&chat.body)
+                );
             }
         }
         LanSessionEvent::BridgeReceived {
@@ -4186,7 +5098,10 @@ fn print_lan_event(ev: &LanSessionEvent, json_out: bool) {
                     "status": pulse.status,
                 }));
             } else {
-                println!("[pulse:{sender_name}] {}", pulse.status);
+                println!(
+                    "[pulse:{sender_name}] {}",
+                    format_fenced_text_body(&pulse.status)
+                );
             }
         }
         LanSessionEvent::ControlNoticeReceived {
@@ -4201,7 +5116,7 @@ fn print_lan_event(ev: &LanSessionEvent, json_out: bool) {
                     "text": notice.text,
                 }));
             } else {
-                println!("[notice] {}", notice.text);
+                println!("[notice] {}", format_fenced_text_body(&notice.text));
             }
         }
         LanSessionEvent::LobbyLocked { roster_epoch } => {
@@ -4233,8 +5148,11 @@ fn print_lan_event(ev: &LanSessionEvent, json_out: bool) {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    use outpost_core::storage_codec::{PeerRecord, PeersStoreRecord, encode_peers_store};
 
     use super::*;
 
@@ -4271,7 +5189,9 @@ mod tests {
         fs::set_permissions(&user_path, fs::Permissions::from_mode(0o600))?;
 
         let paths = LanPolicyPaths {
+            system_unified_policy_path: None,
             system_policy_path: sys_path.clone(),
+            user_unified_policy_path: None,
             user_policy_path: Some(user_path.clone()),
             expected_system_uid: my_uid,
             expected_user_uid: Some(my_uid),
@@ -4288,14 +5208,14 @@ mod tests {
 
         // MP_DISABLE_LAN=1 forces fail-closed disabled = true!
         let report_mp = load_effective_lan_policy(&paths, &|k| {
-            (k == "MP_DISABLE_LAN").then(|| "1".to_string())
+            (k == "MP_DISABLE_LAN").then(|| OsString::from("1"))
         })?;
         assert!(report_mp.policy.disabled);
         assert!(report_mp.env_disabled);
 
         // BLACKBIRD_DISABLE_LAN=true also forces disabled = true!
         let report_bb = load_effective_lan_policy(&paths, &|k| {
-            (k == "BLACKBIRD_DISABLE_LAN").then(|| "YES".to_string())
+            (k == "BLACKBIRD_DISABLE_LAN").then(|| OsString::from("YES"))
         })?;
         assert!(report_bb.policy.disabled);
 
@@ -4303,7 +5223,9 @@ mod tests {
         let sym_path = tmp.path().join("sym_lan.toml");
         symlink(&sys_path, &sym_path)?;
         let sym_paths = LanPolicyPaths {
+            system_unified_policy_path: None,
             system_policy_path: sym_path,
+            user_unified_policy_path: None,
             user_policy_path: None,
             expected_system_uid: my_uid,
             expected_user_uid: Some(my_uid),
@@ -4341,6 +5263,11 @@ mod tests {
             id1.safety_number,
             compute_lan_safety_number(0, &id1.public_key)?
         );
+
+        // Debug output MUST redact signing_seed and device_cwt!
+        let dbg = format!("{id1:?}");
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(!dbg.contains(&encode_hex(&*id1.signing_seed)));
 
         let id_file = lan_dir.join(LAN_IDENTITY_FILE);
         let meta = fs::symlink_metadata(&id_file)?;
@@ -4382,6 +5309,7 @@ mod tests {
             pin: Some(host_pin),
             idle_timeout_sec: 60,
             enable_mdns: false,
+            start_locked: false,
             bind_port: None,
             max_members: 4,
             pin_rate_limit: LanPinRateLimitConfig::default(),
@@ -4471,9 +5399,20 @@ mod tests {
         assert_eq!(join_chat.sender_handle, "HostOne");
         assert_eq!(join_chat.body, "welcome to quake night!");
 
-        // Outbound secret leak guard blocks own signing seed!
+        // Outbound secret leak guard blocks own signing seed (even with stripped control-char obfuscation)
+        // AND host MUST block sending its own active LAN PIN in chat!
         let leaked_seed_hex = encode_hex(&*join_id.signing_seed);
         assert!(joiner.send_chat(&format!("oops {leaked_seed_hex}")).await.is_err());
+        let obfuscated_seed = format!(
+            "{}\x00{}",
+            leaked_seed_hex.get(..16).unwrap_or(""),
+            leaked_seed_hex.get(16..).unwrap_or("")
+        );
+        assert!(joiner.send_chat(&obfuscated_seed).await.is_err());
+        assert!(
+            host.send_chat("the pin is caf\u{00e9}-42").await.is_err(),
+            "host must refuse sending its own active LAN PIN in chat"
+        );
 
         joiner.close().await;
         let _ = host.shutdown("test_done").await;
@@ -4486,6 +5425,7 @@ mod tests {
             pin: Some(join_pin.clone()),
             idle_timeout_sec: 60,
             enable_mdns: false,
+            start_locked: false,
             bind_port: None,
             max_members: 4,
             pin_rate_limit: LanPinRateLimitConfig::default(),
@@ -4546,6 +5486,7 @@ mod tests {
             pin: Some(Zeroizing::new("correct-pin-99".to_string())),
             idle_timeout_sec: 60,
             enable_mdns: false,
+            start_locked: false,
             bind_port: None,
             max_members: 4,
             pin_rate_limit: LanPinRateLimitConfig {
@@ -4683,6 +5624,7 @@ mod tests {
             pin: None,
             idle_timeout_sec: 60,
             enable_mdns: false,
+            start_locked: false,
             bind_port: None,
             max_members: 4,
             pin_rate_limit: LanPinRateLimitConfig::default(),
@@ -4759,6 +5701,7 @@ mod tests {
             pin: None,
             idle_timeout_sec: 60,
             enable_mdns: false,
+            start_locked: false,
             bind_port: None,
             max_members: 4,
             pin_rate_limit: LanPinRateLimitConfig::default(),
@@ -4853,6 +5796,511 @@ mod tests {
         player_a.close().await;
         player_b.close().await;
         let _ = host.shutdown("test_done").await;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Gate #3 Security Hardening Regression Tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn g3_duplicate_display_name_impersonation_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let opts = test_opts(tmp.path());
+        let host_dir = tmp.path().join("dup_host");
+        let imp_host_dir = tmp.path().join("dup_imp_host");
+        let legit_dir = tmp.path().join("dup_legit");
+        let imp_peer_dir = tmp.path().join("dup_imp_peer");
+
+        let host_id =
+            load_or_create_lan_identity(&opts, Some(&host_dir), true, Some("HostAlpha"))?;
+        // Impersonator 1 claims host's display name with different ASCII casing!
+        let imp_host_id =
+            load_or_create_lan_identity(&opts, Some(&imp_host_dir), true, Some("hostalpha"))?;
+        let legit_id =
+            load_or_create_lan_identity(&opts, Some(&legit_dir), true, Some("ScoutOne"))?;
+        // Impersonator 2 claims legit member's display name with different ASCII casing!
+        let imp_peer_id =
+            load_or_create_lan_identity(&opts, Some(&imp_peer_dir), true, Some("SCOUTONE"))?;
+
+        let host_pins = LanPeerPinStore::new(host_dir, None, false, TrustMode::AlwaysReject);
+        host_pins.pin_peer(0, &imp_host_id.public_key, "Other1", &imp_host_id.safety_number)?;
+        host_pins.pin_peer(0, &legit_id.public_key, "ScoutOne", &legit_id.safety_number)?;
+        host_pins.pin_peer(0, &imp_peer_id.public_key, "Other2", &imp_peer_id.safety_number)?;
+
+        let mut host = LanHostSession::start(LanHostConfig {
+            identity: host_id.clone(),
+            lobby_name: "dup-check".to_string(),
+            require_pin: false,
+            pin: None,
+            idle_timeout_sec: 60,
+            enable_mdns: false,
+            start_locked: false,
+            bind_port: None,
+            max_members: 4,
+            pin_rate_limit: LanPinRateLimitConfig::default(),
+            online_state_dir: None,
+            require_local_auth_on_pin: false,
+            trust_mode: TrustMode::AlwaysReject,
+        })
+        .await?;
+        let host_addr = host.loopback_addr();
+
+        // 1. Impersonating the host's display_name MUST be rejected with "display_name_in_use"!
+        let t1 = tokio::spawn(LanJoinSession::connect_and_handshake(LanJoinConfig {
+            identity: imp_host_id,
+            host_pubkey: host_id.public_key,
+            host_addrs: vec![host_addr],
+            expected_lan_party_id: None,
+            policy_require_pin: false,
+            pin: None,
+            pin_prompt_if_needed: false,
+            online_state_dir: None,
+            require_local_auth_on_pin: false,
+            trust_mode: TrustMode::ExpectedSafetyNumber(host_id.safety_number.clone()),
+        }));
+        let mut rej_reason = None;
+        let dl = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < dl && rej_reason.is_none() {
+            if let Ok(Some(evs)) =
+                tokio::time::timeout(Duration::from_millis(300), host.next_event()).await
+            {
+                for ev in evs {
+                    if let LanSessionEvent::PeerRejected { reason, .. } = ev {
+                        rej_reason = Some(reason);
+                    }
+                }
+            }
+        }
+        assert_eq!(rej_reason.as_deref(), Some("display_name_in_use"));
+        assert!(tokio::time::timeout(Duration::from_secs(5), t1).await??.is_err());
+
+        // 2. Legit peer ScoutOne joins cleanly.
+        let t2 = tokio::spawn(LanJoinSession::connect_and_handshake(LanJoinConfig {
+            identity: legit_id,
+            host_pubkey: host_id.public_key,
+            host_addrs: vec![host_addr],
+            expected_lan_party_id: None,
+            policy_require_pin: false,
+            pin: None,
+            pin_prompt_if_needed: false,
+            online_state_dir: None,
+            require_local_auth_on_pin: false,
+            trust_mode: TrustMode::ExpectedSafetyNumber(host_id.safety_number.clone()),
+        }));
+        let dl = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < dl && host.members().len() < 2 {
+            let _ = tokio::time::timeout(Duration::from_millis(300), host.next_event()).await;
+        }
+        let mut legit_client = tokio::time::timeout(Duration::from_secs(5), t2).await???;
+
+        // 3. Second joiner claiming "SCOUTONE" MUST be rejected with "display_name_in_use"!
+        let t3 = tokio::spawn(LanJoinSession::connect_and_handshake(LanJoinConfig {
+            identity: imp_peer_id,
+            host_pubkey: host_id.public_key,
+            host_addrs: vec![host_addr],
+            expected_lan_party_id: None,
+            policy_require_pin: false,
+            pin: None,
+            pin_prompt_if_needed: false,
+            online_state_dir: None,
+            require_local_auth_on_pin: false,
+            trust_mode: TrustMode::ExpectedSafetyNumber(host_id.safety_number),
+        }));
+        let mut rej2 = None;
+        let dl = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < dl && rej2.is_none() {
+            if let Ok(Some(evs)) =
+                tokio::time::timeout(Duration::from_millis(300), host.next_event()).await
+            {
+                for ev in evs {
+                    if let LanSessionEvent::PeerRejected { reason, .. } = ev {
+                        rej2 = Some(reason);
+                    }
+                }
+            }
+        }
+        assert_eq!(rej2.as_deref(), Some("display_name_in_use"));
+        assert!(tokio::time::timeout(Duration::from_secs(5), t3).await??.is_err());
+
+        legit_client.close().await;
+        let _ = host.shutdown("test_done").await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn g3_disconnect_revokes_peer_blocking_reconnect_while_locked_and_rearms_idle_timer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let opts = test_opts(tmp.path());
+        let host_dir = tmp.path().join("rev_host");
+        let peer_dir = tmp.path().join("rev_peer");
+
+        let host_id = load_or_create_lan_identity(&opts, Some(&host_dir), true, Some("LockHost"))?;
+        let peer_id = load_or_create_lan_identity(&opts, Some(&peer_dir), true, Some("LeavingPeer"))?;
+
+        // Start a separate host with start_locked: true to verify idle_deadline is armed even when
+        // started locked with 0 remote peers!
+        let mut locked_start_host = LanHostSession::start(LanHostConfig {
+            identity: host_id.clone(),
+            lobby_name: "locked-init".to_string(),
+            require_pin: false,
+            pin: None,
+            idle_timeout_sec: 45,
+            enable_mdns: false,
+            start_locked: true,
+            bind_port: None,
+            max_members: 4,
+            pin_rate_limit: LanPinRateLimitConfig::default(),
+            online_state_dir: None,
+            require_local_auth_on_pin: false,
+            trust_mode: TrustMode::AlwaysReject,
+        })
+        .await?;
+        assert!(
+            locked_start_host.idle_deadline().is_some(),
+            "start_locked host with 0 remote peers must still arm idle_deadline"
+        );
+        let _ = locked_start_host.shutdown("test_done").await;
+
+        let mut host = LanHostSession::start(LanHostConfig {
+            identity: host_id.clone(),
+            lobby_name: "rev-lock-test".to_string(),
+            require_pin: false,
+            pin: None,
+            idle_timeout_sec: 60,
+            enable_mdns: false,
+            start_locked: false,
+            bind_port: None,
+            max_members: 4,
+            pin_rate_limit: LanPinRateLimitConfig::default(),
+            online_state_dir: None,
+            require_local_auth_on_pin: false,
+            trust_mode: TrustMode::ExpectedSafetyNumber(peer_id.safety_number.clone()),
+        })
+        .await?;
+        assert!(host.idle_deadline().is_some(), "initial idle_deadline must be armed");
+        let host_addr = host.loopback_addr();
+
+        // Peer joins -> idle_deadline clears while lobby has remote members.
+        let join_task = tokio::spawn(LanJoinSession::connect_and_handshake(LanJoinConfig {
+            identity: peer_id.clone(),
+            host_pubkey: host_id.public_key,
+            host_addrs: vec![host_addr],
+            expected_lan_party_id: None,
+            policy_require_pin: false,
+            pin: None,
+            pin_prompt_if_needed: false,
+            online_state_dir: None,
+            require_local_auth_on_pin: false,
+            trust_mode: TrustMode::ExpectedSafetyNumber(host_id.safety_number.clone()),
+        }));
+        let dl = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < dl && host.members().len() < 2 {
+            let _ = tokio::time::timeout(Duration::from_millis(300), host.next_event()).await;
+        }
+        assert_eq!(host.members().len(), 2);
+        assert!(
+            host.idle_deadline().is_none(),
+            "idle_deadline must disarm while remote peers are connected"
+        );
+        let mut peer_client = tokio::time::timeout(Duration::from_secs(5), join_task).await???;
+
+        // Lock lobby while peer is connected, then peer disconnects!
+        let _ = host.lock_lobby().await;
+        peer_client.close().await;
+
+        let mut saw_left = false;
+        let dl = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < dl && !saw_left {
+            if let Ok(Some(evs)) =
+                tokio::time::timeout(Duration::from_millis(300), host.next_event()).await
+                && evs
+                    .iter()
+                    .any(|e| matches!(e, LanSessionEvent::PeerLeft { .. }))
+            {
+                saw_left = true;
+            }
+        }
+        assert!(saw_left, "host must observe PeerLeft after client closes");
+        assert_eq!(host.members().len(), 1);
+        assert!(
+            host.idle_deadline().is_some(),
+            "idle_deadline MUST re-arm when all remote peers leave"
+        );
+
+        // Now the disconnected peer attempts to reconnect directly while the lobby is locked.
+        // Because PeerDisconnected called revoke_peer, the transport MUST reject the reconnect!
+        let reconnect_res = tokio::time::timeout(
+            Duration::from_secs(3),
+            LanJoinSession::connect_and_handshake(LanJoinConfig {
+                identity: peer_id,
+                host_pubkey: host_id.public_key,
+                host_addrs: vec![host_addr],
+                expected_lan_party_id: None,
+                policy_require_pin: false,
+                pin: None,
+                pin_prompt_if_needed: false,
+                online_state_dir: None,
+                require_local_auth_on_pin: false,
+                trust_mode: TrustMode::AlwaysReject,
+            }),
+        )
+        .await;
+        if let Ok(Ok(_)) = reconnect_res {
+            return Err("disconnected peer must NOT reconnect while lobby is locked".into());
+        }
+
+        let _ = host.shutdown("test_done").await;
+        Ok(())
+    }
+
+    #[test]
+    fn g3_revocation_in_lan_peers_dominates_peers_bin_and_corrupt_peers_bin_fails_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let opts = test_opts(tmp.path());
+        let lan_dir = tmp.path().join("lan_rev");
+        let state_dir = tmp.path().join("online_state");
+        let peer_id = load_or_create_lan_identity(
+            &opts,
+            Some(&tmp.path().join("peer_id")),
+            true,
+            Some("RevPeer"),
+        )?;
+        let other_id = load_or_create_lan_identity(
+            &opts,
+            Some(&tmp.path().join("other_id")),
+            true,
+            Some("RevPeer"),
+        )?;
+
+        let vdir = open_or_create_private_dir(&state_dir)?;
+        let peer_sn_42 = compute_lan_safety_number(42, &peer_id.public_key)?;
+
+        // Write lan_peers.json marking peer_id as revoked: true!
+        let lan_vdir = open_or_create_private_dir(&lan_dir)?;
+        let revoked_file = PinnedLanPeersFile {
+            version: 1,
+            peers: vec![PinnedLanPeerEntry {
+                pubkey_hex: encode_hex(&peer_id.public_key),
+                account_id: 42,
+                display_name: "RevPeer".to_string(),
+                safety_number: peer_sn_42.clone(),
+                pinned_at_ms: 1,
+                revoked: true,
+            }],
+        };
+        atomic_write_in_dir(
+            lan_vdir.as_raw_fd(),
+            LAN_PEERS_FILE,
+            &serde_json::to_vec_pretty(&revoked_file)?,
+        )?;
+
+        // 1. peers.bin exists with no entry (Unpinned) -> lan_peers.json revoked: true MUST dominate!
+        atomic_write_in_dir(
+            vdir.as_raw_fd(),
+            PEERS_FILE,
+            &encode_peers_store(&PeersStoreRecord::default())?,
+        )?;
+        let store = LanPeerPinStore::new(
+            lan_dir.clone(),
+            Some(state_dir.clone()),
+            false,
+            TrustMode::AlwaysReject,
+        );
+        assert_eq!(
+            store.lookup_peer(42, &peer_id.public_key)?,
+            PeerTrustStatus::RevokedBlocked
+        );
+
+        // 2. Even if peers.bin says PinnedTrusted, revocation in lan_peers.json STILL dominates!
+        let online_trusted = PeersStoreRecord {
+            peers: vec![PeerRecord {
+                api_authority_hash: [0u8; 8],
+                account_id: 42,
+                root_pubkey: peer_id.public_key,
+                trust_state: TrustState::PinnedTrusted,
+                pinned_at_ms: 1,
+                handle_prop: "RevPeer".to_string(),
+                handle_fetched_ms: 1,
+            }],
+        };
+        atomic_write_in_dir(
+            vdir.as_raw_fd(),
+            PEERS_FILE,
+            &encode_peers_store(&online_trusted)?,
+        )?;
+        assert_eq!(
+            store.lookup_peer(42, &peer_id.public_key)?,
+            PeerTrustStatus::RevokedBlocked
+        );
+
+        // 3. Conversely, RevokedBlocked in peers.bin MUST dominate a pinned entry in lan_peers.json!
+        let lan_pinned = PinnedLanPeersFile {
+            version: 1,
+            peers: vec![PinnedLanPeerEntry {
+                pubkey_hex: encode_hex(&peer_id.public_key),
+                account_id: 42,
+                display_name: "RevPeer".to_string(),
+                safety_number: peer_sn_42,
+                pinned_at_ms: 1,
+                revoked: false,
+            }],
+        };
+        atomic_write_in_dir(
+            lan_vdir.as_raw_fd(),
+            LAN_PEERS_FILE,
+            &serde_json::to_vec_pretty(&lan_pinned)?,
+        )?;
+        let online_revoked = PeersStoreRecord {
+            peers: vec![PeerRecord {
+                api_authority_hash: [0u8; 8],
+                account_id: 42,
+                root_pubkey: peer_id.public_key,
+                trust_state: TrustState::RevokedBlocked,
+                pinned_at_ms: 1,
+                handle_prop: "RevPeer".to_string(),
+                handle_fetched_ms: 1,
+            }],
+        };
+        atomic_write_in_dir(
+            vdir.as_raw_fd(),
+            PEERS_FILE,
+            &encode_peers_store(&online_revoked)?,
+        )?;
+        assert_eq!(
+            store.lookup_peer(42, &peer_id.public_key)?,
+            PeerTrustStatus::RevokedBlocked
+        );
+
+        // 4. Verify account_id binding in peers.bin: restore PinnedTrusted in peers.bin and
+        // empty lan_peers.json -> account_id=42 is PinnedTrusted while mismatched account_id=99 is Unpinned!
+        atomic_write_in_dir(
+            vdir.as_raw_fd(),
+            PEERS_FILE,
+            &encode_peers_store(&online_trusted)?,
+        )?;
+        let empty_lan = PinnedLanPeersFile::default();
+        atomic_write_in_dir(
+            lan_vdir.as_raw_fd(),
+            LAN_PEERS_FILE,
+            &serde_json::to_vec_pretty(&empty_lan)?,
+        )?;
+        assert_eq!(
+            store.lookup_peer(42, &peer_id.public_key)?,
+            PeerTrustStatus::PinnedTrusted
+        );
+        assert_eq!(
+            store.lookup_peer(99, &peer_id.public_key)?,
+            PeerTrustStatus::Unpinned
+        );
+
+        // 5. Key-changed conflict detection surfaces warning when another key claims same account_id/name!
+        let conflict = store.find_key_change_conflict(42, "RevPeer", &other_id.public_key)?;
+        assert!(
+            conflict.is_some(),
+            "different key claiming already-pinned account_id/name must surface key-change warning"
+        );
+
+        // 6. Corrupt peers.bin MUST fail closed (Err), never silently ignored!
+        atomic_write_in_dir(vdir.as_raw_fd(), PEERS_FILE, b"not-a-valid-peers-bin")?;
+        assert!(store.lookup_peer(42, &peer_id.public_key).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn g3_non_utf8_env_kill_switch_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let non_utf8 = OsStr::from_bytes(&[0xff, 0xfe, b'0']).to_os_string();
+        let paths = LanPolicyPaths {
+            system_unified_policy_path: None,
+            system_policy_path: PathBuf::new(),
+            user_unified_policy_path: None,
+            user_policy_path: None,
+            expected_system_uid: unsafe { libc::geteuid() },
+            expected_user_uid: None,
+        };
+        let report_mp = load_effective_lan_policy(&paths, &|k| {
+            (k == "MP_DISABLE_LAN").then(|| non_utf8.clone())
+        })?;
+        assert!(
+            report_mp.policy.disabled && report_mp.env_disabled,
+            "non-UTF-8 MP_DISABLE_LAN MUST fail closed"
+        );
+
+        let report_bb = load_effective_lan_policy(&paths, &|k| {
+            (k == "BLACKBIRD_DISABLE_LAN").then(|| non_utf8.clone())
+        })?;
+        assert!(
+            report_bb.policy.disabled && report_bb.env_disabled,
+            "non-UTF-8 BLACKBIRD_DISABLE_LAN MUST fail closed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn g3_omitted_system_policy_timeout_allows_cli_600_and_merges_unified_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let sys_unified = tmp.path().join("policy.toml");
+        let sys_legacy = tmp.path().join("lan.toml");
+        let my_uid = unsafe { libc::geteuid() };
+
+        // System policy sets require_pin = true but OMITS idle_timeout_sec and scan_timeout_sec!
+        fs::write(&sys_legacy, "[lan]\nrequire_pin = true\n")?;
+        fs::set_permissions(&sys_legacy, fs::Permissions::from_mode(0o644))?;
+
+        let paths = LanPolicyPaths {
+            system_unified_policy_path: Some(sys_unified.clone()),
+            system_policy_path: sys_legacy.clone(),
+            user_unified_policy_path: None,
+            user_policy_path: None,
+            expected_system_uid: my_uid,
+            expected_user_uid: Some(my_uid),
+        };
+
+        let report = load_effective_lan_policy(&paths, &|_| None)?;
+        assert!(report.system_policy_loaded);
+        assert!(report.policy.require_pin);
+        assert_eq!(report.effective.max_idle_timeout_sec, MAX_LAN_IDLE_TIMEOUT_SEC);
+        assert_eq!(report.effective.effective_idle_timeout(Some(600)), 600);
+        assert_eq!(report.effective.effective_scan_timeout(Some(30)), 30);
+
+        // Now add unified policy.toml tightening require_local_auth = true and idle_timeout_sec = 450!
+        fs::write(
+            &sys_unified,
+            "[lan]\nrequire_local_auth = true\nidle_timeout_sec = 450\n",
+        )?;
+        fs::set_permissions(&sys_unified, fs::Permissions::from_mode(0o644))?;
+
+        let merged = load_effective_lan_policy(&paths, &|_| None)?;
+        assert!(merged.system_unified_policy_loaded);
+        assert!(merged.system_policy_loaded);
+        assert!(merged.policy.require_pin);
+        assert!(merged.policy.require_local_auth);
+        assert_eq!(merged.effective.max_idle_timeout_sec, 450);
+        assert_eq!(merged.effective.effective_idle_timeout(Some(600)), 450);
+
+        // Verify multiline text-mode fencing & mDNS unicast target validation helpers.
+        assert_eq!(
+            format_fenced_text_body("hello\n[+] fake join"),
+            "hello\n  | [+] fake join"
+        );
+        assert!(!is_valid_mdns_unicast_target(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+            0
+        )));
+        assert!(!is_valid_mdns_unicast_target(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251)),
+            5353
+        )));
+        assert!(is_valid_mdns_unicast_target(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+            5353
+        )));
+
         Ok(())
     }
 }

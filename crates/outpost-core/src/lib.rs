@@ -8,9 +8,11 @@
 
 pub mod crc32c;
 pub mod fence;
+pub mod inbox_crypto;
 pub mod ipc_wire;
 pub mod lan_protocol;
 pub mod p2p_wire;
 pub mod party_state;
+pub mod policy;
 pub mod storage_codec;
 pub mod trust;

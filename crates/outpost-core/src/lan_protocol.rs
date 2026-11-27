@@ -73,6 +73,7 @@ const DNS_HEADER_BYTES: usize = 12;
 const MAX_DIRECT_TARGET_BYTES: usize = 64;
 const JSON_MAX_NODES: usize = 1024;
 const JSON_MAX_DEPTH: usize = 16;
+pub const MAX_JSON_STRING_BYTES: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -153,9 +154,11 @@ const fn is_disallowed_pin_char(ch: char) -> bool {
         cp,
         0x00..=0x1f
             | 0x7f..=0x9f
-            | 0x200e
-            | 0x200f
+            | 0x00ad
+            | 0x061c
+            | 0x200b..=0x200f
             | 0x202a..=0x202e
+            | 0x2060..=0x2064
             | 0x2066..=0x2069
             | 0xfeff
             | 0xe0000..=0xe007f
@@ -335,11 +338,7 @@ pub fn verify_lan_pin_proof(
         joiner_pubkey,
         host_nonce,
     )?);
-    let mut diff = 0u8;
-    for (&a, &b) in expected.iter().zip(provided_proof.iter()) {
-        diff |= a ^ b;
-    }
-    Ok(core::hint::black_box(diff) == 0)
+    Ok(blake3::Hash::from(*expected) == blake3::Hash::from(*provided_proof))
 }
 
 /// Computes the canonical 39-char Crockford Base32 Safety Number (`XXXX-XXXX-...-XXXX`)
@@ -370,6 +369,7 @@ enum StrictJsonValue {
 }
 
 struct JsonParser<'a> {
+    text: &'a str,
     bytes: &'a [u8],
     pos: usize,
     nodes: usize,
@@ -378,6 +378,7 @@ struct JsonParser<'a> {
 impl<'a> JsonParser<'a> {
     const fn new(text: &'a str) -> Self {
         Self {
+            text,
             bytes: text.as_bytes(),
             pos: 0,
             nodes: 0,
@@ -511,15 +512,15 @@ impl<'a> JsonParser<'a> {
                 self.pos += 1;
                 let esc = self.peek().ok_or(LanProtocolError::FrameInvalidJson)?;
                 self.pos += 1;
-                match esc {
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'/' => out.push('/'),
-                    b'b' => out.push('\u{0008}'),
-                    b'f' => out.push('\u{000C}'),
-                    b'n' => out.push('\n'),
-                    b'r' => out.push('\r'),
-                    b't' => out.push('\t'),
+                let ch = match esc {
+                    b'"' => '"',
+                    b'\\' => '\\',
+                    b'/' => '/',
+                    b'b' => '\u{0008}',
+                    b'f' => '\u{000C}',
+                    b'n' => '\n',
+                    b'r' => '\r',
+                    b't' => '\t',
                     b'u' => {
                         let code = self.parse_hex4()?;
                         if (0xD800..=0xDBFF).contains(&code) {
@@ -534,36 +535,38 @@ impl<'a> JsonParser<'a> {
                             let combined = 0x1_0000
                                 + ((u32::from(code) - 0xD800) << 10)
                                 + (u32::from(low) - 0xDC00);
-                            let ch = char::from_u32(combined)
-                                .ok_or(LanProtocolError::FrameInvalidJson)?;
-                            out.push(ch);
+                            char::from_u32(combined).ok_or(LanProtocolError::FrameInvalidJson)?
                         } else if (0xDC00..=0xDFFF).contains(&code) {
                             return Err(LanProtocolError::FrameInvalidJson);
                         } else {
-                            let ch = char::from_u32(u32::from(code))
-                                .ok_or(LanProtocolError::FrameInvalidJson)?;
-                            out.push(ch);
+                            char::from_u32(u32::from(code))
+                                .ok_or(LanProtocolError::FrameInvalidJson)?
                         }
                     }
                     _ => return Err(LanProtocolError::FrameInvalidJson),
+                };
+                if out.len().saturating_add(ch.len_utf8()) > MAX_JSON_STRING_BYTES {
+                    return Err(LanProtocolError::FrameInvalidJson);
                 }
+                out.push(ch);
             } else if b < 0x20 {
                 return Err(LanProtocolError::FrameInvalidJson);
             } else if b < 0x80 {
+                if out.len().saturating_add(1) > MAX_JSON_STRING_BYTES {
+                    return Err(LanProtocolError::FrameInvalidJson);
+                }
                 self.pos += 1;
                 out.push(char::from(b));
             } else {
-                // Input was validated as UTF-8, slice next scalar.
-                let rest = self
-                    .bytes
+                // `self.text` is already validated UTF-8; decode the next scalar in O(1).
+                let ch = self
+                    .text
                     .get(self.pos..)
+                    .and_then(|s| s.chars().next())
                     .ok_or(LanProtocolError::FrameInvalidJson)?;
-                let rest_str =
-                    core::str::from_utf8(rest).map_err(|_| LanProtocolError::FrameInvalidUtf8)?;
-                let ch = rest_str
-                    .chars()
-                    .next()
-                    .ok_or(LanProtocolError::FrameInvalidJson)?;
+                if out.len().saturating_add(ch.len_utf8()) > MAX_JSON_STRING_BYTES {
+                    return Err(LanProtocolError::FrameInvalidJson);
+                }
                 self.pos += ch.len_utf8();
                 out.push(ch);
             }
@@ -1345,11 +1348,9 @@ impl LanPinRateLimiter {
         LanPinLockoutStatus::Allowed
     }
 
-    pub fn record_success(&mut self, peer: &LanPinPeerKey) {
-        if self.is_lobby_locked() || self.is_peer_locked(peer) {
-            return;
-        }
-        self.peer_failures.remove(peer);
+    pub fn record_success(&mut self, _peer: &LanPinPeerKey) {
+        // Keep per-peer tuple failures cumulative for the lobby lifetime so a peer cannot
+        // reset its failure budget via an interleaved valid join.
     }
 
     pub fn peer_failures(&self, peer: &LanPinPeerKey) -> u32 {
@@ -1425,15 +1426,62 @@ fn parse_policy_timeout_u32(raw: &str, max_val: u32) -> Option<u32> {
     Some(val)
 }
 
-/// Strict minimal TOML parser for `[lan]`. Fails closed on unknown sections, duplicate `[lan]`,
-/// unknown keys, duplicate keys, malformed lines, invalid types, or out-of-range timeouts
-/// (`0`, `> 1800` for `idle_timeout_sec`, `> 60` for `scan_timeout_sec`).
-pub fn parse_lan_policy_toml(text: &str) -> Result<LanPolicyConfig, LanProtocolError> {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PartialLanPolicy {
+    pub disabled: Option<bool>,
+    pub require_pin: Option<bool>,
+    pub require_local_auth: Option<bool>,
+    pub idle_timeout_sec: Option<u32>,
+    pub scan_timeout_sec: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveLanPolicy {
+    pub config: LanPolicyConfig,
+    /// Upper bound enforced by the system floor (equals `MAX_LAN_IDLE_TIMEOUT_SEC` when system omits it).
+    pub max_idle_timeout_sec: u32,
+    /// Upper bound enforced by the system floor (equals `MAX_LAN_SCAN_TIMEOUT_SEC` when system omits it).
+    pub max_scan_timeout_sec: u32,
+}
+
+impl Default for EffectiveLanPolicy {
+    fn default() -> Self {
+        Self {
+            config: LanPolicyConfig::default(),
+            max_idle_timeout_sec: MAX_LAN_IDLE_TIMEOUT_SEC,
+            max_scan_timeout_sec: MAX_LAN_SCAN_TIMEOUT_SEC,
+        }
+    }
+}
+
+impl EffectiveLanPolicy {
+    /// Resolves an optional explicit CLI idle timeout against the policy default & system ceiling.
+    pub fn effective_idle_timeout(&self, requested: Option<u32>) -> u32 {
+        requested
+            .unwrap_or(self.config.idle_timeout_sec)
+            .min(self.max_idle_timeout_sec)
+            .clamp(1, MAX_LAN_IDLE_TIMEOUT_SEC)
+    }
+
+    /// Resolves an optional explicit CLI scan timeout against the policy default & system ceiling.
+    pub fn effective_scan_timeout(&self, requested: Option<u32>) -> u32 {
+        requested
+            .unwrap_or(self.config.scan_timeout_sec)
+            .min(self.max_scan_timeout_sec)
+            .clamp(1, MAX_LAN_SCAN_TIMEOUT_SEC)
+    }
+}
+
+/// Strict minimal TOML parser for `[lan]` preserving which fields were explicitly configured.
+/// Fails closed on unknown sections, duplicate `[lan]`, unknown keys, duplicate keys, malformed
+/// lines, invalid types, or out-of-range timeouts (`0`, `> 1800` for `idle_timeout_sec`, `> 60`
+/// for `scan_timeout_sec`).
+pub fn parse_partial_lan_policy_toml(text: &str) -> Result<PartialLanPolicy, LanProtocolError> {
     if text.len() > MAX_LAN_POLICY_FILE_BYTES || text.as_bytes().contains(&0) {
         return Err(LanProtocolError::PolicyParseError);
     }
 
-    let mut cfg = LanPolicyConfig::default();
+    let mut cfg = PartialLanPolicy::default();
     let mut in_lan_section = false;
     let mut seen_lan_section = false;
     let mut seen_keys: BTreeSet<&str> = BTreeSet::new();
@@ -1479,29 +1527,94 @@ pub fn parse_lan_policy_toml(text: &str) -> Result<LanPolicyConfig, LanProtocolE
 
         match key {
             "disabled" => {
-                cfg.disabled = parse_policy_bool(val).ok_or(LanProtocolError::PolicyParseError)?;
+                cfg.disabled =
+                    Some(parse_policy_bool(val).ok_or(LanProtocolError::PolicyParseError)?);
             }
             "require_pin" => {
                 cfg.require_pin =
-                    parse_policy_bool(val).ok_or(LanProtocolError::PolicyParseError)?;
+                    Some(parse_policy_bool(val).ok_or(LanProtocolError::PolicyParseError)?);
             }
             "require_local_auth" => {
                 cfg.require_local_auth =
-                    parse_policy_bool(val).ok_or(LanProtocolError::PolicyParseError)?;
+                    Some(parse_policy_bool(val).ok_or(LanProtocolError::PolicyParseError)?);
             }
             "idle_timeout_sec" => {
-                cfg.idle_timeout_sec = parse_policy_timeout_u32(val, MAX_LAN_IDLE_TIMEOUT_SEC)
-                    .ok_or(LanProtocolError::PolicyParseError)?;
+                cfg.idle_timeout_sec = Some(
+                    parse_policy_timeout_u32(val, MAX_LAN_IDLE_TIMEOUT_SEC)
+                        .ok_or(LanProtocolError::PolicyParseError)?,
+                );
             }
             "scan_timeout_sec" => {
-                cfg.scan_timeout_sec = parse_policy_timeout_u32(val, MAX_LAN_SCAN_TIMEOUT_SEC)
-                    .ok_or(LanProtocolError::PolicyParseError)?;
+                cfg.scan_timeout_sec = Some(
+                    parse_policy_timeout_u32(val, MAX_LAN_SCAN_TIMEOUT_SEC)
+                        .ok_or(LanProtocolError::PolicyParseError)?,
+                );
             }
             _ => return Err(LanProtocolError::PolicyParseError),
         }
     }
 
     Ok(cfg)
+}
+
+/// Resolves optional partial system & user LAN policies so omitted system timeouts NEVER
+/// spuriously cap user configs or explicit CLI `--timeout` flags.
+pub fn resolve_lan_policy(
+    system: Option<&PartialLanPolicy>,
+    user: Option<&PartialLanPolicy>,
+    env_disabled: bool,
+) -> EffectiveLanPolicy {
+    let sys_idle = system
+        .and_then(|s| s.idle_timeout_sec)
+        .map(|v| v.clamp(1, MAX_LAN_IDLE_TIMEOUT_SEC));
+    let usr_idle = user
+        .and_then(|u| u.idle_timeout_sec)
+        .map(|v| v.clamp(1, MAX_LAN_IDLE_TIMEOUT_SEC));
+    let max_idle_timeout_sec = sys_idle.unwrap_or(MAX_LAN_IDLE_TIMEOUT_SEC);
+    let idle_timeout_sec = match (sys_idle, usr_idle) {
+        (Some(s), Some(u)) => s.min(u),
+        (Some(s), None) => s,
+        (None, Some(u)) => u,
+        (None, None) => DEFAULT_LAN_IDLE_TIMEOUT_SEC,
+    };
+
+    let sys_scan = system
+        .and_then(|s| s.scan_timeout_sec)
+        .map(|v| v.clamp(1, MAX_LAN_SCAN_TIMEOUT_SEC));
+    let usr_scan = user
+        .and_then(|u| u.scan_timeout_sec)
+        .map(|v| v.clamp(1, MAX_LAN_SCAN_TIMEOUT_SEC));
+    let max_scan_timeout_sec = sys_scan.unwrap_or(MAX_LAN_SCAN_TIMEOUT_SEC);
+    let scan_timeout_sec = match (sys_scan, usr_scan) {
+        (Some(s), Some(u)) => s.min(u),
+        (Some(s), None) => s,
+        (None, Some(u)) => u,
+        (None, None) => DEFAULT_LAN_SCAN_TIMEOUT_SEC,
+    };
+
+    EffectiveLanPolicy {
+        config: LanPolicyConfig {
+            disabled: system.and_then(|s| s.disabled).unwrap_or(false)
+                || user.and_then(|u| u.disabled).unwrap_or(false)
+                || env_disabled,
+            require_pin: system.and_then(|s| s.require_pin).unwrap_or(false)
+                || user.and_then(|u| u.require_pin).unwrap_or(false),
+            require_local_auth: system.and_then(|s| s.require_local_auth).unwrap_or(false)
+                || user.and_then(|u| u.require_local_auth).unwrap_or(false),
+            idle_timeout_sec,
+            scan_timeout_sec,
+        },
+        max_idle_timeout_sec,
+        max_scan_timeout_sec,
+    }
+}
+
+/// Strict minimal TOML parser for `[lan]`. Fails closed on unknown sections, duplicate `[lan]`,
+/// unknown keys, duplicate keys, malformed lines, invalid types, or out-of-range timeouts
+/// (`0`, `> 1800` for `idle_timeout_sec`, `> 60` for `scan_timeout_sec`).
+pub fn parse_lan_policy_toml(text: &str) -> Result<LanPolicyConfig, LanProtocolError> {
+    let partial = parse_partial_lan_policy_toml(text)?;
+    Ok(resolve_lan_policy(Some(&partial), None, false).config)
 }
 
 /// Merges optional system & user LAN policies so the system floor can NEVER be weakened:
@@ -1557,10 +1670,6 @@ pub struct LanBeaconRecord {
     pub alpn: String,
 }
 
-fn is_all_zero_pubkey(pubkey: &[u8; 32]) -> bool {
-    pubkey.iter().all(|&b| b == 0)
-}
-
 pub fn encode_lan_pubkey_base64url(pubkey: &[u8; 32]) -> String {
     URL_SAFE_NO_PAD.encode(pubkey)
 }
@@ -1575,9 +1684,7 @@ pub fn decode_lan_pubkey_base64url(encoded: &str) -> Result<[u8; 32], LanProtoco
     let arr: [u8; 32] = decoded
         .try_into()
         .map_err(|_| LanProtocolError::BeaconInvalidPubkey)?;
-    if is_all_zero_pubkey(&arr) {
-        return Err(LanProtocolError::BeaconInvalidPubkey);
-    }
+    validate_ed25519_pubkey_strict(&arr).map_err(|_| LanProtocolError::BeaconInvalidPubkey)?;
     Ok(arr)
 }
 
@@ -1594,9 +1701,8 @@ pub fn validate_lan_beacon_record(beacon: &LanBeaconRecord) -> Result<(), LanPro
     if !is_valid_beacon_display_text(&beacon.host_name) {
         return Err(LanProtocolError::BeaconInvalidHostName);
     }
-    if is_all_zero_pubkey(&beacon.host_pubkey) {
-        return Err(LanProtocolError::BeaconInvalidPubkey);
-    }
+    validate_ed25519_pubkey_strict(&beacon.host_pubkey)
+        .map_err(|_| LanProtocolError::BeaconInvalidPubkey)?;
     if beacon.alpn != LAN_BEACON_ALPN {
         return Err(LanProtocolError::BeaconInvalidAlpn);
     }
@@ -1674,7 +1780,8 @@ pub fn decode_lan_txt_record(wire: &[u8]) -> Result<LanBeaconRecord, LanProtocol
             return Err(LanProtocolError::TxtMalformed);
         }
 
-        match key {
+        let key_lower = key.to_ascii_lowercase();
+        match key_lower.as_str() {
             "v" => {
                 if version.is_some() {
                     return Err(LanProtocolError::TxtDuplicateKey);
@@ -1766,6 +1873,10 @@ fn is_allowed_ipv4_octets(ip: [u8; 4]) -> bool {
 }
 
 fn is_allowed_ipv6_octets(ip: [u8; 16]) -> bool {
+    let addr = Ipv6Addr::from(ip);
+    if let Some(v4) = addr.to_ipv4_mapped() {
+        return is_allowed_ipv4_octets(v4.octets());
+    }
     if ip.first() == Some(&0xff) {
         return false;
     }

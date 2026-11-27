@@ -1,4 +1,5 @@
-//! Static catalog of all 9 Spec v2 MCP tools and strict argument validation.
+//! Static catalog of all 17 MCP tools (9 core + 4 Xbox Live lifecycle + `party_post_card` + 3 E2EE dead-drop inbox tools)
+//! and strict argument validation.
 //!
 //! Zero namespace collision with `https://multiplayer.tech/mcp` or `blackbird-command-post`.
 
@@ -8,14 +9,15 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use mp_protocol::MAX_SAFE_ID;
 use outpost_core::fence::{SecretMatchKind, scan_outbound_secrets};
+use outpost_core::inbox_crypto::INBOX_MAX_PLAINTEXT_BYTES;
 use outpost_core::p2p_wire::{
     MAX_BRIDGE_PAYLOAD_BYTES, MAX_CHAT_BODY_BYTES, MAX_ROOM_SCOPE_BYTES,
 };
 use serde_json::{Map, Value, json};
 
 use crate::backend::{
-    BoardPostReq, FriendAddReq, PartyInviteReq, PartyJoinReq, PartyLeaveReq, PartyPollReq,
-    PartyPostCardReq, PartySendReq, PartyWaitReq,
+    BoardPostReq, FriendAddReq, InboxAckArgs, InboxReadArgs, InboxSendArgs, PartyInviteReq,
+    PartyJoinReq, PartyLeaveReq, PartyPollReq, PartyPostCardReq, PartySendReq, PartyWaitReq,
 };
 
 pub const SERVER_NAME: &str = "multiplayer-outpost";
@@ -32,8 +34,13 @@ pub const MAX_AGENT_CARD_JSON_BYTES: usize = 2048;
 pub const VALID_AGENT_CARD_STATUSES: [&str; 5] =
     ["done", "working", "testing", "blocked", "error"];
 
-/// Exact list of all 14 MCP tool names (9 core + 4 Xbox Live lifecycle + `party_post_card`).
-pub const TOOL_NAMES: [&str; 14] = [
+pub const INBOX_MAX_RECIPIENT_CHARS: usize = 64;
+pub const INBOX_MIN_TTL_SECS: u64 = 300;
+pub const INBOX_MAX_TTL_SECS: u64 = 604_800;
+pub const INBOX_MAX_ACK_IDS: usize = 16;
+
+/// Exact list of all 17 MCP tool names (9 core + 4 Xbox Live lifecycle + `party_post_card` + 3 Dead-Drop Inbox).
+pub const TOOL_NAMES: [&str; 17] = [
     "outpost_status",
     "party_list",
     "party_members",
@@ -48,6 +55,9 @@ pub const TOOL_NAMES: [&str; 14] = [
     "party_leave",
     "friend_add",
     "party_post_card",
+    "inbox_send",
+    "inbox_read",
+    "inbox_ack",
 ];
 
 /// Parsed and validated MCP tool invocation ready for backend dispatch.
@@ -67,6 +77,9 @@ pub enum ParsedToolCall {
     PartyJoin(PartyJoinReq),
     PartyLeave(PartyLeaveReq),
     FriendAdd(FriendAddReq),
+    InboxSend(InboxSendArgs),
+    InboxRead(InboxReadArgs),
+    InboxAck(InboxAckArgs),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,6 +412,76 @@ pub fn tool_catalog() -> Vec<Value> {
                 "additionalProperties": false
             },
             "annotations": send_ann()
+        }),
+        json!({
+            "name": "inbox_send",
+            "description": "Send an E2EE Suite 1 async dead-drop inbox message to a recipient (@handle or account_id). Verifies recipient CWTs and encryption subkey certificates locally and refuses detected secret material.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "recipient": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": INBOX_MAX_RECIPIENT_CHARS
+                    },
+                    "body": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": INBOX_MAX_PLAINTEXT_BYTES
+                    },
+                    "ttl_secs": {
+                        "type": "integer",
+                        "minimum": INBOX_MIN_TTL_SECS,
+                        "maximum": INBOX_MAX_TTL_SECS
+                    }
+                },
+                "required": ["recipient", "body"],
+                "additionalProperties": false
+            },
+            "annotations": send_ann()
+        }),
+        json!({
+            "name": "inbox_read",
+            "description": "Fetch and locally decrypt pending E2EE async dead-drop inbox messages. Optionally acknowledges decrypted drops when ack=true. Every decrypted body is nonce-fenced as untrusted external data.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ack": {
+                        "type": "boolean",
+                        "default": false
+                    }
+                },
+                "additionalProperties": false
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        }),
+        json!({
+            "name": "inbox_ack",
+            "description": "Acknowledge 1..=16 pending dead-drop inbox message IDs after processing so the server can prune delivered drops.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "drop_ids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": INBOX_MAX_ACK_IDS,
+                        "items": safe_id_schema()
+                    }
+                },
+                "required": ["drop_ids"],
+                "additionalProperties": false
+            },
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": true,
+                "openWorldHint": true
+            }
         }),
     ]
 }
@@ -903,6 +986,77 @@ pub fn parse_tool_call(
                 agent_name,
                 client_msg_id,
             }))
+        }
+        "inbox_send" => {
+            reject_unknown_keys(args, &["recipient", "body", "ttl_secs"])?;
+            let recipient_raw = require_string(args, "recipient", 1, INBOX_MAX_RECIPIENT_CHARS)?;
+            let recipient_chars = recipient_raw.chars().count();
+            if recipient_raw.trim().is_empty() || recipient_chars > INBOX_MAX_RECIPIENT_CHARS {
+                return Err(ToolParseError::new(format!(
+                    "field 'recipient' must be 1..={INBOX_MAX_RECIPIENT_CHARS} non-empty characters"
+                )));
+            }
+            let body = require_string(args, "body", 1, INBOX_MAX_PLAINTEXT_BYTES)?.to_string();
+            let ttl_secs = match args.get("ttl_secs") {
+                None => None,
+                Some(val) => {
+                    if val.is_null() {
+                        return Err(ToolParseError::new(format!(
+                            "field 'ttl_secs' must be an integer in {INBOX_MIN_TTL_SECS}..={INBOX_MAX_TTL_SECS}, not null"
+                        )));
+                    }
+                    let v = parse_exact_u64(val, "ttl_secs")?;
+                    if !(INBOX_MIN_TTL_SECS..=INBOX_MAX_TTL_SECS).contains(&v) {
+                        return Err(ToolParseError::new(format!(
+                            "field 'ttl_secs' must be in {INBOX_MIN_TTL_SECS}..={INBOX_MAX_TTL_SECS}"
+                        )));
+                    }
+                    Some(v)
+                }
+            };
+            Ok(ParsedToolCall::InboxSend(InboxSendArgs {
+                recipient: recipient_raw.to_string(),
+                body,
+                ttl_secs,
+            }))
+        }
+        "inbox_read" => {
+            reject_unknown_keys(args, &["ack"])?;
+            let ack = match args.get("ack") {
+                None => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => {
+                    return Err(ToolParseError::new("field 'ack' must be a boolean"));
+                }
+            };
+            Ok(ParsedToolCall::InboxRead(InboxReadArgs { ack }))
+        }
+        "inbox_ack" => {
+            reject_unknown_keys(args, &["drop_ids"])?;
+            let Some(arr_val) = args.get("drop_ids") else {
+                return Err(ToolParseError::new("missing required field 'drop_ids'"));
+            };
+            let Some(arr) = arr_val.as_array() else {
+                return Err(ToolParseError::new(
+                    "field 'drop_ids' must be an array of integers",
+                ));
+            };
+            if arr.is_empty() || arr.len() > INBOX_MAX_ACK_IDS {
+                return Err(ToolParseError::new(format!(
+                    "field 'drop_ids' must contain 1..={INBOX_MAX_ACK_IDS} entries"
+                )));
+            }
+            let mut drop_ids = Vec::with_capacity(arr.len());
+            for item in arr {
+                let id = parse_exact_u64(item, "drop_ids[]")?;
+                if id == 0 || id > MAX_SAFE_ID {
+                    return Err(ToolParseError::new(format!(
+                        "drop_id must be in 1..={MAX_SAFE_ID}"
+                    )));
+                }
+                drop_ids.push(id);
+            }
+            Ok(ParsedToolCall::InboxAck(InboxAckArgs { drop_ids }))
         }
         _ => Err(ToolParseError::new(format!("unknown tool '{name}'"))),
     }

@@ -10,6 +10,9 @@ use std::time::Duration;
 use iroh::endpoint::{ConnectionError, presets};
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey, TransportAddr};
 use mp_protocol::{DirectAddr, EndpointDescriptor, RelayPolicy, TransportKind};
+use outpost_core::lan_protocol::{
+    LanHandshakeMessage, LanHelloMessage, LanJoinMessage, encode_lan_handshake_frame,
+};
 use outpost_core::p2p_wire::{
     P2pActivityState, P2pBridgeEnvelope, P2pChatMessage, P2pControlNotice, P2pControlNoticeKind,
     P2pEphemeralPulse, P2pLane, P2pPartyFrame,
@@ -1129,28 +1132,54 @@ async fn oracle10_lan_open_admission_pending_isolation_promotion_and_lock()
         Err(P2pError::PeerNotAllowed)
     );
 
-    // Before allow_peer: bidirectional Lane 0 Control handshake succeeds cleanly!
-    let lan_hello = P2pPartyFrame::ControlNotice(P2pControlNotice {
-        kind: P2pControlNoticeKind::Status,
-        party_epoch: 1,
-        text: "LAN_HELLO:nonce=abc123".into(),
+    // Before allow_peer: bidirectional Lane 0 LAN handshake (`mp1-lan/1`) succeeds cleanly!
+    let lan_hello = LanHandshakeMessage::Hello(LanHelloMessage {
+        lan_party_id: "0123456789abcdef".into(),
+        lobby_name: "Test LAN".into(),
+        host_name: "host".into(),
+        host_account_id: 100,
+        host_pubkey: host_pk,
+        require_pin: true,
+        host_nonce: [0xAB; 32],
+        max_members: 4,
     });
-    host.send_frame(joiner_a_pk, &lan_hello).await?;
-    assert_eq!(
-        wait_for_frame(&mut joiner_a, host_pk, P2pLane::Control).await,
-        Some(lan_hello)
-    );
+    host.send_lan_handshake(joiner_a_pk, &lan_hello).await?;
+    let mut got_hello = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(P2pTransportEvent::LanHandshakeReceived {
+            peer_pubkey,
+            message,
+        }) = recv_within(&mut joiner_a, Duration::from_millis(500)).await
+            && peer_pubkey == host_pk
+        {
+            got_hello = Some(message);
+            break;
+        }
+    }
+    assert_eq!(got_hello, Some(lan_hello));
 
-    let lan_join = P2pPartyFrame::ControlNotice(P2pControlNotice {
-        kind: P2pControlNoticeKind::SyncAck,
-        party_epoch: 1,
-        text: "LAN_JOIN:pin_proof=ok".into(),
+    let lan_join = LanHandshakeMessage::Join(LanJoinMessage {
+        lan_party_id: "0123456789abcdef".into(),
+        display_name: "joiner-a".into(),
+        account_id: 101,
+        pin_proof: Some([0xCD; 32]),
     });
-    joiner_a.send_frame(host_pk, &lan_join).await?;
-    assert_eq!(
-        wait_for_frame(&mut host, joiner_a_pk, P2pLane::Control).await,
-        Some(lan_join)
-    );
+    joiner_a.send_lan_handshake(host_pk, &lan_join).await?;
+    let mut got_join = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(P2pTransportEvent::LanHandshakeReceived {
+            peer_pubkey,
+            message,
+        }) = recv_within(&mut host, Duration::from_millis(500)).await
+            && peer_pubkey == joiner_a_pk
+        {
+            got_join = Some(message);
+            break;
+        }
+    }
+    assert_eq!(got_join, Some(lan_join));
 
     // 2. Rogue pending Joiner B sends Lane 1 Causal before allow_peer -> strictly blocked
     //    (NEVER delivered to application) and disconnected with CLOSE_PROTOCOL_VIOLATION (4400).
@@ -1376,6 +1405,330 @@ async fn oracle11_lan_open_admission_enforces_16_pending_peer_cap()
 
     overflow.close().await;
     vip.close().await;
+    for (ep, _) in pending {
+        ep.close().await;
+    }
+    host.close().await;
+    Ok(())
+}
+
+/// Oracle 12 (Gate #3 G3-L2-2): `PartyP2pConfig` `Debug` implementation strictly redacts
+/// `device_secret` and never leaks secret key bytes in formatted output.
+#[test]
+fn oracle12_party_p2p_config_debug_redacts_device_secret() {
+    let cfg = PartyP2pConfig {
+        local_device_id: 42,
+        device_secret: [0x5A; 32],
+        effective_relay_policy: RelayPolicy::ForceRelays,
+        pinned_relay_url: Some("https://relay.multiplayer.tech".into()),
+    };
+    let compact = format!("{cfg:?}");
+    let pretty = format!("{cfg:#?}");
+    assert!(compact.contains("[REDACTED]"), "compact debug: {compact}");
+    assert!(pretty.contains("[REDACTED]"), "pretty debug: {pretty}");
+    assert!(
+        !compact.contains("90, 90, 90"),
+        "device_secret bytes leaked in compact debug: {compact}"
+    );
+    assert!(
+        !pretty.contains("90,\n"),
+        "device_secret bytes leaked in pretty debug: {pretty}"
+    );
+    assert!(compact.contains("42"));
+    assert!(compact.contains("relay.multiplayer.tech"));
+}
+
+/// Oracle 13 (Gate #3 G3-L2-1): An online `NoRelays` endpoint (spawned via `spawn`, NOT
+/// `spawn_with_lan` with `no_relays: true`) refuses `set_lan_open_admission(true)`, refuses
+/// `send_lan_handshake`, and NEVER emits `LanHandshakeReceived` for inbound LAN handshake frames.
+#[tokio::test]
+async fn oracle13_online_no_relays_rejects_lan_admission_and_handshake()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut online_host = spawn_no_relays(500, 0x71).await?;
+    let mut peer = spawn_no_relays(501, 0x72).await?;
+
+    let host_pk = online_host.local_pubkey();
+    let peer_pk = peer.local_pubkey();
+
+    // Online NoRelays must ignore set_lan_open_admission(true).
+    online_host.set_lan_open_admission(true).await;
+    assert!(
+        !online_host.is_lan_open_admission(),
+        "online NoRelays endpoint must NEVER enter LAN open admission"
+    );
+
+    online_host.allow_peer(peer_pk).await?;
+    peer.allow_peer(host_pk).await?;
+
+    let host_desc = online_host.local_endpoint_descriptor();
+    peer.connect_peer(PeerDialTarget {
+        device_id: 500,
+        device_pubkey: host_pk,
+        remote_relay_policy: RelayPolicy::NoRelays,
+        endpoint: host_desc.clone(),
+    })
+    .await?;
+    assert!(wait_for_connected(&mut online_host, peer_pk).await);
+    assert!(wait_for_connected(&mut peer, host_pk).await);
+
+    let lan_hello = LanHandshakeMessage::Hello(LanHelloMessage {
+        lan_party_id: "0123456789abcdef".into(),
+        lobby_name: "Online Spoof".into(),
+        host_name: "host".into(),
+        host_account_id: 500,
+        host_pubkey: host_pk,
+        require_pin: false,
+        host_nonce: [0x11; 32],
+        max_members: 4,
+    });
+    assert!(matches!(
+        online_host.send_lan_handshake(peer_pk, &lan_hello).await,
+        Err(P2pError::PolicyViolation(_))
+    ));
+
+    // Even if a raw peer injects a valid mp1-lan/1 Lane-0 frame into an online NoRelays endpoint,
+    // it MUST NOT decode as LanHandshakeReceived and MUST close with CLOSE_PROTOCOL_VIOLATION.
+    let raw_sk = SecretKey::from_bytes(&[0x73; 32]);
+    let raw_pk = *raw_sk.public().as_bytes();
+    online_host.allow_peer(raw_pk).await?;
+    let raw_ep = Endpoint::builder(presets::Minimal)
+        .secret_key(raw_sk)
+        .alpns(vec![ALPN.to_vec()])
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await?;
+    let host_id = PublicKey::from_bytes(&host_pk)?;
+    let host_addr = EndpointAddr::from_parts(host_id, descriptor_to_transport_addrs(&host_desc));
+    let raw_conn = raw_ep.connect(host_addr, ALPN).await?;
+    let (mut s0_send, mut s0_recv) = raw_conn.open_bi().await?;
+    s0_send.write_all(&STREAM_INIT_MARKER.to_le_bytes()).await?;
+    let (mut s4_send, _s4_recv) = raw_conn.open_bi().await?;
+    s4_send.write_all(&STREAM_INIT_MARKER.to_le_bytes()).await?;
+    let mut ack = [0u8; 4];
+    s0_recv.read_exact(&mut ack).await?;
+    assert_eq!(u32::from_le_bytes(ack), STREAM_INIT_MARKER);
+    assert!(wait_for_connected(&mut online_host, raw_pk).await);
+
+    let encoded_handshake = encode_lan_handshake_frame(&lan_hello)?;
+    let frame_len = u32::try_from(encoded_handshake.len())?;
+    s0_send.write_all(&frame_len.to_le_bytes()).await?;
+    s0_send.write_all(&encoded_handshake).await?;
+
+    let mut disconnected_code = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(ev) = recv_within(&mut online_host, Duration::from_millis(500)).await {
+            match ev {
+                P2pTransportEvent::LanHandshakeReceived { .. } => {
+                    return Err("online NoRelays endpoint emitted LanHandshakeReceived!".into());
+                }
+                P2pTransportEvent::PeerDisconnected {
+                    peer_pubkey,
+                    reason_code,
+                } if peer_pubkey == raw_pk => {
+                    disconnected_code = Some(reason_code);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(disconnected_code, Some(CLOSE_PROTOCOL_VIOLATION));
+
+    raw_ep.close().await;
+    peer.close().await;
+    online_host.close().await;
+    Ok(())
+}
+
+/// Oracle 14 (Gate #3 G3-L2-1): A pending (un-allowlisted) LAN peer sending a non-handshake
+/// Lane-0 `ControlNotice` frame MUST be rejected immediately at the transport boundary with
+/// `CLOSE_PROTOCOL_VIOLATION (4400)` and NEVER emitted as `FrameReceived`.
+#[tokio::test]
+async fn oracle14_pending_lan_peer_non_handshake_lane0_rejected_with_4400()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut host = spawn_lan(600, 0x61, true, None).await?;
+    let mut rogue = spawn_lan(601, 0x62, false, None).await?;
+
+    let host_pk = host.local_pubkey();
+    let rogue_pk = rogue.local_pubkey();
+    let host_addrs: Vec<SocketAddr> = host
+        .local_direct_addrs()
+        .into_iter()
+        .filter(|a| a.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .collect();
+    assert!(!host_addrs.is_empty());
+
+    rogue.allow_peer(host_pk).await?;
+    rogue.connect_direct(host_pk, &host_addrs).await?;
+    assert!(wait_for_connected(&mut host, rogue_pk).await);
+    assert!(wait_for_connected(&mut rogue, host_pk).await);
+
+    // Rogue pending peer sends a non-handshake Lane-0 ControlNotice.
+    let spoofed_notice = P2pPartyFrame::ControlNotice(P2pControlNotice {
+        kind: P2pControlNoticeKind::ScopeChanged,
+        party_epoch: 99,
+        text: "unauthenticated-control-notice".into(),
+    });
+    rogue.send_frame(host_pk, &spoofed_notice).await?;
+
+    let mut disconnected_code = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if let Some(ev) = recv_within(&mut host, Duration::from_millis(500)).await {
+            match ev {
+                P2pTransportEvent::FrameReceived { peer_pubkey, .. }
+                    if peer_pubkey == rogue_pk =>
+                {
+                    return Err("pending peer non-handshake Lane-0 ControlNotice leaked!".into());
+                }
+                P2pTransportEvent::PeerDisconnected {
+                    peer_pubkey,
+                    reason_code,
+                } if peer_pubkey == rogue_pk => {
+                    disconnected_code = Some(reason_code);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(disconnected_code, Some(CLOSE_PROTOCOL_VIOLATION));
+    assert_eq!(
+        wait_for_disconnect(&mut rogue, host_pk).await,
+        Some(CLOSE_PROTOCOL_VIOLATION)
+    );
+
+    rogue.close().await;
+    host.close().await;
+    Ok(())
+}
+
+/// Oracle 15 (Gate #3 G3-L2-1): Strict `<= 16` (`MAX_PENDING_LAN_PEERS`) cap accounts for
+/// both active pending peers AND in-flight pending handshakes, enforcing max 1 in-flight
+/// handshake per `EndpointId` and rejecting same-key reconnects when 16 slots are occupied.
+#[tokio::test]
+async fn oracle15_strict_16_pending_cap_includes_in_flight_and_same_key_connections()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut host = spawn_lan(700, 0xA5, true, None).await?;
+    let host_pk = host.local_pubkey();
+    let host_id = PublicKey::from_bytes(&host_pk)?;
+    let host_addrs: Vec<SocketAddr> = host
+        .local_direct_addrs()
+        .into_iter()
+        .filter(|a| a.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .collect();
+    assert!(!host_addrs.is_empty());
+    let host_transport_addrs: Vec<TransportAddr> =
+        host_addrs.iter().copied().map(TransportAddr::Ip).collect();
+
+    // Fill 15 active pending slots.
+    let mut pending = Vec::with_capacity(MAX_PENDING_LAN_PEERS);
+    for idx in 0..(MAX_PENDING_LAN_PEERS - 1) {
+        let seed_byte = u8::try_from(0x20 + idx)?;
+        let ep = spawn_lan(710 + u64::try_from(idx)?, seed_byte, false, None).await?;
+        let pk = ep.local_pubkey();
+        ep.allow_peer(host_pk).await?;
+        ep.connect_direct(host_pk, &host_addrs).await?;
+        assert!(wait_for_connected(&mut host, pk).await);
+        pending.push((ep, pk));
+    }
+
+    // 16th peer starts an IN-FLIGHT handshake (QUIC connects, does NOT open Streams 0 & 4 yet).
+    let inflight_seed = [0x9A; 32];
+    let raw_inflight_ep = Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(&inflight_seed))
+        .alpns(vec![ALPN.to_vec()])
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await?;
+    let inflight_conn = raw_inflight_ep
+        .connect(
+            EndpointAddr::from_parts(host_id, host_transport_addrs.clone()),
+            ALPN,
+        )
+        .await?;
+    // Allow host's accept_loop to reserve the 16th in-flight pending slot.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        inflight_conn.close_reason().is_none(),
+        "16th in-flight pending peer should hold the 16th slot"
+    );
+
+    // While 15 active + 1 in-flight == 16:
+    // (a) A 17th distinct unknown peer MUST be rejected!
+    let extra_unknown = spawn_lan(790, 0x9B, false, None).await?;
+    extra_unknown.allow_peer(host_pk).await?;
+    assert_eq!(
+        extra_unknown.connect_direct(host_pk, &host_addrs).await,
+        Err(P2pError::PeerNotAllowed)
+    );
+
+    // (b) A second concurrent connection using the SAME key as the in-flight peer MUST be rejected!
+    let dup_inflight_ep = Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(&inflight_seed))
+        .alpns(vec![ALPN.to_vec()])
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await?;
+    let dup_res = dup_inflight_ep
+        .connect(
+            EndpointAddr::from_parts(host_id, host_transport_addrs.clone()),
+            ALPN,
+        )
+        .await;
+    match dup_res {
+        Err(_) => {}
+        Ok(conn) => {
+            let err = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await?;
+            match err {
+                ConnectionError::ApplicationClosed(app) => {
+                    assert_eq!(app.error_code.into_inner(), u64::from(CLOSE_UNAUTHORIZED));
+                }
+                other => {
+                    return Err(format!("expected 4401 on duplicate in-flight key, got {other:?}").into());
+                }
+            }
+        }
+    }
+
+    // (c) An ALREADY-ACTIVE pending peer (same key as slot #0) attempting a second connection
+    //     while 15 active + 1 in-flight == 16 MUST ALSO be rejected (never 17)!
+    let same_key_active_ep = Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(&[0x20; 32]))
+        .alpns(vec![ALPN.to_vec()])
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await?;
+    let same_key_res = same_key_active_ep
+        .connect(
+            EndpointAddr::from_parts(host_id, host_transport_addrs),
+            ALPN,
+        )
+        .await;
+    match same_key_res {
+        Err(_) => {}
+        Ok(conn) => {
+            let err = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await?;
+            match err {
+                ConnectionError::ApplicationClosed(app) => {
+                    assert_eq!(app.error_code.into_inner(), u64::from(CLOSE_UNAUTHORIZED));
+                }
+                other => {
+                    return Err(
+                        format!("expected 4401 on same-key overflow at cap 16, got {other:?}")
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+
+    drop(inflight_conn);
+    same_key_active_ep.close().await;
+    dup_inflight_ep.close().await;
+    raw_inflight_ep.close().await;
+    extra_unknown.close().await;
     for (ep, _) in pending {
         ep.close().await;
     }

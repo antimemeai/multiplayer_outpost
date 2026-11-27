@@ -11,14 +11,17 @@
 )]
 
 mod app_daemon;
+mod auth_ux;
 mod build_info;
 mod chat;
 mod cli;
+mod inbox;
 mod ipc_payloads;
 mod lan;
 mod mcp_bridge;
 mod mcp_setup;
 mod mpkey;
+mod policy_loader;
 mod storage;
 mod upgrade;
 

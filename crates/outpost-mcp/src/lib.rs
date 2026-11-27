@@ -22,9 +22,10 @@ pub mod tools;
 
 pub use backend::{
     BackendError, BoardEnvelopeEvent, BoardPostReq, BoardReadResp, BoxFuture, CancellationToken,
-    FriendAddReq, McpOutpostBackend, McpPartyEvent, McpPartyEventKind, PartyInviteReq,
-    PartyJoinReq, PartyLeaveReq, PartyPollReq, PartyPollResp, PartyPostCardReq, PartySendReq,
-    PartyWaitReq, PeerProvenance, ProgressSender, ProgressUpdate,
+    FriendAddReq, InboxAckArgs, InboxAckResult, InboxDecryptedDrop, InboxReadArgs, InboxReadResult,
+    InboxSendArgs, InboxSendResult, McpOutpostBackend, McpPartyEvent, McpPartyEventKind,
+    PartyInviteReq, PartyJoinReq, PartyLeaveReq, PartyPollReq, PartyPollResp, PartyPostCardReq,
+    PartySendReq, PartyWaitReq, PeerProvenance, ProgressSender, ProgressUpdate,
 };
 pub use mentions::{event_mentions_self, is_self_sender, text_mentions_handle};
 pub use stdio::{
@@ -32,7 +33,8 @@ pub use stdio::{
     run_stdio, run_stdio_with_io,
 };
 pub use tools::{
-    DEFAULT_POLL_LIMIT, DEFAULT_POLL_MAX_BYTES, DEFAULT_WAIT_TIMEOUT_MS, MAX_AGENT_CARD_FILES,
+    DEFAULT_POLL_LIMIT, DEFAULT_POLL_MAX_BYTES, DEFAULT_WAIT_TIMEOUT_MS, INBOX_MAX_ACK_IDS,
+    INBOX_MAX_RECIPIENT_CHARS, INBOX_MAX_TTL_SECS, INBOX_MIN_TTL_SECS, MAX_AGENT_CARD_FILES,
     MAX_AGENT_CARD_JSON_BYTES, MAX_POLL_LIMIT, MAX_POLL_MAX_BYTES, MAX_WAIT_TIMEOUT_MS,
     SERVER_NAME, SERVER_VERSION, TOOL_NAMES, VALID_AGENT_CARD_STATUSES, build_agent_card_json,
     scan_card_secrets, scan_static_secret_text, tool_catalog,

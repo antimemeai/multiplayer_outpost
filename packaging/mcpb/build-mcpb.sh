@@ -4,7 +4,7 @@
 set -euo pipefail
 
 VERSION="v0.4.0"
-REPO="antimemeai/multiplayer_outpost"
+REPO="antimeme-ai/multiplayer_outpost"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
 OUT_DIR="${REPO_ROOT}/dist"
@@ -198,7 +198,7 @@ for pkg in data.get("packages", []):
     if pkg.get("registryType") == "mcpb":
         pkg["version"] = version
         pkg["identifier"] = (
-            f"https://github.com/antimemeai/multiplayer_outpost/releases/download/"
+            f"https://github.com/antimeme-ai/multiplayer_outpost/releases/download/"
             f"{version_tag}/mp-outpost-{version_tag}-universal.mcpb"
         )
         pkg["fileSha256"] = sha256_hex

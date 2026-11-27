@@ -126,3 +126,18 @@ Authored `docs/OUTPOST_ARCHITECTURE_AND_SPEC.md` (v1 Draft) and ran all 5 indepe
    - Added `mp-outpost relays [--ping] [--api-authority <host>] [--json]` with concurrent TLS 1.3 `/ping` probes and fastest-region ranking, plus actionable `409 relay_mismatch` IPC error diagnostics naming the party's `pinned_relay_url`.
    - Wired `--org-id <id>` and `--group-id <id>` scoped party creation through `party create` -> IPC -> `ControlClient::create_party_with_scope`.
    - Added compiled-binary E2E Oracle 7 verifying `lan status`, `MP_DISABLE_LAN=1` fail-closed, `--pin` argv guard, live 2-binary encrypted QUIC LAN Party chat on loopback, and TLS 1.3 `relays [--ping] --json`.
+
+## 2026-11-23 — Gate #3 Remediation & `v0.5.0` (Dead-Drop Inbox Suite 1 E2EE, Auth UX Stage 2, Unified Policy & Party Trust Tiers)
+
+1. **Gate #3 Adversarial Audit Fixes:**
+   - Hardened `reject_secrets_in_argv` to reject `-pin`, `-pin=...`, `--pin ...`, and `-pin ...` case-insensitively without echoing values.
+   - Enforced `--group-id requires --org-id` in `party create`, switched `friend list` accept/deny copyable hints to numeric `account_id`, bounded `relays --ping` concurrency to 6 (`Arc<tokio::sync::Semaphore>::new(6)`), and fixed `README.md` policy path documentation (`/etc/multiplayer/policy.toml` + legacy `/etc/multiplayer/lan.toml`).
+   - Hardened daemon `op_friends_list` (`GET /v1/friends` enrichment): sanitized/bounded `peer_handle` (`<= 64` printable ASCII), reconciled `st.friends` snapshot to prune unfriended edges while preserving live presence fields, cleared `safety_number` when `peer_root_pubkey_b64` is omitted (e.g. blocked edges), and cross-checked server `peer_root_pubkey_b64` against locally pinned `peers.bin` (emitting `"KEY_MISMATCH"` + warning instead of silently trusting server-substituted keys).
+   - Updated `409 relay_mismatch` diagnostic in `op_party_join` to direct operators to `mp-outpost relays` and device relay configuration (removing unsupported `--relay-url` suggestion).
+   - Sanitized `handle` in `DaemonMcpBridge::party_friends`.
+
+2. **`v0.5.0` Features:**
+   - **E2EE Dead-Drop Inbox (Suite 1):** X25519 per-device subkey storage (`d<13hex>.enc.bin`, mode `0600`), 161-byte signed `enc_cert`, Suite 1 HPKE `ModeAuth` + key-committing ChaCha20-Poly1305 sealing/opening, `mp-outpost inbox init-key|send|read|ack`, and MCP tools `inbox_send`, `inbox_read`, `inbox_ack` (12 MCP tools total).
+   - **Auth UX Stage 2:** Interactive `mp-outpost login`, guided `mp-outpost add-device` (with pure-Rust ISO/IEC 18004 V1 ECC-L terminal QR code for link code only + local 128-bit `mpdevfp2:` verification), and offline `mp-outpost account emergency-kit --out <path.html>` (mode `0600`, zero JS, zero external URLs, strict HTML escaping, no-clobber unless `--force`, zero stdout key echo).
+   - **Unified Policy & Party Trust Tiers:** Verified `O_NOFOLLOW` fail-closed loader for `/etc/multiplayer/policy.toml` (with legacy `lan.toml` backward compatibility and `MP_DISABLE_LAN` / `MP_BRAKES` overrides), `mp-outpost policy status [--json]`, `mp-outpost doctor [--json]` policy reporting, and `DaemonMcpBridge::effective_trust_profile` (clamping to `Advisory` on policy failure).
+   - **Compiled-Binary E2E Oracle 8:** Added `oracle_8_v050_dead_drop_inbox_auth_ux_and_unified_policy` covering full TLS 1.3 dead-drop inbox E2EE roundtrip + outbound secret refusal + ack pruning, Emergency Kit HTML security invariants, `policy status` + `doctor` reporting, and 12-tool `mp-outpost mcp` `tools/list`.

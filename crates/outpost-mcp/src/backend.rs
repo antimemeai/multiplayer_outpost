@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use outpost_core::fence::SecretMatchKind;
+use outpost_core::policy::PartyTrustProfile;
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc};
 
@@ -300,10 +301,69 @@ impl fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
+/// Arguments for `inbox_send` (E2EE dead-drop send).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxSendArgs {
+    pub recipient: String,
+    pub body: String,
+    pub ttl_secs: Option<u64>,
+}
+
+/// Result of `inbox_send`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxSendResult {
+    pub drop_id: u64,
+    pub delivered_devices: u64,
+    pub idempotent: bool,
+}
+
+/// Arguments for `inbox_read`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxReadArgs {
+    pub ack: bool,
+}
+
+/// Single decrypted E2EE dead-drop returned by `inbox_read` before MCP-layer nonce fencing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxDecryptedDrop {
+    pub drop_id: u64,
+    pub sender_account_id: u64,
+    pub sender_device_id: u64,
+    pub sender_handle: String,
+    pub safety_number: String,
+    pub created_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub body: String,
+}
+
+/// Result of `inbox_read`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxReadResult {
+    pub drops: Vec<InboxDecryptedDrop>,
+}
+
+/// Arguments for `inbox_ack`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxAckArgs {
+    pub drop_ids: Vec<u64>,
+}
+
+/// Result of `inbox_ack`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxAckResult {
+    pub acked: u64,
+    pub pruned_drops: u64,
+}
+
 /// Lazy IPC backend trait representing `outpost-daemon`'s `DaemonClient` (or a test/fault-injection mock).
 ///
 /// The MCP transport MUST NEVER call any method on this trait during `initialize`, `ping`, or `tools/list`.
 pub trait McpOutpostBackend: Send + Sync + 'static {
+    /// Effective remote-peer trust profile advertised in MCP provenance headers & structured JSON.
+    fn effective_trust_profile(&self) -> PartyTrustProfile {
+        PartyTrustProfile::HumanGated
+    }
+
     fn outpost_status(&self) -> BoxFuture<'_, Result<Value, BackendError>>;
     fn party_list(&self) -> BoxFuture<'_, Result<Value, BackendError>>;
     fn party_members(&self, party_id: u64) -> BoxFuture<'_, Result<Value, BackendError>>;
@@ -323,4 +383,37 @@ pub trait McpOutpostBackend: Send + Sync + 'static {
     fn party_join(&self, req: PartyJoinReq) -> BoxFuture<'_, Result<Value, BackendError>>;
     fn party_leave(&self, req: PartyLeaveReq) -> BoxFuture<'_, Result<Value, BackendError>>;
     fn friend_add(&self, req: FriendAddReq) -> BoxFuture<'_, Result<Value, BackendError>>;
+
+    fn inbox_send(
+        &self,
+        _req: InboxSendArgs,
+    ) -> BoxFuture<'_, Result<InboxSendResult, BackendError>> {
+        Box::pin(async {
+            Err(BackendError::ToolError {
+                code: "inbox_not_configured".to_string(),
+                message: "inbox not configured".to_string(),
+            })
+        })
+    }
+
+    fn inbox_read(
+        &self,
+        _req: InboxReadArgs,
+    ) -> BoxFuture<'_, Result<InboxReadResult, BackendError>> {
+        Box::pin(async {
+            Err(BackendError::ToolError {
+                code: "inbox_not_configured".to_string(),
+                message: "inbox not configured".to_string(),
+            })
+        })
+    }
+
+    fn inbox_ack(&self, _req: InboxAckArgs) -> BoxFuture<'_, Result<InboxAckResult, BackendError>> {
+        Box::pin(async {
+            Err(BackendError::ToolError {
+                code: "inbox_not_configured".to_string(),
+                message: "inbox not configured".to_string(),
+            })
+        })
+    }
 }

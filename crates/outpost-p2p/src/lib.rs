@@ -29,7 +29,7 @@
 use core::fmt;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -57,6 +57,7 @@ use outpost_core::trust::effective_relay_policy;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use url::Url;
+use zeroize::Zeroize as _;
 
 pub const ALPN: &[u8] = b"blackbird-mp/1";
 pub const STREAM_INIT_MARKER: u32 = u32::MAX;
@@ -93,12 +94,29 @@ const INBOUND_EPHEMERAL_BYTE_BUDGET: usize = 512 * 1024;
 const OUTBOUND_CONTROL_BYTE_BUDGET: usize = 1024 * 1024;
 const OUTBOUND_CAUSAL_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PartyP2pConfig {
     pub local_device_id: u64,
     pub device_secret: [u8; 32],
     pub effective_relay_policy: RelayPolicy,
     pub pinned_relay_url: Option<String>,
+}
+
+impl fmt::Debug for PartyP2pConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PartyP2pConfig")
+            .field("local_device_id", &self.local_device_id)
+            .field("device_secret", &"[REDACTED]")
+            .field("effective_relay_policy", &self.effective_relay_policy)
+            .field("pinned_relay_url", &self.pinned_relay_url)
+            .finish()
+    }
+}
+
+impl Drop for PartyP2pConfig {
+    fn drop(&mut self) {
+        self.device_secret.zeroize();
+    }
 }
 
 /// Explicit opt-in LAN (`NoRelays`) transport options for [`PartyP2pTransport::spawn_with_lan`].
@@ -218,13 +236,17 @@ impl ActivePeer {
 
 struct InFlightPendingGuard {
     shared: Arc<SharedState>,
+    peer_id: EndpointId,
 }
 
 impl Drop for InFlightPendingGuard {
     fn drop(&mut self) {
-        self.shared
+        let mut in_flight = self
+            .shared
             .in_flight_pending_lan
-            .fetch_sub(1, Ordering::AcqRel);
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        in_flight.remove(&self.peer_id);
     }
 }
 
@@ -233,8 +255,9 @@ struct SharedState {
     relay_policy: RelayPolicy,
     pinned_relay_url: Option<RelayUrl>,
     pinned_relay_url_str: Option<String>,
+    lan_mode: bool,
     lan_open_admission: AtomicBool,
-    in_flight_pending_lan: AtomicUsize,
+    in_flight_pending_lan: Mutex<HashSet<EndpointId>>,
     allowed_peers: RwLock<HashSet<EndpointId>>,
     peers: RwLock<HashMap<EndpointId, ActivePeer>>,
     next_conn_id: AtomicU64,
@@ -259,25 +282,25 @@ impl SharedState {
     }
 
     fn is_lan_open_admission(&self) -> bool {
-        self.relay_policy == RelayPolicy::NoRelays
+        self.lan_mode
+            && self.relay_policy == RelayPolicy::NoRelays
             && self.lan_open_admission.load(Ordering::Acquire)
     }
 
     fn pending_lan_slots_full(&self, candidate: &EndpointId) -> bool {
-        let active_pending = {
-            let peers = self.peers.read().unwrap_or_else(PoisonError::into_inner);
-            if let Some(existing) = peers.get(candidate)
-                && existing.is_pending.load(Ordering::Acquire)
-            {
-                return false;
-            }
-            peers
-                .values()
-                .filter(|p| p.is_pending.load(Ordering::Acquire))
-                .count()
-        };
-        let in_flight = self.in_flight_pending_lan.load(Ordering::Acquire);
-        active_pending.saturating_add(in_flight) >= MAX_PENDING_LAN_PEERS
+        let peers = self.peers.read().unwrap_or_else(PoisonError::into_inner);
+        let in_flight = self
+            .in_flight_pending_lan
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if in_flight.contains(candidate) {
+            return true;
+        }
+        let active_pending = peers
+            .values()
+            .filter(|p| p.is_pending.load(Ordering::Acquire))
+            .count();
+        active_pending.saturating_add(in_flight.len()) >= MAX_PENDING_LAN_PEERS
     }
 
     fn try_reserve_in_flight_pending(
@@ -285,33 +308,25 @@ impl SharedState {
         candidate: &EndpointId,
     ) -> Option<InFlightPendingGuard> {
         let peers = self.peers.read().unwrap_or_else(PoisonError::into_inner);
-        let already_pending_self = peers
-            .get(candidate)
-            .is_some_and(|p| p.is_pending.load(Ordering::Acquire));
+        let mut in_flight = self
+            .in_flight_pending_lan
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if in_flight.contains(candidate) {
+            return None;
+        }
         let active_pending = peers
             .values()
             .filter(|p| p.is_pending.load(Ordering::Acquire))
             .count();
-        let effective_active = if already_pending_self {
-            active_pending.saturating_sub(1)
-        } else {
-            active_pending
-        };
-        loop {
-            let current = self.in_flight_pending_lan.load(Ordering::Acquire);
-            if effective_active.saturating_add(current) >= MAX_PENDING_LAN_PEERS {
-                return None;
-            }
-            if self
-                .in_flight_pending_lan
-                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return Some(InFlightPendingGuard {
-                    shared: Arc::clone(self),
-                });
-            }
+        if active_pending.saturating_add(in_flight.len()) >= MAX_PENDING_LAN_PEERS {
+            return None;
         }
+        in_flight.insert(*candidate);
+        Some(InFlightPendingGuard {
+            shared: Arc::clone(self),
+            peer_id: *candidate,
+        })
     }
 
     fn close_and_remove_peer(
@@ -657,9 +672,9 @@ impl PartyP2pHandle {
         Ok(())
     }
 
-    /// Toggles opt-in open LAN admission (`NoRelays` mode only).
+    /// Toggles opt-in open LAN admission (explicit LAN `NoRelays` mode only).
     ///
-    /// Fail-closed no-op when `effective_relay_policy != RelayPolicy::NoRelays`.
+    /// Fail-closed no-op when not in explicit LAN mode or `effective_relay_policy != RelayPolicy::NoRelays`.
     /// Setting `open = false` immediately stops admitting new unknown LAN peers and closes
     /// all still-pending un-allowlisted peers (`CLOSE_UNAUTHORIZED`), while preserving
     /// already-allowlisted / promoted peers.
@@ -667,7 +682,7 @@ impl PartyP2pHandle {
         if self.shared.closed.load(Ordering::Acquire) {
             return;
         }
-        if self.shared.relay_policy != RelayPolicy::NoRelays {
+        if !self.shared.lan_mode || self.shared.relay_policy != RelayPolicy::NoRelays {
             return;
         }
 
@@ -1094,9 +1109,9 @@ impl PartyP2pHandle {
         if self.shared.closed.load(Ordering::Acquire) {
             return Err(P2pError::Closed);
         }
-        if self.shared.relay_policy != RelayPolicy::NoRelays {
+        if !self.shared.lan_mode || self.shared.relay_policy != RelayPolicy::NoRelays {
             return Err(P2pError::PolicyViolation(
-                "LAN handshake frames are only permitted under no_relays".into(),
+                "LAN handshake frames are only permitted in explicit LAN no_relays mode".into(),
             ));
         }
         let peer_id =
@@ -1320,7 +1335,7 @@ impl PartyP2pTransport {
             .as_deref()
             .filter(|s| !s.is_empty());
 
-        let (initial_lan_open_admission, lan_bind_port) = if let Some(lan_cfg) = lan {
+        let (lan_mode, initial_lan_open_admission, lan_bind_port) = if let Some(lan_cfg) = lan {
             if lan_cfg.lan_open_admission && !lan_cfg.no_relays {
                 return Err(P2pError::InvalidConfig(
                     "lan_open_admission requires no_relays == true".into(),
@@ -1343,9 +1358,13 @@ impl PartyP2pTransport {
                     ));
                 }
             }
-            (lan_cfg.lan_open_admission, lan_cfg.lan_bind_port)
+            (
+                lan_cfg.no_relays,
+                lan_cfg.lan_open_admission,
+                lan_cfg.lan_bind_port,
+            )
         } else {
-            (false, None)
+            (false, false, None)
         };
 
         let parsed_relay = match (config.effective_relay_policy, raw_relay) {
@@ -1386,8 +1405,9 @@ impl PartyP2pTransport {
             relay_policy: config.effective_relay_policy,
             pinned_relay_url: pinned_relay_url.clone(),
             pinned_relay_url_str,
+            lan_mode,
             lan_open_admission: AtomicBool::new(initial_lan_open_admission),
-            in_flight_pending_lan: AtomicUsize::new(0),
+            in_flight_pending_lan: Mutex::new(HashSet::new()),
             allowed_peers: RwLock::new(HashSet::new()),
             peers: RwLock::new(HashMap::new()),
             next_conn_id: AtomicU64::new(0),
@@ -1905,6 +1925,7 @@ async fn read_framed_stream(
             return;
         }
         let event = if lane == P2pLane::Control
+            && shared.lan_mode
             && shared.relay_policy == RelayPolicy::NoRelays
             && is_lan_handshake_frame(&payload)
         {
@@ -1930,6 +1951,16 @@ async fn read_framed_stream(
                 }
             }
         } else {
+            if !shared.is_allowed(&peer_id) {
+                shared.close_and_remove_peer(
+                    &peer_id,
+                    Some(conn_id),
+                    CLOSE_PROTOCOL_VIOLATION,
+                    b"pending_peer_non_handshake_frame",
+                    true,
+                );
+                return;
+            }
             let frame = match decode_p2p_party_frame(lane, &payload) {
                 Ok(frame) => frame,
                 Err(err) => {

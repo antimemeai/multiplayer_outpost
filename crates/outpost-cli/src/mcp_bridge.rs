@@ -14,14 +14,16 @@ use std::time::{Duration, Instant};
 
 use mp_protocol::MAX_SAFE_ID;
 use outpost_control::sleep_aware_now_ms;
-use outpost_core::fence::{SecretMatchKind, scan_outbound_secrets};
+use outpost_core::fence::{SecretMatchKind, sanitize_peer_text, scan_outbound_secrets};
 use outpost_core::ipc_wire::{ClientKind, HelloPayload, IPC_SCHEMA_VER, IpcFrame, IpcOpcode};
+use outpost_core::policy::PartyTrustProfile;
 use outpost_daemon::{
     ClientConfig, DaemonClient, DaemonError, SpawnCommand, decode_error_payload,
     encode_cancel_payload, fill_random, read_ipc_frame, write_ipc_frame,
 };
 use outpost_mcp::{
     BackendError, BoardPostReq, BoardReadResp, BoxFuture, CancellationToken, FriendAddReq,
+    InboxAckArgs, InboxAckResult, InboxReadArgs, InboxReadResult, InboxSendArgs, InboxSendResult,
     McpOutpostBackend, PartyInviteReq, PartyJoinReq, PartyLeaveReq, PartyPollReq, PartyPollResp,
     PartyPostCardReq, PartySendReq, PartyWaitReq, ProgressSender, build_agent_card_json,
     scan_card_secrets,
@@ -319,22 +321,28 @@ pub struct DaemonMcpBridge {
     state_dir: PathBuf,
     runtime_dir_override: Option<PathBuf>,
     device_id_override: Option<u64>,
+    trust_profile: PartyTrustProfile,
     conn: Arc<Mutex<Option<Arc<MultiplexedConn>>>>,
     connect_lock: Mutex<()>,
     idle_reaper_started: AtomicBool,
 }
 
 impl DaemonMcpBridge {
-    /// Creates a lazy bridge. Performs ZERO filesystem, socket, or daemon I/O on construction!
+    /// Creates a lazy bridge. Loads the unified policy ceiling (failing closed to `Advisory` on
+    /// any tampered/corrupt policy) and performs ZERO socket or daemon I/O on construction.
     pub fn new(
         state_dir: PathBuf,
         runtime_dir_override: Option<PathBuf>,
         device_id_override: Option<u64>,
     ) -> Arc<Self> {
+        let trust_profile = crate::policy_loader::load_effective_unified_policy()
+            .map(|loaded| loaded.effective.party_trust.max_default_profile)
+            .unwrap_or(PartyTrustProfile::Advisory);
         Arc::new(Self {
             state_dir,
             runtime_dir_override,
             device_id_override,
+            trust_profile,
             conn: Arc::new(Mutex::new(None)),
             connect_lock: Mutex::new(()),
             idle_reaper_started: AtomicBool::new(false),
@@ -615,6 +623,10 @@ fn map_ipc_error(code: u16, message: String) -> BackendError {
 }
 
 impl McpOutpostBackend for DaemonMcpBridge {
+    fn effective_trust_profile(&self) -> PartyTrustProfile {
+        self.trust_profile
+    }
+
     fn outpost_status(&self) -> BoxFuture<'_, Result<Value, BackendError>> {
         Box::pin(async move {
             let (raw, conn) = self.call_ipc(IpcOpcode::GetStatus, Vec::new(), None).await?;
@@ -1043,7 +1055,7 @@ impl McpOutpostBackend for DaemonMcpBridge {
                 .map(|f| {
                     json!({
                         "account_id": f.account_id,
-                        "handle": f.handle,
+                        "handle": sanitize_peer_text(&f.handle),
                         "state": f.state,
                         "presence": f.presence,
                         "client": f.client,
@@ -1192,6 +1204,30 @@ impl McpOutpostBackend for DaemonMcpBridge {
                 "state": edge.state,
                 "state_label": state_label,
             }))
+        })
+    }
+
+    fn inbox_send(
+        &self,
+        req: InboxSendArgs,
+    ) -> BoxFuture<'_, Result<InboxSendResult, BackendError>> {
+        Box::pin(async move {
+            crate::inbox::mcp_inbox_send(&self.state_dir, self.device_id_override, req).await
+        })
+    }
+
+    fn inbox_read(
+        &self,
+        req: InboxReadArgs,
+    ) -> BoxFuture<'_, Result<InboxReadResult, BackendError>> {
+        Box::pin(async move {
+            crate::inbox::mcp_inbox_read(&self.state_dir, self.device_id_override, req).await
+        })
+    }
+
+    fn inbox_ack(&self, req: InboxAckArgs) -> BoxFuture<'_, Result<InboxAckResult, BackendError>> {
+        Box::pin(async move {
+            crate::inbox::mcp_inbox_ack(&self.state_dir, self.device_id_override, req).await
         })
     }
 }

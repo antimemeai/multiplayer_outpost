@@ -16,7 +16,7 @@
 //!    plus typed REST endpoint contract coverage across all `/v1/*` routes.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,15 +31,19 @@ use mp_protocol::{
     verify_rfc9421_request,
 };
 use outpost_control::{
-    ApprovePartyRequest, ChurnStatus, ControlClient, ControlClientConfig, ControlError,
-    CreatePartyRequest, DeviceLinkApproveRequest, DeviceLinkClaimResponse,
-    DeviceLinkInspectResponse, DeviceLinkPollResponse, EndpointUpdateCoalescer,
-    EnrollDeviceRequest, EvictionChurnDetector, JoinPartyRequest, JoinPartyResponse,
-    MAX_CLOCK_OFFSET_MS, MAX_DISCOVERED_RELAYS, MAX_RELAY_METADATA_CHARS, MAX_RESPONSE_BODY_BYTES,
+    AccountEncKeysResponse, AckInboxResponse, ApprovePartyRequest, ChurnStatus, ControlClient,
+    ControlClientConfig, ControlError, CreatePartyRequest, DeviceEncKeyInfo,
+    DeviceLinkApproveRequest, DeviceLinkClaimResponse, DeviceLinkInspectResponse,
+    DeviceLinkPollResponse, ENC_CERT_BYTES, EndpointUpdateCoalescer, EnrollDeviceRequest,
+    EvictionChurnDetector, InboxDropItem, InboxDropsResponse, JoinPartyRequest, JoinPartyResponse,
+    MAX_CLOCK_OFFSET_MS, MAX_DISCOVERED_RELAYS, MAX_ENC_KEYS_RESPONSE_BYTES,
+    MAX_INBOX_GET_RESPONSE_BYTES, MAX_INBOX_PENDING_DROPS, MAX_INBOX_POST_BODY_BYTES,
+    MAX_INBOX_RECIPIENT_DEVICES, MAX_RELAY_METADATA_CHARS, MAX_RESPONSE_BODY_BYTES,
     MAX_RETRY_AFTER_MS, MIN_RETRY_AFTER_MS, MP1_PING_TEXT, MP1_PONG_TEXT, MintPartyInviteRequest,
-    Mp1WsEvent, Mp1WsTarget, RegisterAccountRequest, RelayInfo, RelaysResponse, RequestSigner,
-    WsConnectError, WsError, build_tls13_client_config_with_roots, sanitize_server_error,
-    validate_link_code, wall_now_ms, wall_now_secs,
+    Mp1WsEvent, Mp1WsTarget, PostInboxDropRequest, PostInboxDropResponse, PutDeviceEncKeyResponse,
+    RegisterAccountRequest, RelayInfo, RelaysResponse, RequestSigner, WrappedDeviceKey,
+    WsConnectError, WsError, build_tls13_client_config_with_roots, is_public_routable_ip,
+    sanitize_server_error, validate_link_code, wall_now_ms, wall_now_secs,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -3835,4 +3839,702 @@ async fn oracle_mp2_ws_chat_ack_resume_dedup_agent_card_and_ping_pong() {
             .get(),
         8801
     );
+}
+
+// ===========================================================================
+// Oracle 17 (Gate #3 G3-L2-3): `is_public_routable_ip`, `probe_relay_ping` SSRF
+//            Guard, `list_relays` URL Deduplication, & `group_id` requires `org_id`
+// ===========================================================================
+
+#[test]
+fn oracle_is_public_routable_ip_exhaustive_ssrf_ranges() {
+    let non_public = [
+        // IPv4 unspecified / zero network (0.0.0.0/8)
+        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+        IpAddr::V4(Ipv4Addr::new(0, 1, 2, 3)),
+        // IPv4 loopback (127.0.0.0/8)
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(127, 255, 255, 254)),
+        // IPv4 RFC 1918 private
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(172, 31, 255, 255)),
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+        // IPv4 link-local (169.254.0.0/16) — AWS/GCP/Cloudflare metadata!
+        IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+        // IPv4 CGNAT (100.64.0.0/10)
+        IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(100, 127, 255, 254)),
+        // IPv4 benchmarking (198.18.0.0/15)
+        IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(198, 19, 255, 255)),
+        // IPv4 documentation (TEST-NET-1/2/3)
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+        // IPv4 multicast & reserved / broadcast
+        IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(239, 255, 255, 250)),
+        IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
+        // IPv6 unspecified, loopback, link-local, ULA, multicast, documentation
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+        IpAddr::V6("fe80::1".parse().expect("ipv6")),
+        IpAddr::V6("febf::1".parse().expect("ipv6")),
+        IpAddr::V6("fc00::1".parse().expect("ipv6")),
+        IpAddr::V6("fd12:3456::1".parse().expect("ipv6")),
+        IpAddr::V6("ff02::1".parse().expect("ipv6")),
+        IpAddr::V6("2001:db8::1".parse().expect("ipv6")),
+        // IPv4-mapped IPv6 non-public
+        IpAddr::V6("::ffff:127.0.0.1".parse().expect("ipv6")),
+        IpAddr::V6("::ffff:10.0.0.1".parse().expect("ipv6")),
+        IpAddr::V6("::ffff:169.254.169.254".parse().expect("ipv6")),
+        IpAddr::V6("::ffff:100.64.0.1".parse().expect("ipv6")),
+        IpAddr::V6("::ffff:192.168.0.1".parse().expect("ipv6")),
+        // NAT64 well-known prefix wrapping loopback
+        IpAddr::V6("64:ff9b::127.0.0.1".parse().expect("ipv6")),
+    ];
+    for ip in non_public {
+        assert!(
+            !is_public_routable_ip(ip),
+            "non-public IP {ip} MUST be rejected"
+        );
+    }
+
+    let public = [
+        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        IpAddr::V4(Ipv4Addr::new(104, 18, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(100, 63, 255, 255)),
+        IpAddr::V4(Ipv4Addr::new(100, 128, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(172, 15, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(172, 32, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(198, 17, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(198, 20, 0, 1)),
+        IpAddr::V6("2606:4700:4700::1111".parse().expect("ipv6")),
+        IpAddr::V6("2001:4860:4860::8888".parse().expect("ipv6")),
+        IpAddr::V6("::ffff:1.1.1.1".parse().expect("ipv6")),
+    ];
+    for ip in public {
+        assert!(
+            is_public_routable_ip(ip),
+            "public IP {ip} MUST be accepted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn oracle_list_relays_dedup_probe_ssrf_and_group_requires_org() {
+    let pki = generate_test_pki_for_hosts(&[TEST_AUTHORITY, "relay.multiplayer.tech"]);
+    let tls13_acceptor = make_server_acceptor(&pki, &[&rustls::version::TLS13]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let srv = tokio::spawn(async move {
+        // Request 1: GET /v1/relays with duplicate canonical URLs (first entry must win!)
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 1");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 1");
+            let req = read_http_request(&mut tls).await;
+            assert_eq!(req.method, "GET");
+            assert_eq!(req.path, "/v1/relays");
+            let body = concat!(
+                r#"{"default_relay_url":"https://relay.multiplayer.tech","relays":["#,
+                r#"{"url":"https://relay.multiplayer.tech","region":"global","label":"Primary Global","default":true},"#,
+                r#"{"url":"https://relay-wnam.multiplayer.tech","region":"wnam","label":"US West","default":false},"#,
+                r#"{"url":"https://relay.multiplayer.tech","region":"dup","label":"Duplicate Global","default":false}"#,
+                r#"]}"#
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write relays");
+            tls.shutdown().await.expect("shutdown 1");
+        }
+
+        // Request 2: Valid probe_relay_ping with explicit test connect_addr override
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 2");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 2");
+            let req = read_http_request(&mut tls).await;
+            assert_eq!(req.method, "GET");
+            assert_eq!(req.path, "/ping");
+            assert_eq!(
+                req.headers.get("host").map(String::as_str),
+                Some("relay.multiplayer.tech")
+            );
+            let resp = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+            tls.write_all(resp.as_bytes()).await.expect("write ping");
+            tls.shutdown().await.expect("shutdown 2");
+        }
+    });
+
+    let signer = RequestSigner::device(
+        AccountId::new(1001).expect("acct"),
+        DeviceId::new(2002).expect("dev"),
+        [84u8; 32],
+    );
+    let client = ControlClient::with_device_signer(make_client_config(&pki, addr), signer);
+
+    // 1. list_relays deduplicates by canonical URL keeping the first occurrence
+    let relays = client.list_relays().await.expect("list_relays");
+    assert_eq!(relays.relays.len(), 2, "duplicate relay URL must be removed");
+    assert_eq!(relays.relays[0].url, "https://relay.multiplayer.tech");
+    assert_eq!(relays.relays[0].label, "Primary Global");
+    assert_eq!(relays.relays[1].url, "https://relay-wnam.multiplayer.tech");
+
+    // 2. group_id without org_id is rejected locally (never hits network)
+    let base_req = CreatePartyRequest {
+        visibility: PartyVisibility::Friends,
+        join_mode: PartyJoinMode::InviteOnly,
+        relay_policy: RelayPolicy::ForceRelays,
+        max_members: 4,
+        endpoint: make_relay_only_endpoint(),
+        relay_url: Some("https://relay.multiplayer.tech".to_owned()),
+    };
+    let group_err = client
+        .create_party_with_scope(&base_req, None, Some(99))
+        .await
+        .expect_err("group_id without org_id must fail locally");
+    match group_err {
+        ControlError::InvalidRequest(msg) => {
+            assert!(
+                msg.contains("group_id requires org_id"),
+                "unexpected error message: {msg}"
+            );
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+
+    // 3. probe_relay_ping rejects unsafe / non-public relay URLs before dialing
+    let prod_client = ControlClient::new(
+        ControlClientConfig::new(TEST_AUTHORITY)
+            .expect("cfg")
+            .with_tls_config(Arc::clone(&pki.client_tls13))
+            .with_request_timeout(Duration::from_secs(2)),
+    );
+    for bad_relay in [
+        "https://localhost",
+        "https://127.0.0.1",
+        "https://relay.internal",
+        "https://relay.local",
+        "http://relay.multiplayer.tech",
+        "https://relay.multiplayer.tech/evil",
+    ] {
+        assert!(
+            prod_client.probe_relay_ping(bad_relay).await.is_err(),
+            "unsafe relay URL {bad_relay} must be rejected"
+        );
+    }
+
+    // 4. Valid relay ping with test connect_addr override succeeds
+    let rtt = client
+        .probe_relay_ping("https://relay.multiplayer.tech")
+        .await
+        .expect("valid probe_relay_ping with override");
+    assert!(rtt < Duration::from_secs(5));
+
+    srv.await.expect("server task");
+}
+
+// ===========================================================================
+// Oracle 18 (v0.5.0): All 5 Live Dead-Drop Inbox REST Endpoints (TLS 1.3 + RFC 9421)
+// ===========================================================================
+
+#[tokio::test]
+async fn oracle_dead_drop_inbox_all_five_endpoints_tls13_and_validations() {
+    let pki = generate_test_pki();
+    let tls13_acceptor = make_server_acceptor(&pki, &[&rustls::version::TLS13]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let acct_id = AccountId::new(1001).expect("acct");
+    let dev_id = DeviceId::new(2002).expect("dev");
+    let recipient_acct_id: u64 = 1002;
+    let dev_secret = [85u8; 32];
+    let dev_pubkey = SigningKey::from_bytes(&dev_secret)
+        .verifying_key()
+        .to_bytes();
+
+    let valid_enc_cert_b64 = B64_STD.encode([0x42u8; ENC_CERT_BYTES]);
+    let enc_cert_b64_srv = valid_enc_cert_b64.clone();
+
+    let srv = tokio::spawn(async move {
+        // 1. PUT /v1/devices/2002/enc-key
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 1");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 1");
+            let req = read_http_request(&mut tls).await;
+            assert_eq!(req.method, "PUT");
+            assert_eq!(req.path, "/v1/devices/2002/enc-key");
+            verify_rfc9421_request(
+                &Rfc9421Request {
+                    method: HttpMethod::Put,
+                    authority: req.headers.get("host").map(String::as_str).unwrap_or(""),
+                    path: &req.path,
+                    query: &req.query,
+                    content_type: req.headers.get("content-type").map(String::as_str),
+                    content_digest: req.headers.get("content-digest").map(String::as_str),
+                    has_content_encoding: req.headers.contains_key("content-encoding"),
+                    body: &req.body,
+                    signature_input: req.headers.get("signature-input").expect("sig-in"),
+                    signature: req.headers.get("signature").expect("sig"),
+                },
+                TEST_AUTHORITY,
+                &dev_pubkey,
+                wall_now_secs(),
+            )
+            .expect("PUT enc-key RFC 9421 verify");
+            let body_json: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("valid json");
+            assert_eq!(
+                body_json.get("enc_cert_b64").and_then(|v| v.as_str()),
+                Some(enc_cert_b64_srv.as_str())
+            );
+            let resp_body = r#"{"device_id":2002,"enc_pk_b64":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=","expires_at_ms":1760000000000}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write 1");
+            tls.shutdown().await.expect("shutdown 1");
+        }
+
+        // 2. GET /v1/accounts/1002/enc-keys (8 devices > 16 KiB standard cap, within 64 KiB cap)
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 2");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 2");
+            let req = read_http_request(&mut tls).await;
+            assert_eq!(req.method, "GET");
+            assert_eq!(req.path, "/v1/accounts/1002/enc-keys");
+            verify_rfc9421_request(
+                &Rfc9421Request {
+                    method: HttpMethod::Get,
+                    authority: req.headers.get("host").map(String::as_str).unwrap_or(""),
+                    path: &req.path,
+                    query: &req.query,
+                    content_type: None,
+                    content_digest: None,
+                    has_content_encoding: false,
+                    body: &[],
+                    signature_input: req.headers.get("signature-input").expect("sig-in"),
+                    signature: req.headers.get("signature").expect("sig"),
+                },
+                TEST_AUTHORITY,
+                &dev_pubkey,
+                wall_now_secs(),
+            )
+            .expect("GET enc-keys RFC 9421 verify");
+            let big_cwt = "A".repeat(2200);
+            let devs: Vec<String> = (1..=MAX_INBOX_RECIPIENT_DEVICES)
+                .map(|i| {
+                    format!(
+                        r#"{{"device_id":{},"device_pubkey_b64":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","device_cwt_b64":"{}","enc_pk_b64":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=","enc_cert_b64":"{}","expires_at_ms":1760000000000}}"#,
+                        3000 + i,
+                        big_cwt,
+                        enc_cert_b64_srv
+                    )
+                })
+                .collect();
+            let resp_body = format!(
+                r#"{{"account_id":1002,"root_pubkey_b64":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=","devices":[{}]}}"#,
+                devs.join(",")
+            );
+            assert!(resp_body.len() > MAX_RESPONSE_BODY_BYTES);
+            assert!(resp_body.len() <= MAX_ENC_KEYS_RESPONSE_BYTES);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write 2");
+            tls.shutdown().await.expect("shutdown 2");
+        }
+
+        // 3. GET /v1/accounts/1002/enc-keys with 9 devices (> 8 max) -> client Protocol error
+        {
+            let (tcp, _) = listener.accept().await.expect("accept 3");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls 3");
+            let _req = read_http_request(&mut tls).await;
+            let devs: Vec<String> = (1..=9)
+                .map(|i| {
+                    format!(
+                        r#"{{"device_id":{},"device_pubkey_b64":"AA==","device_cwt_b64":"AA==","enc_pk_b64":"AA==","enc_cert_b64":"AA==","expires_at_ms":1760000000000}}"#,
+                        3000 + i
+                    )
+                })
+                .collect();
+            let resp_body = format!(
+                r#"{{"account_id":1002,"root_pubkey_b64":"AA==","devices":[{}]}}"#,
+                devs.join(",")
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write 3");
+            tls.shutdown().await.expect("shutdown 3");
+        }
+
+        // 4. POST /v1/inbox/1002 -> 201 Created
+        // 5. POST /v1/inbox/1002 -> 200 OK (idempotent)
+        for attempt in 0..2u8 {
+            let (tcp, _) = listener.accept().await.expect("accept post");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls post");
+            let req = read_http_request(&mut tls).await;
+            assert_eq!(req.method, "POST");
+            assert_eq!(req.path, "/v1/inbox/1002");
+            verify_rfc9421_request(
+                &Rfc9421Request {
+                    method: HttpMethod::Post,
+                    authority: req.headers.get("host").map(String::as_str).unwrap_or(""),
+                    path: &req.path,
+                    query: &req.query,
+                    content_type: req.headers.get("content-type").map(String::as_str),
+                    content_digest: req.headers.get("content-digest").map(String::as_str),
+                    has_content_encoding: req.headers.contains_key("content-encoding"),
+                    body: &req.body,
+                    signature_input: req.headers.get("signature-input").expect("sig-in"),
+                    signature: req.headers.get("signature").expect("sig"),
+                },
+                TEST_AUTHORITY,
+                &dev_pubkey,
+                wall_now_secs(),
+            )
+            .expect("POST inbox RFC 9421 verify");
+            let body_json: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("valid json");
+            assert_eq!(body_json.get("suite").and_then(|v| v.as_u64()), Some(1));
+            assert!(body_json.get("msg_id_b64").is_some());
+            assert!(body_json.get("sender_cwt_b64").is_some());
+            assert!(body_json.get("sender_enc_cert_b64").is_some());
+            assert!(body_json.get("ciphertext_b64").is_some());
+            assert!(body_json.get("wrapped_keys").and_then(|v| v.as_array()).is_some());
+
+            let (status_line, resp_body) = if attempt == 0 {
+                (
+                    "HTTP/1.1 201 Created",
+                    r#"{"drop_id":9001,"delivered_devices":2,"idempotent":false}"#,
+                )
+            } else {
+                (
+                    "HTTP/1.1 200 OK",
+                    r#"{"drop_id":9001,"delivered_devices":2,"idempotent":true}"#,
+                )
+            };
+            let resp = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write post");
+            tls.shutdown().await.expect("shutdown post");
+        }
+
+        // 6. GET /v1/inbox -> large (> 64 KiB, well under 2 MiB cap) multi-drop response
+        {
+            let (tcp, _) = listener.accept().await.expect("accept get inbox");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls get inbox");
+            let req = read_http_request(&mut tls).await;
+            assert_eq!(req.method, "GET");
+            assert_eq!(req.path, "/v1/inbox");
+            verify_rfc9421_request(
+                &Rfc9421Request {
+                    method: HttpMethod::Get,
+                    authority: req.headers.get("host").map(String::as_str).unwrap_or(""),
+                    path: &req.path,
+                    query: &req.query,
+                    content_type: None,
+                    content_digest: None,
+                    has_content_encoding: false,
+                    body: &[],
+                    signature_input: req.headers.get("signature-input").expect("sig-in"),
+                    signature: req.headers.get("signature").expect("sig"),
+                },
+                TEST_AUTHORITY,
+                &dev_pubkey,
+                wall_now_secs(),
+            )
+            .expect("GET inbox RFC 9421 verify");
+            let big_ct_b64 = B64_STD.encode(vec![0x77u8; 65_536]);
+            let drops: Vec<String> = (0..2)
+                .map(|i| {
+                    format!(
+                        r#"{{"drop_id":{},"sender_account_id":1002,"sender_device_id":3001,"msg_id_b64":"AAAAAAAAAAAAAAAAAAAAAA==","suite":1,"sender_cwt_b64":"SENSITIVE_CWT","sender_enc_cert_b64":"{}","ciphertext_b64":"{}","wrapped_key_b64":"SENSITIVE_WRAPPED_KEY","created_at_ms":1750000000000,"expires_at_ms":1760000000000}}"#,
+                        9100 + i,
+                        enc_cert_b64_srv,
+                        big_ct_b64
+                    )
+                })
+                .collect();
+            let resp_body = format!(r#"{{"drops":[{}]}}"#, drops.join(","));
+            assert!(resp_body.len() > MAX_ENC_KEYS_RESPONSE_BYTES);
+            assert!(resp_body.len() <= MAX_INBOX_GET_RESPONSE_BYTES);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write get inbox");
+            tls.shutdown().await.expect("shutdown get inbox");
+        }
+
+        // 7. GET /v1/inbox with 17 drops (> 16 max) -> client Protocol error
+        {
+            let (tcp, _) = listener.accept().await.expect("accept get inbox 17");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls get inbox 17");
+            let _req = read_http_request(&mut tls).await;
+            let drops: Vec<String> = (1..=17)
+                .map(|i| {
+                    format!(
+                        r#"{{"drop_id":{i},"sender_account_id":1002,"sender_device_id":3001,"msg_id_b64":"AA==","suite":1,"sender_cwt_b64":"AA==","sender_enc_cert_b64":"AA==","ciphertext_b64":"AA==","wrapped_key_b64":"AA==","created_at_ms":1750000000000,"expires_at_ms":1760000000000}}"#
+                    )
+                })
+                .collect();
+            let resp_body = format!(r#"{{"drops":[{}]}}"#, drops.join(","));
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write get inbox 17");
+            tls.shutdown().await.expect("shutdown get inbox 17");
+        }
+
+        // 8. POST /v1/inbox/ack
+        {
+            let (tcp, _) = listener.accept().await.expect("accept ack");
+            let mut tls = tls13_acceptor.accept(tcp).await.expect("tls ack");
+            let req = read_http_request(&mut tls).await;
+            assert_eq!(req.method, "POST");
+            assert_eq!(req.path, "/v1/inbox/ack");
+            verify_rfc9421_request(
+                &Rfc9421Request {
+                    method: HttpMethod::Post,
+                    authority: req.headers.get("host").map(String::as_str).unwrap_or(""),
+                    path: &req.path,
+                    query: &req.query,
+                    content_type: req.headers.get("content-type").map(String::as_str),
+                    content_digest: req.headers.get("content-digest").map(String::as_str),
+                    has_content_encoding: req.headers.contains_key("content-encoding"),
+                    body: &req.body,
+                    signature_input: req.headers.get("signature-input").expect("sig-in"),
+                    signature: req.headers.get("signature").expect("sig"),
+                },
+                TEST_AUTHORITY,
+                &dev_pubkey,
+                wall_now_secs(),
+            )
+            .expect("POST inbox/ack RFC 9421 verify");
+            let body_json: serde_json::Value =
+                serde_json::from_slice(&req.body).expect("valid json");
+            assert_eq!(body_json, serde_json::json!({ "drop_ids": [9100, 9101] }));
+            let resp_body = r#"{"acked":2,"pruned_drops":1}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            tls.write_all(resp.as_bytes()).await.expect("write ack");
+            tls.shutdown().await.expect("shutdown ack");
+        }
+    });
+
+    // Verify .root signer is rejected locally on all 5 inbox endpoints!
+    let root_client = ControlClient::with_device_signer(
+        make_client_config(&pki, addr),
+        RequestSigner::root(acct_id, [99u8; 32]),
+    );
+    let sample_post = PostInboxDropRequest {
+        msg_id_b64: B64_STD.encode([1u8; 16]),
+        suite: 1,
+        sender_cwt_b64: "SECRET_SENDER_CWT".to_owned(),
+        sender_enc_cert_b64: valid_enc_cert_b64.clone(),
+        ciphertext_b64: B64_STD.encode([0x55u8; 1024]),
+        wrapped_keys: vec![
+            WrappedDeviceKey {
+                device_id: 3001,
+                wrapped_key_b64: "SECRET_WRAPPED_KEY_1".to_owned(),
+            },
+            WrappedDeviceKey {
+                device_id: 3002,
+                wrapped_key_b64: "SECRET_WRAPPED_KEY_2".to_owned(),
+            },
+        ],
+        expires_at_ms: 1_760_000_000_000,
+    };
+    assert!(matches!(
+        root_client.put_device_enc_key(2002, &valid_enc_cert_b64).await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        root_client.get_account_enc_keys(recipient_acct_id).await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        root_client.post_inbox_drop(recipient_acct_id, &sample_post).await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        root_client.get_inbox_drops().await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        root_client.ack_inbox_drops(&[9100]).await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+
+    // Verify Debug redaction on WrappedDeviceKey & PostInboxDropRequest
+    let req_dbg = format!("{sample_post:?}");
+    assert!(req_dbg.contains("[REDACTED]"));
+    assert!(!req_dbg.contains("SECRET_WRAPPED_KEY_1"));
+    assert!(!req_dbg.contains("SECRET_SENDER_CWT"));
+
+    let signer = RequestSigner::device(acct_id, dev_id, dev_secret);
+    let client = ControlClient::with_device_signer(make_client_config(&pki, addr), signer);
+
+    // Local validation checks for PUT /enc-key
+    assert!(matches!(
+        client.put_device_enc_key(9999, &valid_enc_cert_b64).await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        client.put_device_enc_key(2002, &B64_STD.encode([0u8; 160])).await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        client.put_device_enc_key(2002, "!!!not-base64!!!").await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+
+    // 1. Valid PUT /v1/devices/2002/enc-key
+    let put_res: PutDeviceEncKeyResponse = client
+        .put_device_enc_key(2002, &valid_enc_cert_b64)
+        .await
+        .expect("put_device_enc_key");
+    assert_eq!(put_res.device_id, 2002);
+    assert_eq!(
+        put_res.enc_pk_b64,
+        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+    );
+    assert_eq!(put_res.expires_at_ms, 1_760_000_000_000);
+
+    // 2. Valid GET /v1/accounts/1002/enc-keys (>16 KiB, 8 devices)
+    let keys_res: AccountEncKeysResponse = client
+        .get_account_enc_keys(recipient_acct_id)
+        .await
+        .expect("get_account_enc_keys");
+    assert_eq!(keys_res.account_id, 1002);
+    assert_eq!(keys_res.devices.len(), MAX_INBOX_RECIPIENT_DEVICES);
+    let first_dev: &DeviceEncKeyInfo = &keys_res.devices[0];
+    assert_eq!(first_dev.device_id, 3001);
+
+    // 3. GET /v1/accounts/1002/enc-keys with >8 devices rejected
+    assert!(matches!(
+        client.get_account_enc_keys(recipient_acct_id).await,
+        Err(ControlError::Protocol(_))
+    ));
+
+    // Local validation checks for POST /v1/inbox/{recipient_account_id}
+    let mut bad_suite = sample_post.clone();
+    bad_suite.suite = 2;
+    assert!(matches!(
+        client.post_inbox_drop(recipient_acct_id, &bad_suite).await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+    let mut empty_wk = sample_post.clone();
+    empty_wk.wrapped_keys.clear();
+    assert!(matches!(
+        client.post_inbox_drop(recipient_acct_id, &empty_wk).await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+    let mut oversized_post = sample_post.clone();
+    oversized_post.ciphertext_b64 = "A".repeat(MAX_INBOX_POST_BODY_BYTES);
+    assert!(matches!(
+        client.post_inbox_drop(recipient_acct_id, &oversized_post).await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+
+    // 4 & 5. Valid POST /v1/inbox/1002 (201 Created, then 200 idempotent)
+    let post1: PostInboxDropResponse = client
+        .post_inbox_drop(recipient_acct_id, &sample_post)
+        .await
+        .expect("post_inbox_drop 201");
+    assert_eq!(
+        post1,
+        PostInboxDropResponse {
+            drop_id: 9001,
+            delivered_devices: 2,
+            idempotent: false,
+        }
+    );
+    let post2: PostInboxDropResponse = client
+        .post_inbox_drop(recipient_acct_id, &sample_post)
+        .await
+        .expect("post_inbox_drop 200 idempotent");
+    assert_eq!(
+        post2,
+        PostInboxDropResponse {
+            drop_id: 9001,
+            delivered_devices: 2,
+            idempotent: true,
+        }
+    );
+
+    // 6. Valid GET /v1/inbox (>64 KiB body, within 2 MiB cap) + Debug redaction
+    let inbox: InboxDropsResponse = client.get_inbox_drops().await.expect("get_inbox_drops");
+    assert_eq!(inbox.drops.len(), 2);
+    let drop0: &InboxDropItem = &inbox.drops[0];
+    assert_eq!(drop0.drop_id, 9100);
+    assert_eq!(drop0.sender_account_id, 1002);
+    assert_eq!(drop0.sender_device_id, 3001);
+    let drop_dbg = format!("{drop0:?}");
+    assert!(drop_dbg.contains("[REDACTED]"));
+    assert!(!drop_dbg.contains("SENSITIVE_WRAPPED_KEY"));
+    assert!(!drop_dbg.contains("SENSITIVE_CWT"));
+
+    // 7. GET /v1/inbox with 17 drops (> 16 max) rejected
+    assert!(matches!(
+        client.get_inbox_drops().await,
+        Err(ControlError::Protocol(_))
+    ));
+
+    // Local validation checks for POST /v1/inbox/ack
+    assert!(matches!(
+        client.ack_inbox_drops(&[]).await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+    let seventeen_ids: Vec<u64> = (1..=(MAX_INBOX_PENDING_DROPS as u64 + 1)).collect();
+    assert!(matches!(
+        client.ack_inbox_drops(&seventeen_ids).await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        client.ack_inbox_drops(&[0]).await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        client.ack_inbox_drops(&[MAX_SAFE_ID + 1]).await,
+        Err(ControlError::InvalidRequest(_))
+    ));
+
+    // 8. Valid POST /v1/inbox/ack
+    let ack: AckInboxResponse = client
+        .ack_inbox_drops(&[9100, 9101])
+        .await
+        .expect("ack_inbox_drops");
+    assert_eq!(
+        ack,
+        AckInboxResponse {
+            acked: 2,
+            pruned_drops: 1,
+        }
+    );
+
+    srv.await.expect("server task");
 }

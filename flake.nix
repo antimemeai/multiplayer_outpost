@@ -1,7 +1,7 @@
 {
   description = "mp-outpost — standalone E2EE P2P sidecar, daemon, and MCP stdio server for multiplayer.tech";
 
-  # Drop-in root flake.nix for https://github.com/antimemeai/multiplayer_outpost.
+  # Drop-in root flake.nix for https://github.com/antimeme-ai/multiplayer_outpost.
   # Requires Rust >= 1.91 (edition 2024); nixos-unstable provides a compatible toolchain.
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -52,7 +52,7 @@
             meta = with lib; {
               description = "Standalone E2EE sidecar CLI, daemon, and MCP server for multiplayer.tech";
               homepage = "https://multiplayer.tech";
-              changelog = "https://github.com/antimemeai/multiplayer_outpost/releases/tag/v0.4.0";
+              changelog = "https://github.com/antimeme-ai/multiplayer_outpost/releases/tag/v0.4.0";
               license = licenses.mit;
               mainProgram = "mp-outpost";
               platforms = supportedSystems;

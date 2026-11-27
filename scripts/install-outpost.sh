@@ -59,9 +59,9 @@ fi
 
 if [ -z "$outpost_base_url" ]; then
   if [ "$outpost_version" = latest ]; then
-    outpost_base_url='https://github.com/antimemeai/multiplayer_outpost/releases/latest/download'
+    outpost_base_url='https://github.com/antimeme-ai/multiplayer_outpost/releases/latest/download'
   else
-    outpost_base_url="https://github.com/antimemeai/multiplayer_outpost/releases/download/$outpost_version"
+    outpost_base_url="https://github.com/antimeme-ai/multiplayer_outpost/releases/download/$outpost_version"
   fi
 fi
 outpost_base_url=${outpost_base_url%/}
@@ -127,7 +127,7 @@ sums_file="$tmpdir/SHA256SUMS.txt"
 if ! fetch_file "$outpost_base_url/SHA256SUMS.txt" "$sums_file"; then
   printf 'Could not fetch SHA256SUMS.txt from %s.\n' "$outpost_base_url" >&2
   printf 'If no prebuilt release is published yet, build from source:\n' >&2
-  printf '  git clone https://github.com/antimemeai/multiplayer_outpost.git && cd multiplayer_outpost && cargo build --release -p outpost-cli\n' >&2
+  printf '  git clone https://github.com/antimeme-ai/multiplayer_outpost.git && cd multiplayer_outpost && cargo build --release -p outpost-cli\n' >&2
   exit 1
 fi
 

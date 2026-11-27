@@ -392,8 +392,8 @@ fn oracle_1_custody_lazy_mcp_eof_and_tty_gate() -> Result<(), String> {
         .pointer("/result/tools")
         .and_then(Value::as_array)
         .ok_or("missing tools array")?;
-    if tools.len() != 14 {
-        return Err(format!("expected 14 MCP tools, got {}", tools.len()));
+    if tools.len() != 17 {
+        return Err(format!("expected 17 MCP tools, got {}", tools.len()));
     }
 
     // Verify NO daemon socket was created during initialize / tools/list!
@@ -5087,6 +5087,786 @@ async fn oracle_10_chat_second_window_live_mp2_bidirectional_and_board() -> Resu
 
     let _ = run_bin(&alice_st, &alice_rt, &["daemon", "stop", "--force"], None, &env_vars);
     let _ = run_bin(&bob_st, &bob_rt, &["daemon", "stop", "--force"], None, &env_vars);
+    server_task.abort();
+    result
+}
+
+// ===========================================================================
+// Oracle 9: v0.5.0 Dead-Drop Inbox (Suite 1 E2EE), Emergency Kit, Unified Policy & 17 MCP Tools
+// ===========================================================================
+
+fn extract_caller_account_and_device(headers: &HashMap<String, String>) -> Option<(u64, u64)> {
+    let sig_input = headers.get("signature-input")?;
+    let marker = "keyid=\"";
+    let start = sig_input.find(marker)? + marker.len();
+    let rest = sig_input.get(start..)?;
+    let end = rest.find('"')?;
+    let keyid = rest.get(..end)?;
+    let (acc_str, dev_str) = keyid.split_once('.')?;
+    let aid = acc_str.parse::<u64>().ok()?;
+    let did = dev_str.parse::<u64>().ok()?;
+    Some((aid, did))
+}
+
+struct MockInboxDevice {
+    account_id: u64,
+    device_pubkey: [u8; 32],
+    device_cwt: Vec<u8>,
+    enc_pk_b64: Option<String>,
+    enc_cert_b64: Option<String>,
+    enc_expires_at_ms: u64,
+}
+
+struct MockInboxState {
+    accounts: HashMap<u64, (String, [u8; 32])>,
+    devices: HashMap<u64, MockInboxDevice>,
+    next_drop_id: u64,
+    drops_by_device: HashMap<u64, Vec<Value>>,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oracle_9_v050_dead_drop_inbox_auth_ux_and_unified_policy() -> Result<(), String> {
+    let root_tmp = make_short_tempdir("mpo8")?;
+    let alice_st = make_private_subdir(root_tmp.path(), "a_st")?;
+    let alice_rt = make_private_subdir(root_tmp.path(), "a_rt")?;
+    let bob_st = make_private_subdir(root_tmp.path(), "b_st")?;
+    let bob_rt = make_private_subdir(root_tmp.path(), "b_rt")?;
+    let iso_home = make_private_subdir(root_tmp.path(), "home")?;
+    let iso_xdg = make_private_subdir(root_tmp.path(), "xdg")?;
+
+    let alice_root_seed = [0xA1u8; 32];
+    let bob_root_seed = [0xB2u8; 32];
+    let alice = provision_device(&alice_st, &alice_rt, 101, 201, alice_root_seed, "alice-dev")?;
+    let bob = provision_device(&bob_st, &bob_rt, 102, 202, bob_root_seed, "bob-dev")?;
+
+    let mut accounts = HashMap::new();
+    accounts.insert(101, ("alice".to_string(), alice.root_pubkey));
+    accounts.insert(102, ("bob".to_string(), bob.root_pubkey));
+
+    let mut devices = HashMap::new();
+    devices.insert(
+        201,
+        MockInboxDevice {
+            account_id: 101,
+            device_pubkey: alice.device_pubkey,
+            device_cwt: alice.device_cwt.clone(),
+            enc_pk_b64: None,
+            enc_cert_b64: None,
+            enc_expires_at_ms: 0,
+        },
+    );
+    devices.insert(
+        202,
+        MockInboxDevice {
+            account_id: 102,
+            device_pubkey: bob.device_pubkey,
+            device_cwt: bob.device_cwt.clone(),
+            enc_pk_b64: None,
+            enc_cert_b64: None,
+            enc_expires_at_ms: 0,
+        },
+    );
+
+    let mock_state = Arc::new(Mutex::new(MockInboxState {
+        accounts,
+        devices,
+        next_drop_id: 1,
+        drops_by_device: HashMap::new(),
+    }));
+
+    let (acceptor, cert_pem) = generate_mock_tls()?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("bind inbox mock: {e}"))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("inbox mock addr: {e}"))?;
+
+    let state_for_srv = Arc::clone(&mock_state);
+    let server_task = tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor_c = acceptor.clone();
+            let st_c = Arc::clone(&state_for_srv);
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor_c.accept(tcp).await else {
+                    return;
+                };
+                let Ok(req) = read_http_req(&mut tls).await else {
+                    return;
+                };
+
+                if req.method == "GET" && req.path == "/v1/health" {
+                    let body = json!({
+                        "ok": true,
+                        "server_now_ms": outpost_control::wall_now_ms(),
+                    });
+                    let _ = write_http_json(&mut tls, 200, "OK", &body).await;
+                    return;
+                }
+                if req.method == "GET" && req.path == "/ping" {
+                    let _ = tls
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = tls.flush().await;
+                    return;
+                }
+
+                // PUT /v1/devices/:id/enc-key
+                if req.method == "PUT"
+                    && let Some(rest) = req.path.strip_prefix("/v1/devices/")
+                    && let Some(id_str) = rest.strip_suffix("/enc-key")
+                    && let Ok(dev_id) = id_str.parse::<u64>()
+                {
+                    let Ok(parsed): Result<Value, _> = serde_json::from_slice(&req.body) else {
+                        let _ = write_http_json(
+                            &mut tls,
+                            400,
+                            "Bad Request",
+                            &json!({"error": "bad_json"}),
+                        )
+                        .await;
+                        return;
+                    };
+                    let Some(enc_cert_b64) = parsed.get("enc_cert_b64").and_then(Value::as_str)
+                    else {
+                        let _ = write_http_json(
+                            &mut tls,
+                            400,
+                            "Bad Request",
+                            &json!({"error": "missing_enc_cert_b64"}),
+                        )
+                        .await;
+                        return;
+                    };
+                    let Ok(cert_bytes) = B64.decode(enc_cert_b64.as_bytes()) else {
+                        let _ = write_http_json(
+                            &mut tls,
+                            400,
+                            "Bad Request",
+                            &json!({"error": "bad_b64"}),
+                        )
+                        .await;
+                        return;
+                    };
+                    let resp_opt = {
+                        let Ok(mut st) = st_c.lock() else {
+                            return;
+                        };
+                        let dev_info = st
+                            .devices
+                            .get(&dev_id)
+                            .map(|d| (d.account_id, d.device_pubkey));
+                        if let Some((aid, dev_pk)) = dev_info
+                            && let Some((_, root_pk)) = st.accounts.get(&aid).cloned()
+                            && let Ok(claims) = mp_protocol::verify_enc_subkey_cert(
+                                &cert_bytes,
+                                aid,
+                                dev_id,
+                                &root_pk,
+                                &dev_pk,
+                                wall_now_secs(),
+                            )
+                        {
+                            let enc_pk_b64 = B64.encode(claims.enc_pk);
+                            let expires_at_ms = u64::try_from(claims.exp_s.max(0))
+                                .unwrap_or(0)
+                                .saturating_mul(1_000);
+                            if let Some(d) = st.devices.get_mut(&dev_id) {
+                                d.enc_pk_b64 = Some(enc_pk_b64.clone());
+                                d.enc_cert_b64 = Some(enc_cert_b64.to_string());
+                                d.enc_expires_at_ms = expires_at_ms;
+                            }
+                            Some(json!({
+                                "device_id": dev_id,
+                                "enc_pk_b64": enc_pk_b64,
+                                "expires_at_ms": expires_at_ms,
+                            }))
+                        } else {
+                            None
+                        }
+                    };
+                    match resp_opt {
+                        Some(body) => {
+                            let _ = write_http_json(&mut tls, 200, "OK", &body).await;
+                        }
+                        None => {
+                            let _ = write_http_json(
+                                &mut tls,
+                                400,
+                                "Bad Request",
+                                &json!({"error": "invalid_enc_cert"}),
+                            )
+                            .await;
+                        }
+                    }
+                    return;
+                }
+
+                // GET /v1/accounts/:id/enc-keys
+                if req.method == "GET"
+                    && let Some(rest) = req.path.strip_prefix("/v1/accounts/")
+                    && let Some(id_str) = rest.strip_suffix("/enc-keys")
+                    && let Ok(aid) = id_str.parse::<u64>()
+                {
+                    let body_opt = {
+                        let Ok(st) = st_c.lock() else {
+                            return;
+                        };
+                        st.accounts.get(&aid).map(|(_, root_pk)| {
+                            let mut devs = Vec::new();
+                            for (&did, d) in &st.devices {
+                                if d.account_id == aid
+                                    && let (Some(epk), Some(ecert)) =
+                                        (d.enc_pk_b64.as_ref(), d.enc_cert_b64.as_ref())
+                                {
+                                    devs.push(json!({
+                                        "device_id": did,
+                                        "device_pubkey_b64": B64.encode(d.device_pubkey),
+                                        "device_cwt_b64": B64.encode(&d.device_cwt),
+                                        "enc_pk_b64": epk,
+                                        "enc_cert_b64": ecert,
+                                        "expires_at_ms": d.enc_expires_at_ms,
+                                    }));
+                                }
+                            }
+                            json!({
+                                "account_id": aid,
+                                "root_pubkey_b64": B64.encode(root_pk),
+                                "devices": devs,
+                            })
+                        })
+                    };
+                    match body_opt {
+                        Some(body) => {
+                            let _ = write_http_json(&mut tls, 200, "OK", &body).await;
+                        }
+                        None => {
+                            let _ = write_http_json(
+                                &mut tls,
+                                404,
+                                "Not Found",
+                                &json!({"error": "not_found"}),
+                            )
+                            .await;
+                        }
+                    }
+                    return;
+                }
+
+                // GET /v1/accounts/:id
+                if req.method == "GET"
+                    && let Some(id_str) = req.path.strip_prefix("/v1/accounts/")
+                    && !id_str.contains('/')
+                    && let Ok(aid) = id_str.parse::<u64>()
+                {
+                    let body_opt = {
+                        let Ok(st) = st_c.lock() else {
+                            return;
+                        };
+                        st.accounts.get(&aid).map(|(handle, root_pk)| {
+                            json!({
+                                "account_id": aid,
+                                "handle": handle,
+                                "root_pubkey_b64": B64.encode(root_pk),
+                            })
+                        })
+                    };
+                    match body_opt {
+                        Some(body) => {
+                            let _ = write_http_json(&mut tls, 200, "OK", &body).await;
+                        }
+                        None => {
+                            let _ = write_http_json(
+                                &mut tls,
+                                404,
+                                "Not Found",
+                                &json!({"error": "not_found"}),
+                            )
+                            .await;
+                        }
+                    }
+                    return;
+                }
+
+                // POST /v1/inbox/ack
+                if req.method == "POST" && req.path == "/v1/inbox/ack" {
+                    let Some((_, caller_did)) = extract_caller_account_and_device(&req.headers)
+                    else {
+                        let _ = write_http_json(
+                            &mut tls,
+                            401,
+                            "Unauthorized",
+                            &json!({"error": "unauthorized"}),
+                        )
+                        .await;
+                        return;
+                    };
+                    let Ok(parsed): Result<Value, _> = serde_json::from_slice(&req.body) else {
+                        let _ = write_http_json(
+                            &mut tls,
+                            400,
+                            "Bad Request",
+                            &json!({"error": "bad_json"}),
+                        )
+                        .await;
+                        return;
+                    };
+                    let ack_ids: Vec<u64> = parsed
+                        .get("drop_ids")
+                        .and_then(Value::as_array)
+                        .map(|arr| arr.iter().filter_map(Value::as_u64).collect())
+                        .unwrap_or_default();
+                    let removed = {
+                        let Ok(mut st) = st_c.lock() else {
+                            return;
+                        };
+                        if let Some(list) = st.drops_by_device.get_mut(&caller_did) {
+                            let before = list.len();
+                            list.retain(|d| {
+                                let id = d.get("drop_id").and_then(Value::as_u64).unwrap_or(0);
+                                !ack_ids.contains(&id)
+                            });
+                            before.saturating_sub(list.len()) as u64
+                        } else {
+                            0u64
+                        }
+                    };
+                    let _ = write_http_json(
+                        &mut tls,
+                        200,
+                        "OK",
+                        &json!({
+                            "acked": removed,
+                            "pruned_drops": removed,
+                        }),
+                    )
+                    .await;
+                    return;
+                }
+
+                // POST /v1/inbox/:recipient
+                if req.method == "POST"
+                    && let Some(recip_str) = req.path.strip_prefix("/v1/inbox/")
+                    && !recip_str.contains('/')
+                    && let Ok(_recip_aid) = recip_str.parse::<u64>()
+                {
+                    let Some((sender_aid, sender_did)) =
+                        extract_caller_account_and_device(&req.headers)
+                    else {
+                        let _ = write_http_json(
+                            &mut tls,
+                            401,
+                            "Unauthorized",
+                            &json!({"error": "unauthorized"}),
+                        )
+                        .await;
+                        return;
+                    };
+                    let Ok(parsed): Result<Value, _> = serde_json::from_slice(&req.body) else {
+                        let _ = write_http_json(
+                            &mut tls,
+                            400,
+                            "Bad Request",
+                            &json!({"error": "bad_json"}),
+                        )
+                        .await;
+                        return;
+                    };
+                    let wrapped = parsed
+                        .get("wrapped_keys")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let created_at_ms = outpost_control::wall_now_ms();
+                    let (drop_id, delivered) = {
+                        let Ok(mut st) = st_c.lock() else {
+                            return;
+                        };
+                        let id = st.next_drop_id;
+                        st.next_drop_id = st.next_drop_id.saturating_add(1);
+                        let mut delivered = 0u64;
+                        for wk in &wrapped {
+                            if let (Some(target_did), Some(wk_b64)) = (
+                                wk.get("device_id").and_then(Value::as_u64),
+                                wk.get("wrapped_key_b64").and_then(Value::as_str),
+                            ) {
+                                let item = json!({
+                                    "drop_id": id,
+                                    "sender_account_id": sender_aid,
+                                    "sender_device_id": sender_did,
+                                    "msg_id_b64": parsed.get("msg_id_b64").cloned().unwrap_or(Value::Null),
+                                    "suite": parsed.get("suite").cloned().unwrap_or(json!(1)),
+                                    "sender_cwt_b64": parsed.get("sender_cwt_b64").cloned().unwrap_or(Value::Null),
+                                    "sender_enc_cert_b64": parsed.get("sender_enc_cert_b64").cloned().unwrap_or(Value::Null),
+                                    "ciphertext_b64": parsed.get("ciphertext_b64").cloned().unwrap_or(Value::Null),
+                                    "wrapped_key_b64": wk_b64,
+                                    "created_at_ms": created_at_ms,
+                                    "expires_at_ms": parsed.get("expires_at_ms").cloned().unwrap_or(json!(0)),
+                                });
+                                st.drops_by_device.entry(target_did).or_default().push(item);
+                                delivered = delivered.saturating_add(1);
+                            }
+                        }
+                        (id, delivered)
+                    };
+                    let _ = write_http_json(
+                        &mut tls,
+                        201,
+                        "Created",
+                        &json!({
+                            "drop_id": drop_id,
+                            "delivered_devices": delivered,
+                            "idempotent": false,
+                        }),
+                    )
+                    .await;
+                    return;
+                }
+
+                // GET /v1/inbox
+                if req.method == "GET" && req.path == "/v1/inbox" {
+                    let Some((_, caller_did)) = extract_caller_account_and_device(&req.headers)
+                    else {
+                        let _ = write_http_json(
+                            &mut tls,
+                            401,
+                            "Unauthorized",
+                            &json!({"error": "unauthorized"}),
+                        )
+                        .await;
+                        return;
+                    };
+                    let drops = {
+                        let Ok(st) = st_c.lock() else {
+                            return;
+                        };
+                        st.drops_by_device
+                            .get(&caller_did)
+                            .cloned()
+                            .unwrap_or_default()
+                    };
+                    let _ = write_http_json(&mut tls, 200, "OK", &json!({ "drops": drops })).await;
+                    return;
+                }
+
+                let _ = write_http_json(
+                    &mut tls,
+                    404,
+                    "Not Found",
+                    &json!({"error": "not_found", "path": req.path}),
+                )
+                .await;
+            });
+        }
+    });
+
+    let ca_path = root_tmp.path().join("inbox_ca.pem");
+    std::fs::write(&ca_path, cert_pem).map_err(|e| format!("write inbox ca: {e}"))?;
+    let addr_str = addr.to_string();
+    let ca_str = ca_path.to_string_lossy().into_owned();
+    let home_str = iso_home.to_string_lossy().into_owned();
+    let xdg_str = iso_xdg.to_string_lossy().into_owned();
+    let env_vars = [
+        ("OUTPOST_TEST_CONNECT_ADDR", addr_str.as_str()),
+        ("OUTPOST_TEST_CA_PEM", ca_str.as_str()),
+        ("HOME", home_str.as_str()),
+        ("XDG_CONFIG_HOME", xdg_str.as_str()),
+    ];
+
+    let result: Result<(), String> = (|| {
+        // 1. Both Alice and Bob run `inbox init-key`.
+        for (label, st, rt) in [("alice", &alice_st, &alice_rt), ("bob", &bob_st, &bob_rt)] {
+            let init_out = run_bin(st, rt, &["--json", "inbox", "init-key"], None, &env_vars)?;
+            if !init_out.status_ok {
+                return Err(format!("{label} inbox init-key failed: {}", init_out.stderr));
+            }
+            let init_j: Value = serde_json::from_str(&init_out.stdout)
+                .map_err(|e| format!("{label} parse init-key json: {e}"))?;
+            if init_j
+                .get("enc_pk_b64")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .is_empty()
+            {
+                return Err(format!("{label} missing enc_pk_b64 in init-key output: {init_j}"));
+            }
+        }
+
+        // 2. Alice sends an E2EE dead-drop to Bob (account_id=102).
+        let msg_text = "Async E2EE handoff from Alice!";
+        let send_out = run_bin(
+            &alice_st,
+            &alice_rt,
+            &["--json", "inbox", "send", "102", msg_text],
+            None,
+            &env_vars,
+        )?;
+        if !send_out.status_ok {
+            return Err(format!("alice inbox send failed: {}", send_out.stderr));
+        }
+        let send_j: Value = serde_json::from_str(&send_out.stdout)
+            .map_err(|e| format!("parse inbox send json: {e}"))?;
+        if send_j.get("drop_id").and_then(Value::as_u64) != Some(1)
+            || send_j.get("delivered_devices").and_then(Value::as_u64) != Some(1)
+        {
+            return Err(format!("unexpected inbox send response: {send_j}"));
+        }
+
+        // 3. Outbound secret refusal on `inbox send` with `mprk1_...` (both stdin scanner & argv guard!).
+        let alice_rk = mp_protocol::encode_recovery_key(&alice_root_seed);
+        let secret_body = format!("leaked key: {alice_rk}");
+        let refused_stdin = run_bin(
+            &alice_st,
+            &alice_rt,
+            &["inbox", "send", "102", "--stdin"],
+            Some(secret_body.as_bytes()),
+            &env_vars,
+        )?;
+        if refused_stdin.status_ok {
+            return Err("inbox send --stdin MUST refuse mprk1_ recovery key!".to_string());
+        }
+        let refused_argv = run_bin(
+            &alice_st,
+            &alice_rt,
+            &["inbox", "send", "102", &secret_body],
+            None,
+            &env_vars,
+        )?;
+        if refused_argv.status_ok {
+            return Err("inbox send argv MUST refuse mprk1_ recovery key!".to_string());
+        }
+
+        // 4. Bob reads and acks his inbox -> exact decrypted plaintext + sender_account_id + safety_number!
+        let read1 = run_bin(
+            &bob_st,
+            &bob_rt,
+            &["inbox", "read", "--ack", "--json"],
+            None,
+            &env_vars,
+        )?;
+        if !read1.status_ok {
+            return Err(format!("bob inbox read --ack failed: {}", read1.stderr));
+        }
+        let read1_j: Value = serde_json::from_str(&read1.stdout)
+            .map_err(|e| format!("parse bob inbox read json: {e}"))?;
+        let drops = read1_j
+            .get("drops")
+            .and_then(Value::as_array)
+            .ok_or("missing drops array")?;
+        if drops.len() != 1 {
+            return Err(format!("expected 1 decrypted drop, got {}: {read1_j}", drops.len()));
+        }
+        let expected_alice_sn = compute_safety_number(101, &alice.root_pubkey);
+        if read1_j.pointer("/drops/0/body").and_then(Value::as_str) != Some(msg_text)
+            || read1_j
+                .pointer("/drops/0/sender_account_id")
+                .and_then(Value::as_u64)
+                != Some(101)
+            || read1_j
+                .pointer("/drops/0/safety_number")
+                .and_then(Value::as_str)
+                != Some(expected_alice_sn.as_str())
+            || read1_j.pointer("/ack/acked").and_then(Value::as_u64) != Some(1)
+        {
+            return Err(format!("unexpected bob inbox read payload: {read1_j}"));
+        }
+
+        // 5. Second inbox read on Bob returns 0 drops!
+        let read2 = run_bin(
+            &bob_st,
+            &bob_rt,
+            &["inbox", "read", "--json"],
+            None,
+            &env_vars,
+        )?;
+        if !read2.status_ok {
+            return Err(format!("bob second inbox read failed: {}", read2.stderr));
+        }
+        let read2_j: Value = serde_json::from_str(&read2.stdout)
+            .map_err(|e| format!("parse bob second inbox read json: {e}"))?;
+        let drops2 = read2_j
+            .get("drops")
+            .and_then(Value::as_array)
+            .ok_or("missing drops array on second read")?;
+        if !drops2.is_empty() {
+            return Err(format!("expected 0 drops after ack, got {}", drops2.len()));
+        }
+
+        // 6. `account emergency-kit --out <tmp.html>` (mode 0600, zero <script>, zero http(s)://,
+        //    contains mprk1_, refuses overwrite without --force, NEVER prints mprk1_ on stdout!).
+        let rk_file = root_tmp.path().join("alice_root.key");
+        std::fs::write(&rk_file, format!("{alice_rk}\n"))
+            .map_err(|e| format!("write root key file: {e}"))?;
+        std::fs::set_permissions(&rk_file, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod 0600 root key file: {e}"))?;
+        let kit_path = root_tmp.path().join("alice-emergency-kit.html");
+        let rk_str = rk_file.to_string_lossy().into_owned();
+        let kit_str = kit_path.to_string_lossy().into_owned();
+
+        let kit_out = run_bin(
+            &alice_st,
+            &alice_rt,
+            &[
+                "account",
+                "emergency-kit",
+                "--root-key-file",
+                &rk_str,
+                "--account-id",
+                "101",
+                "--handle",
+                "alice",
+                "--out",
+                &kit_str,
+            ],
+            None,
+            &env_vars,
+        )?;
+        if !kit_out.status_ok {
+            return Err(format!("account emergency-kit failed: {}", kit_out.stderr));
+        }
+        if kit_out.stdout.contains("mprk1_") || kit_out.stderr.contains("mprk1_") {
+            return Err("account emergency-kit MUST NEVER emit mprk1_ on stdout/stderr!".to_string());
+        }
+        let meta = std::fs::metadata(&kit_path)
+            .map_err(|e| format!("stat emergency kit html: {e}"))?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(format!("expected emergency kit mode 0600, got {:04o}", mode));
+        }
+        let html = std::fs::read_to_string(&kit_path)
+            .map_err(|e| format!("read emergency kit html: {e}"))?;
+        if html.contains("<script")
+            || html.contains("http://")
+            || html.contains("https://")
+            || !html.contains("mprk1_")
+        {
+            return Err("emergency kit HTML violated zero-JS / zero-URL / mprk1_ invariants".to_string());
+        }
+
+        // Refuses overwrite without --force!
+        let overwrite_refused = run_bin(
+            &alice_st,
+            &alice_rt,
+            &[
+                "account",
+                "emergency-kit",
+                "--root-key-file",
+                &rk_str,
+                "--account-id",
+                "101",
+                "--handle",
+                "alice",
+                "--out",
+                &kit_str,
+            ],
+            None,
+            &env_vars,
+        )?;
+        if overwrite_refused.status_ok {
+            return Err("account emergency-kit MUST refuse overwrite without --force!".to_string());
+        }
+
+        // 7. `policy status --json` and `doctor --json` report policy.brakes and policy.party_trust.
+        let pol_out = run_bin(
+            &alice_st,
+            &alice_rt,
+            &["policy", "status", "--json"],
+            None,
+            &env_vars,
+        )?;
+        if !pol_out.status_ok {
+            return Err(format!("policy status --json failed: {}", pol_out.stderr));
+        }
+        let pol_j: Value = serde_json::from_str(&pol_out.stdout)
+            .map_err(|e| format!("parse policy status json: {e}"))?;
+        if pol_j.pointer("/brakes/default_profile").and_then(Value::as_str).is_none()
+            || pol_j
+                .pointer("/party_trust/max_default_profile")
+                .and_then(Value::as_str)
+                .is_none()
+        {
+            return Err(format!("policy status --json missing brakes/party_trust: {pol_j}"));
+        }
+
+        let relay_url = format!("https://{TEST_AUTHORITY}");
+        let doc_out = run_bin(
+            &alice_st,
+            &alice_rt,
+            &[
+                "--json",
+                "doctor",
+                "--api-authority",
+                TEST_AUTHORITY,
+                "--relay-url",
+                &relay_url,
+            ],
+            None,
+            &env_vars,
+        )?;
+        if !doc_out.status_ok {
+            return Err(format!("doctor --json failed: {}", doc_out.stderr));
+        }
+        let doc_j: Value = serde_json::from_str(&doc_out.stdout)
+            .map_err(|e| format!("parse doctor json: {e}"))?;
+        if doc_j.pointer("/policy/ok").and_then(Value::as_bool) != Some(true)
+            || doc_j
+                .pointer("/policy/brakes/default_profile")
+                .and_then(Value::as_str)
+                .is_none()
+            || doc_j
+                .pointer("/policy/party_trust/max_default_profile")
+                .and_then(Value::as_str)
+                .is_none()
+        {
+            return Err(format!("doctor --json missing policy.brakes / policy.party_trust: {doc_j}"));
+        }
+
+        // 8. `mp-outpost mcp` `tools/list` returns 12 tools including inbox_send, inbox_read, inbox_ack.
+        let mut mcp = McpProc::spawn(&alice_st, &alice_rt, &env_vars)?;
+        mcp.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "oracle8", "version": "0.5.0" }
+            }
+        }))?;
+        let _ = mcp.recv()?;
+        mcp.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))?;
+        let list_resp = mcp.recv()?;
+        let tools = list_resp
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .ok_or("missing tools array in oracle8 mcp tools/list")?;
+        if tools.len() != 17 {
+            return Err(format!("expected 17 MCP tools, got {}", tools.len()));
+        }
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+        for required in ["inbox_send", "inbox_read", "inbox_ack"] {
+            if !names.contains(&required) {
+                return Err(format!("missing MCP tool '{required}' in tools/list: {names:?}"));
+            }
+        }
+        let (mcp_ok, _) = mcp.close_stdin_and_wait()?;
+        if !mcp_ok {
+            return Err("mcp did not exit cleanly on EOF in oracle8".to_string());
+        }
+
+        Ok(())
+    })();
+
     server_task.abort();
     result
 }

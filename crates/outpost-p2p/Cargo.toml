@@ -13,6 +13,7 @@ mp-protocol.workspace = true
 outpost-core = { path = "../outpost-core" }
 tokio.workspace = true
 url = "2.5"
+zeroize.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 iroh = { version = "1.5.0", default-features = false, features = ["tls-ring", "fast-apple-datapath"] }

@@ -12,6 +12,7 @@ use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd as _, RawFd};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -120,7 +121,13 @@ pub fn reject_secrets_in_argv(args: &[String]) -> Result<(), String> {
 
     for a in args.iter().skip(1) {
         let lower = a.to_ascii_lowercase();
-        if lower == "--pin" || lower.starts_with("--pin=") {
+        if lower == "--pin"
+            || lower.starts_with("--pin=")
+            || lower.starts_with("--pin ")
+            || lower == "-pin"
+            || lower.starts_with("-pin=")
+            || lower.starts_with("-pin ")
+        {
             return Err(
                 "PINs are forbidden on CLI argv (use hidden /dev/tty prompt or --pin-stdin)"
                     .to_string(),
@@ -228,6 +235,7 @@ pub(crate) fn redact_unknown_arg(arg: &str) -> String {
             || fl == "--recovery-key"
             || fl == "--invite-secret"
             || fl == "--pin"
+            || fl == "-pin"
             || fl == "--token"
             || fl == "--secret"
             || fl == "--key"
@@ -381,7 +389,13 @@ pub async fn run_cli_command(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        "login" => cmd_login(&opts, sub).await,
+        "login" => {
+            if sub.iter().any(|a| a == "--code" || a == "--web") {
+                crate::auth_ux::run_login_cmd(&opts, sub).await
+            } else {
+                cmd_login(&opts, sub).await
+            }
+        }
         "chat" => crate::chat::cmd_chat(&opts, sub).await,
         "invite" => cmd_invite(&opts, sub).await,
         "join" => cmd_join(&opts, sub).await,
@@ -389,9 +403,12 @@ pub async fn run_cli_command(args: &[String]) -> Result<(), String> {
         "friends" => cmd_friends_live(&opts, sub).await,
         "add" => cmd_add_friend(&opts, sub).await,
         "account" => cmd_account(&opts, sub).await,
+        "add-device" => crate::auth_ux::run_add_device_cmd(&opts, sub).await,
         "whoami" => cmd_whoami(&opts, sub),
         "device" => cmd_device(&opts, sub).await,
         "web" => cmd_web(&opts, sub).await,
+        "inbox" => crate::inbox::run_inbox_cmd(&opts, sub).await,
+        "policy" => crate::policy_loader::run_policy_cmd(&opts, sub),
         "doctor" => cmd_doctor(&opts, sub).await,
         "relays" => cmd_relays(&opts, sub).await,
         "lan" => crate::lan::run_lan(&opts, sub).await,
@@ -430,15 +447,18 @@ Global Flags:\n\
   --runtime-dir <path>    Override runtime directory (or OUTPOST_RUNTIME_DIR)\n\
   --device-id <u64>       Select device ID (or OUTPOST_DEVICE_ID)\n\n\
 Advanced Commands:\n\
+  add-device [--root-key-file <path>] [--device-label <name>]\n\
   whoami [--safety-number]\n\
   peers list|verify|trust|revoke\n\
   party status|list|members|say|read|wait|create|join|invite|leave|disband\n\
   board post|read\n\
   friend list|add|accept|deny|decline|remove|block <@handle>\n\
   lan status|scan|host|join\n\
+  inbox init-key|send|read|ack\n\
+  policy status\n\
   mcp [setup [--client claude|codex|cursor|antigravity|hermes|gemini|opencode|zed|all] [--write] [--config <path>] [--global]]\n\
   daemon status|start|stop|restart|logs\n\
-  account register|rename|recovery-key|export-mpkey|recover\n\
+  account register|rename|recovery-key|export-mpkey|emergency-kit|recover\n\
   device init|install-cwt|enroll|renew|revoke|link <create|join|approve>\n\
   web approve <XXXX-XXXX>\n\
   doctor | relays | upgrade"
@@ -1697,7 +1717,7 @@ async fn cmd_add_friend(opts: &GlobalOpts, args: &[String]) -> Result<(), String
 async fn cmd_account(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     let Some(sub) = args.first().map(String::as_str) else {
         return Err(
-            "usage: mp-outpost account <register|rename|recovery-key|export-mpkey|recover> ..."
+            "usage: mp-outpost account <register|rename|recovery-key|export-mpkey|emergency-kit|recover> ..."
                 .to_string(),
         );
     };
@@ -1707,6 +1727,7 @@ async fn cmd_account(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
         "rename" => cmd_account_rename(opts, rest).await,
         "recovery-key" => cmd_account_recovery_key(opts, rest),
         "export-mpkey" => cmd_account_export_mpkey(opts, rest),
+        "emergency-kit" => crate::auth_ux::run_emergency_kit_cmd(opts, rest),
         "recover" => cmd_account_recover(opts, rest).await,
         other => Err(format!("unknown account subcommand '{other}'")),
     }
@@ -4580,6 +4601,10 @@ async fn cmd_party(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                 }
             }
 
+            if group_id.is_some() && org_id.is_none() {
+                return Err("--group-id requires --org-id".to_string());
+            }
+
             let req = PartyCreateReq {
                 visibility: visibility as u8,
                 join_mode: join_mode as u8,
@@ -6147,11 +6172,21 @@ async fn cmd_relays(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
         .collect();
 
     if ping {
+        let sem = Arc::new(tokio::sync::Semaphore::new(6));
         let mut join_set = tokio::task::JoinSet::new();
         for row in &rows {
             let idx = row.orig_idx;
             let url = row.url.clone();
+            let sem_c = Arc::clone(&sem);
             join_set.spawn(async move {
+                let Ok(_permit) = sem_c.acquire_owned().await else {
+                    return (
+                        idx,
+                        false,
+                        None,
+                        Some("probe concurrency semaphore closed".to_string()),
+                    );
+                };
                 let auth = extract_https_authority_from_url(&url)
                     .unwrap_or(DEFAULT_API_AUTHORITY)
                     .to_string();
@@ -6518,6 +6553,36 @@ async fn cmd_doctor(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
         }),
     };
 
+    // 5. Unified policy check (`/etc/multiplayer/policy.toml`, user policy, env overrides)
+    let policy_res = crate::policy_loader::load_effective_unified_policy();
+    let policy_json = match &policy_res {
+        Ok(loaded) => json!({
+            "ok": true,
+            "system_policy_loaded": loaded.system_policy_loaded,
+            "legacy_system_lan_loaded": loaded.legacy_system_lan_loaded,
+            "user_policy_loaded": loaded.user_policy_loaded,
+            "legacy_user_lan_loaded": loaded.legacy_user_lan_loaded,
+            "brakes": {
+                "min_profile": loaded.effective.brakes.min_profile.as_str(),
+                "default_profile": loaded.effective.brakes.default_profile.as_str(),
+                "active_profile": loaded.effective.brakes.active_profile.as_str(),
+            },
+            "party_trust": {
+                "max_default_profile": loaded.effective.party_trust.max_default_profile.as_str(),
+                "max_peer_override": loaded.effective.party_trust.max_peer_override.as_str(),
+                "max_external_guest_profile": loaded.effective.party_trust.max_external_guest_profile.as_str(),
+            },
+            "lan": {
+                "disabled": loaded.effective.lan.config.disabled,
+                "require_pin": loaded.effective.lan.config.require_pin,
+            },
+        }),
+        Err(err) => json!({
+            "ok": false,
+            "error": sanitize_cli_meta(err),
+        }),
+    };
+
     if opts.json {
         print_json(&json!({
             "binary": {
@@ -6533,6 +6598,7 @@ async fn cmd_doctor(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
             "daemon": daemon_json,
             "control_plane": control_json,
             "relay": relay_json,
+            "policy": policy_json,
         }));
     } else {
         println!("mp-outpost doctor (v{PKG_VERSION})");
@@ -6643,6 +6709,20 @@ async fn cmd_doctor(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                         .unwrap_or("unknown")
                 )
             );
+        }
+        match &policy_res {
+            Ok(loaded) => {
+                println!(
+                    "  policy:               ok (brakes.default_profile={}, party_trust.max_default_profile={}, lan.disabled={}, system_policy_loaded={})",
+                    loaded.effective.brakes.default_profile.as_str(),
+                    loaded.effective.party_trust.max_default_profile.as_str(),
+                    loaded.effective.lan.config.disabled,
+                    loaded.system_policy_loaded,
+                );
+            }
+            Err(err) => {
+                println!("  policy:               ERROR ({})", sanitize_cli_meta(err));
+            }
         }
     }
     Ok(())
@@ -6920,12 +7000,17 @@ mod tests {
         assert!(!err.is_empty());
         assert!(!err.contains("supersecret999"));
 
-        // --pin and --pin=... (case-insensitive) MUST be rejected without echoing value!
+        // --pin, --pin=..., --pin ..., -pin, -pin=..., -pin ... (case-insensitive) MUST be rejected without echoing value!
         for bad_pin in [
             vec!["mp-outpost", "lan", "host", "--pin", "424242"],
             vec!["mp-outpost", "lan", "host", "--pin=424242"],
             vec!["mp-outpost", "lan", "join", "--PIN=424242"],
             vec!["mp-outpost", "lan", "join", "--PIN", "424242"],
+            vec!["mp-outpost", "lan", "host", "--pin 424242"],
+            vec!["mp-outpost", "lan", "join", "-pin", "424242"],
+            vec!["mp-outpost", "lan", "join", "-pin=424242"],
+            vec!["mp-outpost", "lan", "join", "-PIN=424242"],
+            vec!["mp-outpost", "lan", "join", "-PIN 424242"],
         ] {
             let pin_err = reject_secrets_in_argv(&s(&bad_pin))
                 .err()

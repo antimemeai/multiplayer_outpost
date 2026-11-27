@@ -2142,18 +2142,21 @@ fn v040_lan_pin_rate_limiter_5_peer_and_15_lobby_lockouts() {
     rl.record_success(&p1);
     assert!(rl.is_peer_locked(&p1));
 
-    // Peer 2: 2 failures then success clears peer_failures but preserves total_failures
+    // Peer 2: 2 failures then success RETAINS cumulative peer_failures and total_failures (G3-L1-3)
     assert_eq!(rl.record_failure(&p2), LanPinLockoutStatus::Allowed);
     assert_eq!(rl.record_failure(&p2), LanPinLockoutStatus::Allowed);
     rl.record_success(&p2);
-    assert_eq!(rl.peer_failures(&p2), 0);
+    assert_eq!(rl.peer_failures(&p2), 2);
     assert_eq!(rl.total_failures(), 7);
 
-    // Push total failures across p2 (4 more -> 11) and p3 (4 more -> 15 => LobbyLocked!)
+    // 2 more failures -> 4 cumulative (Allowed), 5th cumulative -> PeerLocked (total = 10)
+    assert_eq!(rl.record_failure(&p2), LanPinLockoutStatus::Allowed);
+    assert_eq!(rl.record_failure(&p2), LanPinLockoutStatus::Allowed);
+    assert_eq!(rl.record_failure(&p2), LanPinLockoutStatus::PeerLocked);
+    assert_eq!(rl.total_failures(), 10);
+
+    // Push total failures across p3 (4 -> 14 Allowed, 5th -> 15 LobbyLocked!)
     for _ in 0..4 {
-        assert_eq!(rl.record_failure(&p2), LanPinLockoutStatus::Allowed);
-    }
-    for _ in 0..3 {
         assert_eq!(rl.record_failure(&p3), LanPinLockoutStatus::Allowed);
     }
     assert_eq!(rl.total_failures(), 14);
@@ -2267,12 +2270,15 @@ fn v040_lan_mdns_txt_packet_goodbye_pointer_loop_and_direct_target() {
     };
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+    let beacon_host_pk = SigningKey::from_bytes(&[0x33; 32])
+        .verifying_key()
+        .to_bytes();
     let beacon = LanBeaconRecord {
         version: LAN_BEACON_VERSION,
         lan_party_id: "0102030405060708".to_string(),
         lobby_name: "LAN Night".to_string(),
         host_name: "alice".to_string(),
-        host_pubkey: [0x33; 32],
+        host_pubkey: beacon_host_pk,
         require_pin: true,
         alpn: LAN_BEACON_ALPN.to_string(),
     };
@@ -2413,3 +2419,1063 @@ fn v040_lan_mdns_txt_packet_goodbye_pointer_loop_and_direct_target() {
 
 
 
+
+// ---------------------------------------------------------------------------
+// 12. Gate #3 Lane 1 Regression Oracles (`lan_protocol.rs`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gate3_l1_json_non_ascii_linear_time_and_string_cap() {
+    use outpost_core::lan_protocol::{
+        LanProtocolError, MAX_JSON_STRING_BYTES, decode_lan_handshake_frame,
+    };
+
+    // 1. 64 KiB single non-ASCII string (`é` x 32,000 = 64,000 UTF-8 bytes) MUST reject
+    //    via MAX_JSON_STRING_BYTES cap in O(1)/linear time (< 50 ms).
+    let mut big_single = vec![0x01, 0x11, 0x00, 0x00];
+    big_single.extend_from_slice(br#"{"lan_party_id":"0102030405060708","display_name":""#);
+    for _ in 0..32_000 {
+        big_single.extend_from_slice("é".as_bytes());
+    }
+    big_single.extend_from_slice(br#"","account_id":0}"#);
+    assert!(big_single.len() <= 65_536);
+
+    let t0 = std::time::Instant::now();
+    assert_eq!(
+        decode_lan_handshake_frame(P2pLane::Control, &big_single),
+        Err(LanProtocolError::FrameInvalidJson)
+    );
+    let elapsed_single = t0.elapsed();
+    assert!(
+        elapsed_single < std::time::Duration::from_millis(50),
+        "64 KiB single non-ASCII string decode took {elapsed_single:?} (budget < 50 ms)"
+    );
+
+    // 2. Multi-field ~64 KiB payload where EVERY string is <= MAX_JSON_STRING_BYTES (4000 B of `é` x 15)
+    //    forces the parser to scan ~60 KiB of non-ASCII UTF-8 bytes: MUST finish in O(N) (< 50 ms)!
+    let mut big_multi = vec![0x01, 0x11, 0x00, 0x00];
+    big_multi.extend_from_slice(br#"{"#);
+    let chunk_2000_e = "é".repeat(2000); // 4000 UTF-8 bytes <= MAX_JSON_STRING_BYTES
+    assert_eq!(chunk_2000_e.len(), 4000);
+    assert!(chunk_2000_e.len() <= MAX_JSON_STRING_BYTES);
+    for i in 0..15 {
+        if i > 0 {
+            big_multi.push(b',');
+        }
+        big_multi.extend_from_slice(format!("\"k{i}\":\"{chunk_2000_e}\"").as_bytes());
+    }
+    big_multi.push(b'}');
+    assert!(big_multi.len() > 60_000 && big_multi.len() <= 65_536);
+
+    let t1 = std::time::Instant::now();
+    assert_eq!(
+        decode_lan_handshake_frame(P2pLane::Control, &big_multi),
+        Err(LanProtocolError::FrameInvalidField)
+    );
+    let elapsed_multi = t1.elapsed();
+    assert!(
+        elapsed_multi < std::time::Duration::from_millis(50),
+        "60 KiB multi-field non-ASCII JSON decode took {elapsed_multi:?} (budget < 50 ms)"
+    );
+}
+
+#[test]
+fn gate3_l1_ipv4_mapped_ipv6_and_strict_beacon_pubkey() {
+    use outpost_core::lan_protocol::{
+        LAN_BEACON_ALPN, LAN_BEACON_VERSION, LanBeaconRecord, LanMdnsAnnouncement,
+        LanProtocolError, decode_lan_pubkey_base64url, encode_lan_announcement,
+        encode_lan_pubkey_base64url, parse_lan_direct_target, validate_lan_beacon_record,
+    };
+    use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+
+    // 1. IPv4-mapped IPv6 unspecified/multicast/broadcast MUST be rejected; private unicast allowed.
+    for bad in [
+        "[::ffff:0.0.0.0]:51515",
+        "[::ffff:0.1.2.3]:51515",
+        "[::ffff:224.0.0.1]:51515",
+        "[::ffff:224.0.0.251]:5353",
+        "[::ffff:239.255.255.250]:1900",
+        "[::ffff:255.255.255.255]:51515",
+    ] {
+        assert_eq!(
+            parse_lan_direct_target(bad),
+            Err(LanProtocolError::InvalidDirectTarget),
+            "must reject IPv4-mapped IPv6 target {bad}"
+        );
+    }
+    assert!(parse_lan_direct_target("[::ffff:192.168.1.42]:51515").is_ok());
+
+    let valid_pk = SigningKey::from_bytes(&[0x33; 32])
+        .verifying_key()
+        .to_bytes();
+    let valid_beacon = LanBeaconRecord {
+        version: LAN_BEACON_VERSION,
+        lan_party_id: "0102030405060708".to_string(),
+        lobby_name: "LAN Night".to_string(),
+        host_name: "alice".to_string(),
+        host_pubkey: valid_pk,
+        require_pin: true,
+        alpn: LAN_BEACON_ALPN.to_string(),
+    };
+    let bad_mapped_ann = LanMdnsAnnouncement {
+        beacon: valid_beacon.clone(),
+        service_port: 51515,
+        addrs: vec![SocketAddr::new(
+            IpAddr::V6("::ffff:224.0.0.1".parse::<Ipv6Addr>().unwrap()),
+            51515,
+        )],
+        ttl_sec: 120,
+    };
+    assert_eq!(
+        encode_lan_announcement(&bad_mapped_ann),
+        Err(LanProtocolError::DnsInvalidRecord)
+    );
+
+    // 2. Strict Ed25519 pubkey validation in decode_lan_pubkey_base64url & validate_lan_beacon_record:
+    //    synthetic [0x33; 32], all-zero, identity, order-2, order-8 torsion, and non-canonical Y >= p rejected!
+    let mut non_canonical = [0xffu8; 32];
+    non_canonical[0] = 0xed;
+    non_canonical[31] = 0x7f;
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    let mut order2 = [0xffu8; 32];
+    order2[0] = 0xec;
+    order2[31] = 0x7f;
+    let order8: [u8; 32] = [
+        0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67,
+        0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac,
+        0x03, 0x7a,
+    ];
+
+    for bad_pk in [[0u8; 32], [0x33; 32], identity, order2, order8, non_canonical] {
+        let b64 = encode_lan_pubkey_base64url(&bad_pk);
+        assert_eq!(
+            decode_lan_pubkey_base64url(&b64),
+            Err(LanProtocolError::BeaconInvalidPubkey),
+            "decode_lan_pubkey_base64url must reject invalid/weak pubkey {}",
+            to_hex(&bad_pk)
+        );
+        let bad_beacon = LanBeaconRecord {
+            host_pubkey: bad_pk,
+            ..valid_beacon.clone()
+        };
+        assert_eq!(
+            validate_lan_beacon_record(&bad_beacon),
+            Err(LanProtocolError::BeaconInvalidPubkey),
+            "validate_lan_beacon_record must reject invalid/weak pubkey {}",
+            to_hex(&bad_pk)
+        );
+    }
+
+    assert_eq!(
+        decode_lan_pubkey_base64url(&encode_lan_pubkey_base64url(&valid_pk)),
+        Ok(valid_pk)
+    );
+    assert!(validate_lan_beacon_record(&valid_beacon).is_ok());
+}
+
+#[test]
+fn gate3_l1_partial_policy_timeouts_pin_ignorable_and_case_insensitive_txt() {
+    use outpost_core::lan_protocol::{
+        LAN_BEACON_ALPN, LAN_BEACON_VERSION, LanBeaconRecord, LanProtocolError,
+        MAX_LAN_IDLE_TIMEOUT_SEC, MAX_LAN_SCAN_TIMEOUT_SEC, decode_lan_txt_record,
+        encode_lan_pubkey_base64url, parse_partial_lan_policy_toml, resolve_lan_policy,
+        validate_lan_pin,
+    };
+
+    // 1. System policy omitting timeouts MUST NOT cap user timeout or explicit CLI `--timeout 600` / `30`!
+    let sys_no_timeout = parse_partial_lan_policy_toml("[lan]\nrequire_pin = true\n").unwrap();
+    assert_eq!(sys_no_timeout.idle_timeout_sec, None);
+    assert_eq!(sys_no_timeout.scan_timeout_sec, None);
+
+    let eff_no_user = resolve_lan_policy(Some(&sys_no_timeout), None, false);
+    assert!(eff_no_user.config.require_pin);
+    assert_eq!(eff_no_user.config.idle_timeout_sec, 300);
+    assert_eq!(eff_no_user.max_idle_timeout_sec, MAX_LAN_IDLE_TIMEOUT_SEC);
+    assert_eq!(eff_no_user.max_scan_timeout_sec, MAX_LAN_SCAN_TIMEOUT_SEC);
+    assert_eq!(eff_no_user.effective_idle_timeout(Some(600)), 600);
+    assert_eq!(eff_no_user.effective_scan_timeout(Some(30)), 30);
+
+    let usr_higher = parse_partial_lan_policy_toml(
+        "[lan]\nidle_timeout_sec = 600\nscan_timeout_sec = 30\n",
+    )
+    .unwrap();
+    let eff_with_user = resolve_lan_policy(Some(&sys_no_timeout), Some(&usr_higher), false);
+    assert!(eff_with_user.config.require_pin);
+    assert_eq!(eff_with_user.config.idle_timeout_sec, 600);
+    assert_eq!(eff_with_user.config.scan_timeout_sec, 30);
+
+    // System policy WITH explicit timeout DOES cap both user & CLI!
+    let sys_capped = parse_partial_lan_policy_toml(
+        "[lan]\nrequire_pin = true\nidle_timeout_sec = 120\nscan_timeout_sec = 10\n",
+    )
+    .unwrap();
+    let eff_capped = resolve_lan_policy(Some(&sys_capped), Some(&usr_higher), false);
+    assert_eq!(eff_capped.config.idle_timeout_sec, 120);
+    assert_eq!(eff_capped.max_idle_timeout_sec, 120);
+    assert_eq!(eff_capped.effective_idle_timeout(Some(600)), 120);
+    assert_eq!(eff_capped.config.scan_timeout_sec, 10);
+    assert_eq!(eff_capped.effective_scan_timeout(Some(30)), 10);
+
+    // 2. Full BiDi / ignorable PIN character rejection
+    for ch in [
+        '\u{00AD}', '\u{061C}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}',
+        '\u{2060}', '\u{2061}', '\u{2062}', '\u{2063}', '\u{2064}', '\u{FEFF}',
+    ] {
+        let pin = format!("42{ch}42");
+        assert_eq!(
+            validate_lan_pin(&pin),
+            Err(LanProtocolError::InvalidPin),
+            "must reject PIN containing U+{:04X}",
+            ch as u32
+        );
+    }
+
+    // 3. Case-insensitive TXT keys (RFC 6763 §6.4) + mixed-case duplicate detection
+    let pk = SigningKey::from_bytes(&[0x44; 32])
+        .verifying_key()
+        .to_bytes();
+    let pk_b64 = encode_lan_pubkey_base64url(&pk);
+    let make_txt = |entries: &[String]| -> Vec<u8> {
+        let mut wire = Vec::new();
+        for e in entries {
+            wire.push(u8::try_from(e.len()).unwrap());
+            wire.extend_from_slice(e.as_bytes());
+        }
+        wire
+    };
+    let upper_txt = make_txt(&[
+        "V=1".to_string(),
+        "Id=0102030405060708".to_string(),
+        "NAME=UpperLobby".to_string(),
+        "Host=alice".to_string(),
+        format!("PK={pk_b64}"),
+        "Pin=1".to_string(),
+        format!("ALPN={LAN_BEACON_ALPN}"),
+    ]);
+    let decoded = decode_lan_txt_record(&upper_txt).expect("RFC 6763 case-insensitive TXT keys");
+    assert_eq!(
+        decoded,
+        LanBeaconRecord {
+            version: LAN_BEACON_VERSION,
+            lan_party_id: "0102030405060708".to_string(),
+            lobby_name: "UpperLobby".to_string(),
+            host_name: "alice".to_string(),
+            host_pubkey: pk,
+            require_pin: true,
+            alpn: LAN_BEACON_ALPN.to_string(),
+        }
+    );
+
+    let mut dup_mixed = upper_txt;
+    dup_mixed.push(3);
+    dup_mixed.extend_from_slice(b"v=1");
+    assert_eq!(
+        decode_lan_txt_record(&dup_mixed),
+        Err(LanProtocolError::TxtDuplicateKey)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 13. v0.5.0 Dead-Drop Inbox Suite 1 Crypto Oracles (RFC 7748 + RFC 9180 + Suite 1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v050_x25519_rfc7748_official_vectors() {
+    use outpost_core::inbox_crypto::{x25519_public_key, x25519_scalarmult};
+
+    // RFC 7748 §5.2 Test Vector #1
+    let k1: [u8; 32] =
+        from_hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4")
+            .try_into()
+            .unwrap();
+    let u1: [u8; 32] =
+        from_hex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c")
+            .try_into()
+            .unwrap();
+    assert_eq!(
+        to_hex(&x25519_scalarmult(&k1, &u1)),
+        "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"
+    );
+
+    // RFC 7748 §5.2 Test Vector #2
+    let k2: [u8; 32] =
+        from_hex("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d")
+            .try_into()
+            .unwrap();
+    let u2: [u8; 32] =
+        from_hex("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493")
+            .try_into()
+            .unwrap();
+    assert_eq!(
+        to_hex(&x25519_scalarmult(&k2, &u2)),
+        "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957"
+    );
+
+    // RFC 7748 §5.2 Iterated Test Vectors (1 iteration and 1,000 iterations)
+    let mut k = [0u8; 32];
+    k[0] = 9;
+    let mut u = k;
+    let next = x25519_scalarmult(&k, &u);
+    u = k;
+    k = next;
+    assert_eq!(
+        to_hex(&k),
+        "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079"
+    );
+    for _ in 1..1000 {
+        let next = x25519_scalarmult(&k, &u);
+        u = k;
+        k = next;
+    }
+    assert_eq!(
+        to_hex(&k),
+        "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51"
+    );
+
+    // RFC 7748 §6.1 Alice & Bob Diffie-Hellman Test Vector
+    let alice_sk: [u8; 32] =
+        from_hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+            .try_into()
+            .unwrap();
+    let bob_sk: [u8; 32] =
+        from_hex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+            .try_into()
+            .unwrap();
+    let alice_pk = x25519_public_key(&alice_sk);
+    let bob_pk = x25519_public_key(&bob_sk);
+    assert_eq!(
+        to_hex(&alice_pk),
+        "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+    );
+    assert_eq!(
+        to_hex(&bob_pk),
+        "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"
+    );
+    let ss_ab = x25519_scalarmult(&alice_sk, &bob_pk);
+    let ss_ba = x25519_scalarmult(&bob_sk, &alice_pk);
+    assert_eq!(ss_ab, ss_ba);
+    assert_eq!(
+        to_hex(&ss_ab),
+        "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
+    );
+}
+
+#[test]
+fn v050_hpke_mode_auth_rfc9180_appendix_a23_official_vector() {
+    use outpost_core::inbox_crypto::{
+        HpkeAuthContext, auth_decap, auth_encap_deterministic, hpke_auth_open_single_shot,
+        hpke_auth_seal_single_shot, hpke_derive_key_pair, key_schedule_auth,
+    };
+
+    // Official RFC 9180 Appendix A.2.3:
+    // mode=2 (Auth), kem_id=0x0020 (X25519/HKDF-SHA256), kdf_id=0x0001 (HKDF-SHA256),
+    // aead_id=0x0003 (ChaCha20Poly1305)
+    let info = from_hex("4f6465206f6e2061204772656369616e2055726e");
+    let ikm_e = from_hex("938d3daa5a8904540bc24f48ae90eed3f4f7f11839560597b55e7c9598c996c0");
+    let ikm_r = from_hex("64835d5ee64aa7aad57c6f2e4f758f7696617f8829e70bc9ac7a5ef95d1c756c");
+    let ikm_s = from_hex("9d8f94537d5a3ddef71234c0baedfad4ca6861634d0b94c3007fed557ad17df6");
+
+    let (sk_em, pk_em) = hpke_derive_key_pair(&ikm_e).unwrap();
+    let (sk_rm, pk_rm) = hpke_derive_key_pair(&ikm_r).unwrap();
+    let (sk_sm, pk_sm) = hpke_derive_key_pair(&ikm_s).unwrap();
+
+    assert_eq!(
+        to_hex(&*sk_em),
+        "c94619e1af28971c8fa7957192b7e62a71ca2dcdde0a7cc4a8a9e741d600ab13"
+    );
+    assert_eq!(
+        to_hex(&pk_em),
+        "f7674cc8cd7baa5872d1f33dbaffe3314239f6197ddf5ded1746760bfc847e0e"
+    );
+    assert_eq!(
+        to_hex(&*sk_rm),
+        "3ca22a6d1cda1bb9480949ec5329d3bf0b080ca4c45879c95eddb55c70b80b82"
+    );
+    assert_eq!(
+        to_hex(&pk_rm),
+        "1a478716d63cb2e16786ee93004486dc151e988b34b475043d3e0175bdb01c44"
+    );
+    assert_eq!(
+        to_hex(&*sk_sm),
+        "2def0cb58ffcf83d1062dd085c8aceca7f4c0c3fd05912d847b61f3e54121f05"
+    );
+    assert_eq!(
+        to_hex(&pk_sm),
+        "f0f4f9e96c54aeed3f323de8534fffd7e0577e4ce269896716bcb95643c8712b"
+    );
+
+    let (ss_s, enc) = auth_encap_deterministic(&pk_rm, &sk_sm, &sk_em).unwrap();
+    assert_eq!(
+        to_hex(&enc),
+        "f7674cc8cd7baa5872d1f33dbaffe3314239f6197ddf5ded1746760bfc847e0e"
+    );
+    assert_eq!(
+        to_hex(&*ss_s),
+        "d2d67828c8bc9fa661cf15a31b3ebf1febe0cafef7abfaaca580aaf6d471e3eb"
+    );
+
+    let ss_r = auth_decap(&enc, &sk_rm, &pk_sm).unwrap();
+    assert_eq!(*ss_s, *ss_r);
+
+    let ks = key_schedule_auth(&ss_s, &info).unwrap();
+    assert_eq!(
+        to_hex(&*ks.key),
+        "b071fd1136680600eb447a845a967d35e9db20749cdf9ce098bcc4deef4b1356"
+    );
+    assert_eq!(to_hex(&*ks.base_nonce), "d20577dff16d7cea2c4bf780");
+    assert_eq!(
+        to_hex(&*ks.exporter_secret),
+        "be2d93b82071318cdb88510037cf504344151f2f9b9da8ab48974d40a2251dd7"
+    );
+
+    // Multi-sequence encryptions (seq 0, 1, 2) from RFC 9180 Appendix A.2.3.1
+    let pt = from_hex("4265617574792069732074727574682c20747275746820626561757479");
+    let expected_cts = [
+        (
+            "436f756e742d30",
+            "ab1a13c9d4f01a87ec3440dbd756e2677bd2ecf9df0ce7ed73869b98e00c09be111cb9fdf077347aeb88e61bdf",
+        ),
+        (
+            "436f756e742d31",
+            "3265c7807ffff7fdace21659a2c6ccffee52a26d270c76468ed74202a65478bfaedfff9c2b7634e24f10b71016",
+        ),
+        (
+            "436f756e742d32",
+            "3aadee86ad2a05081ea860033a9d09dbccb4acac2ded0891da40f51d4df19925f7a767b076a5cbc9355c8fd35e",
+        ),
+    ];
+
+    let (enc_ctx, mut ctx_s) =
+        HpkeAuthContext::setup_sender_deterministic(&pk_rm, &sk_sm, &info, &sk_em).unwrap();
+    assert_eq!(enc_ctx, enc);
+    let mut ctx_r = HpkeAuthContext::setup_receiver(&enc_ctx, &sk_rm, &pk_sm, &info).unwrap();
+
+    for (aad_hex, expected_ct_hex) in expected_cts {
+        let aad = from_hex(aad_hex);
+        let ct = ctx_s.seal(&aad, &pt).unwrap();
+        assert_eq!(to_hex(&ct), expected_ct_hex);
+        let opened = ctx_r.open(&aad, &ct).unwrap();
+        assert_eq!(opened, pt);
+    }
+
+    // Exported values (RFC 9180 Appendix A.2.3.2)
+    assert_eq!(
+        to_hex(&ctx_s.export(b"", 32).unwrap()),
+        "070cffafd89b67b7f0eeb800235303a223e6ff9d1e774dce8eac585c8688c872"
+    );
+    assert_eq!(
+        to_hex(&ctx_r.export(&[0x00], 32).unwrap()),
+        "2852e728568d40ddb0edde284d36a4359c56558bb2fb8837cd3d92e46a3a14a8"
+    );
+
+    // Single-shot API matches seq=0 bit-for-bit!
+    let aad0 = from_hex("436f756e742d30");
+    let ss_sealed = hpke_auth_seal_single_shot(&pk_rm, &sk_sm, &info, &aad0, &pt, &sk_em).unwrap();
+    assert_eq!(ss_sealed.len(), 32 + pt.len() + 16);
+    assert_eq!(&ss_sealed[0..32], &enc);
+    assert_eq!(
+        to_hex(&ss_sealed[32..]),
+        "ab1a13c9d4f01a87ec3440dbd756e2677bd2ecf9df0ce7ed73869b98e00c09be111cb9fdf077347aeb88e61bdf"
+    );
+    let ss_opened = hpke_auth_open_single_shot(&ss_sealed, &sk_rm, &pk_sm, &info, &aad0).unwrap();
+    assert_eq!(ss_opened, pt);
+
+    // 32-byte CEK single-shot is exact 80 bytes (32 enc + 32 ct + 16 tag)
+    let cek_sealed =
+        hpke_auth_seal_single_shot(&pk_rm, &sk_sm, &info, &aad0, &[0x42; 32], &sk_em).unwrap();
+    assert_eq!(cek_sealed.len(), 80);
+    assert_eq!(
+        hpke_auth_open_single_shot(&cek_sealed, &sk_rm, &pk_sm, &info, &aad0).unwrap(),
+        vec![0x42; 32]
+    );
+}
+
+#[test]
+fn v050_inbox_suite1_enc_cert_buckets_roundtrip_tamper_and_golden_vector() {
+    use mp_protocol::verify_enc_subkey_cert;
+    use outpost_core::inbox_crypto::{
+        INBOX_MAX_PLAINTEXT_BYTES, INBOX_SUITE_1, INBOX_SUITE1_WRAPPED_KEY_BYTES,
+        InboxCryptoError, InboxRecipientDevice, open_inbox_drop, pad_to_bucket, seal_inbox_drop,
+        sign_enc_subkey_cert, unpad_from_bucket, x25519_public_key,
+    };
+
+    // 1. enc_cert signing & mp_protocol::verify_enc_subkey_cert parity
+    let root_sk = SigningKey::from_bytes(&[0x11; 32]);
+    let root_pk = root_sk.verifying_key().to_bytes();
+    let dev_sk = SigningKey::from_bytes(&[0x22; 32]);
+    let dev_pk = dev_sk.verifying_key().to_bytes();
+    let sender_enc_sk = [0x31u8; 32];
+    let sender_enc_pk = x25519_public_key(&sender_enc_sk);
+
+    let sender_acct = AccountId::new(1001).unwrap();
+    let sender_dev = DeviceId::new(2002).unwrap();
+    let now_s = 1_800_000_000i64;
+
+    let cert = sign_enc_subkey_cert(
+        sender_acct,
+        sender_dev,
+        &root_pk,
+        &sender_enc_pk,
+        now_s - 60,
+        now_s + 86_400,
+        &dev_sk,
+    )
+    .expect("sign_enc_subkey_cert");
+    assert_eq!(cert.len(), 161);
+    let claims = verify_enc_subkey_cert(&cert, 1001, 2002, &root_pk, &dev_pk, now_s)
+        .expect("verify_enc_subkey_cert");
+    assert_eq!(claims.enc_pk, sender_enc_pk);
+
+    // Reject weak X25519 key or invalid TTL (> 30d)
+    assert_eq!(
+        sign_enc_subkey_cert(
+            sender_acct,
+            sender_dev,
+            &root_pk,
+            &[0u8; 32],
+            now_s,
+            now_s + 3600,
+            &dev_sk
+        ),
+        Err(InboxCryptoError::WeakPublicKey)
+    );
+    assert_eq!(
+        sign_enc_subkey_cert(
+            sender_acct,
+            sender_dev,
+            &root_pk,
+            &sender_enc_pk,
+            now_s,
+            now_s + 31 * 86_400,
+            &dev_sk
+        ),
+        Err(InboxCryptoError::InvalidCertTtl)
+    );
+
+    // 2. Exact bucket padding boundaries (ciphertext = padded + 16 in {1024, 4096, 16384, 65536})
+    for (pt_len, expected_ct_bucket) in [
+        (0usize, 1024usize),
+        (1004, 1024),
+        (1005, 4096),
+        (4076, 4096),
+        (4077, 16384),
+        (16364, 16384),
+        (16365, 65536),
+        (INBOX_MAX_PLAINTEXT_BYTES, 65536),
+    ] {
+        let pt = vec![0x5Au8; pt_len];
+        let padded = pad_to_bucket(&pt).unwrap();
+        assert_eq!(padded.len() + 16, expected_ct_bucket);
+        assert_eq!(unpad_from_bucket(&padded).unwrap(), pt);
+    }
+    assert_eq!(
+        pad_to_bucket(&vec![0u8; INBOX_MAX_PLAINTEXT_BYTES + 1]),
+        Err(InboxCryptoError::PlaintextTooLarge)
+    );
+
+    // Non-zero padding byte MUST fail unpad_from_bucket!
+    let mut bad_pad = pad_to_bucket(b"hello").unwrap();
+    let last_idx = bad_pad.len() - 1;
+    bad_pad[last_idx] = 0x01;
+    assert_eq!(
+        unpad_from_bucket(&bad_pad),
+        Err(InboxCryptoError::InvalidPadding)
+    );
+    assert_eq!(
+        unpad_from_bucket(&[0u8; 500]),
+        Err(InboxCryptoError::InvalidBucketSize)
+    );
+
+    // 3. Multi-device deterministic Suite 1 seal + open + tamper/negative oracles
+    let recip_acct = AccountId::new(1002).unwrap();
+    let recip_dev1 = DeviceId::new(3001).unwrap();
+    let recip_dev2 = DeviceId::new(3002).unwrap();
+    let recip_sk1 = [0x41u8; 32];
+    let recip_pk1 = x25519_public_key(&recip_sk1);
+    let recip_sk2 = [0x42u8; 32];
+    let recip_pk2 = x25519_public_key(&recip_sk2);
+
+    let msg_id = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10,
+    ];
+    let expires_at_ms = 1_800_086_400_000_i64;
+    let cek = [0x77u8; 32];
+    let eph_sks = [[0x51u8; 32], [0x52u8; 32]];
+    let plaintext = b"{\"kind\":\"handoff\",\"body\":\"Meet in party/main at 09:00 UTC\"}";
+
+    let sealed = seal_inbox_drop(
+        sender_acct,
+        sender_dev,
+        &sender_enc_sk,
+        recip_acct,
+        &[
+            InboxRecipientDevice {
+                device_id: recip_dev1,
+                enc_pk: recip_pk1,
+            },
+            InboxRecipientDevice {
+                device_id: recip_dev2,
+                enc_pk: recip_pk2,
+            },
+        ],
+        msg_id,
+        expires_at_ms,
+        plaintext,
+        &cek,
+        &eph_sks,
+    )
+    .expect("seal_inbox_drop");
+
+    assert_eq!(sealed.suite, INBOX_SUITE_1);
+    assert_eq!(sealed.ciphertext.len(), 1024);
+    assert_eq!(sealed.wrapped_keys.len(), 2);
+    assert_eq!(
+        sealed.wrapped_keys[0].wrapped_key.len(),
+        INBOX_SUITE1_WRAPPED_KEY_BYTES
+    );
+    assert_eq!(
+        sealed.wrapped_keys[1].wrapped_key.len(),
+        INBOX_SUITE1_WRAPPED_KEY_BYTES
+    );
+
+    // Both devices decrypt identical plaintext!
+    let pt1 = open_inbox_drop(
+        INBOX_SUITE_1,
+        sender_acct,
+        sender_dev,
+        &sender_enc_pk,
+        recip_acct,
+        recip_dev1,
+        &recip_sk1,
+        &msg_id,
+        expires_at_ms,
+        &sealed.ciphertext,
+        &sealed.wrapped_keys[0].wrapped_key,
+    )
+    .expect("device 1 decrypt");
+    let pt2 = open_inbox_drop(
+        INBOX_SUITE_1,
+        sender_acct,
+        sender_dev,
+        &sender_enc_pk,
+        recip_acct,
+        recip_dev2,
+        &recip_sk2,
+        &msg_id,
+        expires_at_ms,
+        &sealed.ciphertext,
+        &sealed.wrapped_keys[1].wrapped_key,
+    )
+    .expect("device 2 decrypt");
+    assert_eq!(pt1, plaintext);
+    assert_eq!(pt2, plaintext);
+
+    // Negative A: Tampered ciphertext bit flip -> fails (wrap_aad sha256 mismatch + AEAD)
+    let mut bad_ct = sealed.ciphertext.clone();
+    bad_ct[10] ^= 0x01;
+    assert!(
+        open_inbox_drop(
+            INBOX_SUITE_1,
+            sender_acct,
+            sender_dev,
+            &sender_enc_pk,
+            recip_acct,
+            recip_dev1,
+            &recip_sk1,
+            &msg_id,
+            expires_at_ms,
+            &bad_ct,
+            &sealed.wrapped_keys[0].wrapped_key,
+        )
+        .is_err()
+    );
+
+    // Negative B: Wrong sender_enc_pk -> ModeAuth MUST fail!
+    let impostor_pk = x25519_public_key(&[0x99u8; 32]);
+    assert!(
+        open_inbox_drop(
+            INBOX_SUITE_1,
+            sender_acct,
+            sender_dev,
+            &impostor_pk,
+            recip_acct,
+            recip_dev1,
+            &recip_sk1,
+            &msg_id,
+            expires_at_ms,
+            &sealed.ciphertext,
+            &sealed.wrapped_keys[0].wrapped_key,
+        )
+        .is_err()
+    );
+
+    // Negative C: Wrong target_device_id -> wrap_aad mismatch!
+    assert!(
+        open_inbox_drop(
+            INBOX_SUITE_1,
+            sender_acct,
+            sender_dev,
+            &sender_enc_pk,
+            recip_acct,
+            recip_dev2,
+            &recip_sk1,
+            &msg_id,
+            expires_at_ms,
+            &sealed.ciphertext,
+            &sealed.wrapped_keys[0].wrapped_key,
+        )
+        .is_err()
+    );
+
+    // Negative D: Swapped wrapped_key from device 2 given to device 1 -> fails!
+    assert!(
+        open_inbox_drop(
+            INBOX_SUITE_1,
+            sender_acct,
+            sender_dev,
+            &sender_enc_pk,
+            recip_acct,
+            recip_dev1,
+            &recip_sk1,
+            &msg_id,
+            expires_at_ms,
+            &sealed.ciphertext,
+            &sealed.wrapped_keys[1].wrapped_key,
+        )
+        .is_err()
+    );
+
+    // Negative E: Malicious sender wraps valid CEK under a forged/mismatched key_commit prefix -> KeyCommitMismatch!
+    let forged_commit = [0xEEu8; 32];
+    let forged_wrap_aad = outpost_core::inbox_crypto::canonical_wrap_aad(
+        INBOX_SUITE_1,
+        sender_acct.get(),
+        sender_dev.get(),
+        recip_acct.get(),
+        recip_dev1.get(),
+        &msg_id,
+        expires_at_ms,
+        &forged_commit,
+        &sealed.ciphertext_sha256,
+    );
+    let forged_hpke = outpost_core::inbox_crypto::hpke_auth_seal_single_shot(
+        &recip_pk1,
+        &sender_enc_sk,
+        outpost_core::inbox_crypto::INBOX_HPKE_INFO,
+        &forged_wrap_aad,
+        &cek,
+        &[0x61u8; 32],
+    )
+    .unwrap();
+    let mut forged_wrapped = Vec::with_capacity(INBOX_SUITE1_WRAPPED_KEY_BYTES);
+    forged_wrapped.extend_from_slice(&forged_commit);
+    forged_wrapped.extend_from_slice(&forged_hpke);
+    assert_eq!(
+        open_inbox_drop(
+            INBOX_SUITE_1,
+            sender_acct,
+            sender_dev,
+            &sender_enc_pk,
+            recip_acct,
+            recip_dev1,
+            &recip_sk1,
+            &msg_id,
+            expires_at_ms,
+            &sealed.ciphertext,
+            &forged_wrapped,
+        ),
+        Err(InboxCryptoError::KeyCommitMismatch)
+    );
+
+    // Frozen deterministic Suite 1 golden vector assertions (for cross-client interop sync)
+    assert_eq!(
+        to_hex(&sender_enc_pk),
+        "04f5f29162c31a8defa18e6e742224ee806fc1718a278be859ba5620402b8f3a"
+    );
+    assert_eq!(
+        to_hex(&recip_pk1),
+        "7a1a4e709bf085ac494aba0469b9b1eda0ab1f78b16aabb79ffeda90623e8522"
+    );
+    assert_eq!(
+        to_hex(&sealed.key_commit),
+        "c593b3ada1e7d68e55442ad9890f8b10a269b6630ed59a177895401aa05e108d"
+    );
+    assert_eq!(
+        to_hex(&sealed.ciphertext_sha256),
+        "57fdc4130ed563f905bee384ab8afa561c6fb97d3a05311f8d9b426d9f8a0e91"
+    );
+    assert_eq!(
+        to_hex(&sealed.wrapped_keys[0].wrapped_key),
+        "c593b3ada1e7d68e55442ad9890f8b10a269b6630ed59a177895401aa05e108dad908a8a708aca07588cda7c4ed3e44d4966a80a9abb2f1e4bbac53c67414e34ec8227dd7d12de1e069b89147400a54ee0fe8b50230aa7c674dcf09214ab1818b7b6289a9d4e5845046ec3d094fb6872"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 14. v0.5.0 Unified `/etc/multiplayer/policy.toml` & Party Trust Tiers Oracles
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v050_unified_policy_toml_monotonic_merge_legacy_lan_and_trust_tiers() {
+    use outpost_core::lan_protocol::{
+        MAX_LAN_IDLE_TIMEOUT_SEC, parse_partial_lan_policy_toml,
+    };
+    use outpost_core::policy::{
+        BrakesProfile, PartyTrustProfile, PolicyError, effective_peer_trust,
+        merge_unified_policy_floor, parse_unified_policy_toml,
+    };
+
+    // Ordering invariants
+    assert!(BrakesProfile::BlackFlag < BrakesProfile::Guarded);
+    assert!(BrakesProfile::Guarded < BrakesProfile::Sandboxed);
+    assert!(BrakesProfile::Sandboxed < BrakesProfile::Airgap);
+    assert!(PartyTrustProfile::Advisory < PartyTrustProfile::HumanGated);
+    assert!(PartyTrustProfile::HumanGated < PartyTrustProfile::PeerTrusted);
+    assert!(PartyTrustProfile::PeerTrusted < PartyTrustProfile::BlackFlag);
+
+    // Full corporate `/etc/multiplayer/policy.toml` (aligned with Blackbird seq:46 §3.1)
+    let corp_toml = r#"
+# /etc/multiplayer/policy.toml — root:root (0644)
+[brakes]
+min_profile = "guarded"
+default_profile = "guarded"
+allow_escalation = true
+require_local_auth_for_escalation = false
+extra_denied_paths = [
+    "~/.corp-vault", # comment after element
+    "~/.kube/prod",
+]
+fail_closed_on_missing_sandbox = true
+
+[party_trust]
+max_default_profile = "human-gated"
+max_peer_override = "peer-trusted"
+max_external_guest_profile = "advisory"
+max_turns_per_peer = 32
+max_cost_usd_per_peer = 2.0
+
+[lan]
+disabled = false
+require_pin = true
+require_local_auth = true
+idle_timeout_sec = 300
+scan_timeout_sec = 15
+
+[online]
+disabled = false
+require_force_relays = true
+allowed_authorities = ["api.multiplayer.tech"]
+allowed_org_slugs = ["acme-eng"]
+allow_personal_parties = false
+"#;
+
+    let sys_policy = parse_unified_policy_toml(corp_toml).expect("valid corporate policy.toml");
+    assert_eq!(sys_policy.brakes.min_profile, Some(BrakesProfile::Guarded));
+    assert_eq!(
+        sys_policy.brakes.extra_denied_paths,
+        Some(vec!["~/.corp-vault".to_string(), "~/.kube/prod".to_string()])
+    );
+    assert_eq!(
+        sys_policy.party_trust.max_external_guest_profile,
+        Some(PartyTrustProfile::Advisory)
+    );
+    assert_eq!(
+        sys_policy.party_trust.max_cost_usd_per_peer_micros,
+        Some(2_000_000)
+    );
+    assert_eq!(sys_policy.online.allow_personal_parties, Some(false));
+
+    // User tries to weaken EVERY field in the corporate floor -> monotonic merge refuses to weaken!
+    let weak_user_toml = r#"
+[brakes]
+min_profile = "black-flag"
+default_profile = "black-flag"
+allow_escalation = true
+require_local_auth_for_escalation = false
+extra_denied_paths = ["~/.personal-secret"]
+fail_closed_on_missing_sandbox = false
+
+[party_trust]
+max_default_profile = "black-flag"
+max_peer_override = "black-flag"
+max_external_guest_profile = "black-flag"
+max_turns_per_peer = 999
+max_cost_usd_per_peer = 50.0
+
+[lan]
+disabled = false
+require_pin = false
+require_local_auth = false
+idle_timeout_sec = 1800
+scan_timeout_sec = 60
+
+[online]
+disabled = false
+require_force_relays = false
+allowed_authorities = ["api.multiplayer.tech", "rogue.example.com"]
+allowed_org_slugs = ["acme-eng", "rogue-org"]
+allow_personal_parties = true
+"#;
+    let usr_policy = parse_unified_policy_toml(weak_user_toml).expect("valid user policy.toml");
+
+    // Legacy `/etc/multiplayer/lan.toml` sets a tighter idle_timeout_sec = 120 -> MUST take min!
+    let legacy_sys_lan =
+        parse_partial_lan_policy_toml("[lan]\nidle_timeout_sec = 120\n").unwrap();
+
+    let eff = merge_unified_policy_floor(
+        Some(&sys_policy),
+        Some(&legacy_sys_lan),
+        Some(&usr_policy),
+        None,
+        false,
+        None,
+    )
+    .expect("merge_unified_policy_floor");
+
+    assert_eq!(eff.brakes.min_profile, BrakesProfile::Guarded);
+    assert_eq!(eff.brakes.default_profile, BrakesProfile::Guarded);
+    assert_eq!(eff.brakes.active_profile, BrakesProfile::Guarded);
+    assert!(eff.brakes.fail_closed_on_missing_sandbox);
+    // extra_denied_paths is a union (system paths preserved, user path added)
+    assert_eq!(
+        eff.brakes.extra_denied_paths,
+        vec![
+            "~/.corp-vault".to_string(),
+            "~/.kube/prod".to_string(),
+            "~/.personal-secret".to_string(),
+        ]
+    );
+
+    assert_eq!(
+        eff.party_trust.max_default_profile,
+        PartyTrustProfile::HumanGated
+    );
+    assert_eq!(
+        eff.party_trust.max_peer_override,
+        PartyTrustProfile::PeerTrusted
+    );
+    assert_eq!(
+        eff.party_trust.max_external_guest_profile,
+        PartyTrustProfile::Advisory
+    );
+    assert_eq!(eff.party_trust.max_turns_per_peer, 32);
+    assert_eq!(eff.party_trust.max_cost_usd_per_peer_micros, 2_000_000);
+
+    // LAN merged monotonically with legacy lan.toml (120 < 300)
+    assert!(eff.lan.config.require_pin);
+    assert!(eff.lan.config.require_local_auth);
+    assert_eq!(eff.lan.config.idle_timeout_sec, 120);
+    assert_eq!(eff.lan.max_idle_timeout_sec, 120);
+    assert_eq!(eff.lan.config.scan_timeout_sec, 15);
+
+    // Online allowlists intersected (rogue entries stripped!), personal parties still forbidden!
+    assert!(eff.online.require_force_relays);
+    assert!(!eff.online.allow_personal_parties);
+    assert_eq!(
+        eff.online.allowed_authorities,
+        Some(vec!["api.multiplayer.tech".to_string()])
+    );
+    assert_eq!(
+        eff.online.allowed_org_slugs,
+        Some(vec!["acme-eng".to_string()])
+    );
+    assert!(eff.is_authority_allowed("API.MULTIPLAYER.TECH"));
+    assert!(!eff.is_authority_allowed("rogue.example.com"));
+    assert!(eff.is_org_slug_allowed("acme-eng"));
+    assert!(!eff.is_org_slug_allowed("rogue-org"));
+
+    // Explicit env/CLI override looser than system floor -> PolicyFloorViolation (fail closed!)
+    assert_eq!(
+        merge_unified_policy_floor(
+            Some(&sys_policy),
+            None,
+            None,
+            None,
+            false,
+            Some(BrakesProfile::BlackFlag),
+        ),
+        Err(PolicyError::PolicyFloorViolation)
+    );
+    assert_eq!(
+        eff.validate_cli_brakes(BrakesProfile::BlackFlag),
+        Err(PolicyError::PolicyFloorViolation)
+    );
+    assert_eq!(
+        eff.validate_cli_brakes(BrakesProfile::Sandboxed),
+        Ok(BrakesProfile::Sandboxed)
+    );
+
+    // External-guest & peer-trust clamping
+    assert_eq!(
+        effective_peer_trust(
+            PartyTrustProfile::PeerTrusted,
+            None,
+            false,
+            &eff.party_trust
+        ),
+        PartyTrustProfile::HumanGated
+    );
+    assert_eq!(
+        effective_peer_trust(
+            PartyTrustProfile::HumanGated,
+            Some(PartyTrustProfile::BlackFlag),
+            false,
+            &eff.party_trust
+        ),
+        PartyTrustProfile::PeerTrusted
+    );
+    assert_eq!(
+        effective_peer_trust(
+            PartyTrustProfile::HumanGated,
+            Some(PartyTrustProfile::BlackFlag),
+            true,
+            &eff.party_trust
+        ),
+        PartyTrustProfile::Advisory
+    );
+
+    // Legacy backward compatibility: only legacy lan.toml without timeouts leaves CLI headroom intact
+    let legacy_only = parse_partial_lan_policy_toml("[lan]\nrequire_pin = true\n").unwrap();
+    let eff_legacy =
+        merge_unified_policy_floor(None, Some(&legacy_only), None, None, false, None).unwrap();
+    assert!(eff_legacy.lan.config.require_pin);
+    assert_eq!(eff_legacy.lan.max_idle_timeout_sec, MAX_LAN_IDLE_TIMEOUT_SEC);
+    assert_eq!(eff_legacy.lan.effective_idle_timeout(Some(600)), 600);
+    assert_eq!(eff_legacy.brakes.active_profile, BrakesProfile::BlackFlag);
+
+    // Strict fail-closed TOML rejections
+    for (bad, expected) in [
+        ("min_profile = \"guarded\"\n", PolicyError::KeyBeforeSection),
+        ("[unknown]\nx = true\n", PolicyError::UnknownSection),
+        ("[brakes]\n[brakes]\n", PolicyError::DuplicateSection),
+        ("[brakes]\nfoo = true\n", PolicyError::UnknownKey),
+        (
+            "[brakes]\nallow_escalation = true\nallow_escalation = false\n",
+            PolicyError::DuplicateKey,
+        ),
+        (
+            "[brakes]\nmin_profile = \"yolo\"\n",
+            PolicyError::InvalidValue,
+        ),
+        (
+            "[party_trust]\nmax_turns_per_peer = 0\n",
+            PolicyError::InvalidValue,
+        ),
+        (
+            "[party_trust]\nmax_cost_usd_per_peer = 0.0\n",
+            PolicyError::InvalidValue,
+        ),
+        (
+            "[online]\nallowed_authorities = [\"bad host/path\"]\n",
+            PolicyError::InvalidValue,
+        ),
+        ("[brakes]\nallow_escalation = true\0\n", PolicyError::InvalidCharacter),
+    ] {
+        assert_eq!(
+            parse_unified_policy_toml(bad),
+            Err(expected),
+            "must reject unified policy TOML: {bad:?}"
+        );
+    }
+}
