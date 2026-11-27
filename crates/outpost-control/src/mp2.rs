@@ -31,8 +31,10 @@ pub const MP2_SUBPROTOCOL: &str = "mp2";
 pub const MP2_PING_TEXT: &str = "MP2:PING";
 /// Zero-DO-wakeup text heartbeat pong (`MP2:PONG`).
 pub const MP2_PONG_TEXT: &str = "MP2:PONG";
-/// Hard cap on inbound/outbound `mp2` UTF-8 JSON frame size (`48 KiB`).
+/// Hard cap on inbound/outbound `mp2` UTF-8 JSON application frame size (`48 KiB`).
 pub const MAX_MP2_FRAME_BYTES: usize = 48 * 1024;
+/// Hard cap on inbound `mp2` MLS control signal frame size (`256 KiB`).
+pub const MAX_MP2_CONTROL_FRAME_BYTES: usize = 256 * 1024;
 /// Hard cap on `mp2` opaque event `body` size (`32 KiB`).
 pub const MAX_MP2_BODY_BYTES: usize = 32 * 1024;
 
@@ -64,13 +66,15 @@ impl fmt::Display for Mp2WsError {
 
 impl std::error::Error for Mp2WsError {}
 
-/// Canonical `mp2` event kind (`"chat"`, `"agent_card"`, or `"system"`).
+/// Canonical `mp2` event kind (`"chat"`, `"agent_card"`, `"system"`, `"e2ee_app"`, or `"e2ee_ephemeral"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mp2EventKind {
     Chat,
     AgentCard,
     System,
+    E2eeApp,
+    E2eeEphemeral,
 }
 
 impl Mp2EventKind {
@@ -79,6 +83,8 @@ impl Mp2EventKind {
             Self::Chat => "chat",
             Self::AgentCard => "agent_card",
             Self::System => "system",
+            Self::E2eeApp => "e2ee_app",
+            Self::E2eeEphemeral => "e2ee_ephemeral",
         }
     }
 }
@@ -94,6 +100,8 @@ pub struct Mp2SelfInfo {
     pub client: String,
     #[serde(default)]
     pub is_guest: bool,
+    #[serde(default)]
+    pub is_browser: bool,
     #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
     pub device_id: Option<u64>,
 }
@@ -110,6 +118,8 @@ pub struct Mp2Member {
     #[serde(default)]
     pub is_guest: bool,
     #[serde(default)]
+    pub is_browser: bool,
+    #[serde(default)]
     pub agent_name: Option<String>,
     #[serde(default)]
     pub agent_state: Option<String>,
@@ -119,6 +129,15 @@ pub struct Mp2Member {
     pub status: String,
     #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
     pub device_id: Option<u64>,
+}
+
+impl Mp2Member {
+    /// Returns `true` when this member is connected via a browser session.
+    pub fn is_browser_origin(&self) -> bool {
+        self.is_browser
+            || self.client.trim().eq_ignore_ascii_case("web")
+            || self.client.trim().eq_ignore_ascii_case("browser")
+    }
 }
 
 /// Authoritative sender block attached by `PartyDO` to every `mp2` `event`.
@@ -133,12 +152,26 @@ pub struct Mp2Sender {
     #[serde(default)]
     pub is_guest: bool,
     #[serde(default)]
+    pub is_browser: bool,
+    #[serde(default)]
     pub agent_name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
     pub device_id: Option<u64>,
 }
 
-/// Authoritative sequenced `mp2` room event (`chat`, `agent_card`, or `system`).
+impl Mp2Sender {
+    /// Returns `true` when the message originated from a web browser session
+    /// (`is_browser: true` or `client == "web"` / `"browser"`). Browser-originated
+    /// messages MUST always be treated as untrusted remote input even when
+    /// `sender.handle` or `sender.account_id` matches the local operator.
+    pub fn is_browser_origin(&self) -> bool {
+        self.is_browser
+            || self.client.trim().eq_ignore_ascii_case("web")
+            || self.client.trim().eq_ignore_ascii_case("browser")
+    }
+}
+
+/// Authoritative sequenced `mp2` room event (`chat`, `agent_card`, `system`, `e2ee_app`, or `e2ee_ephemeral`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Mp2Event {
     #[serde(deserialize_with = "deserialize_u64_or_string")]
@@ -155,6 +188,12 @@ pub struct Mp2Event {
     pub body_encoding: String,
     #[serde(default)]
     pub body: String,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    pub mls_epoch: Option<u64>,
+    #[serde(default)]
+    pub e2ee_mode: Option<u8>,
+    #[serde(default)]
+    pub group_id_b64: Option<String>,
 }
 
 fn default_target() -> String {
@@ -181,6 +220,16 @@ pub struct Mp2Hello {
     pub members: Vec<Mp2Member>,
     #[serde(default)]
     pub history: Vec<Mp2Event>,
+    #[serde(default)]
+    pub e2ee_mode: u8,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub mls_epoch: u64,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub min_allowed_mls_epoch: u64,
+    #[serde(default)]
+    pub mls_rekey_required: bool,
+    #[serde(default)]
+    pub group_id_b64: Option<String>,
 }
 
 /// Authoritative delivery acknowledgement for an outbound `send`.
@@ -201,6 +250,52 @@ pub enum Mp2RoomEvent {
     Ack(Mp2Ack),
     Presence {
         members: Vec<Mp2Member>,
+    },
+    MlsCommitTentative {
+        party_id: Option<u64>,
+        group_id_b64: String,
+        parent_epoch: u64,
+        target_epoch: u64,
+        commit_sha256_b64: String,
+        committer_account_id: u64,
+        committer_device_id: u64,
+        commit_b64: String,
+        proposal_blobs_b64: Vec<String>,
+        deadline_ms: u64,
+    },
+    MlsCommitFinalized {
+        party_id: Option<u64>,
+        group_id_b64: String,
+        epoch: u64,
+        commit_sha256_b64: String,
+        commit_b64: String,
+        proposal_blobs_b64: Vec<String>,
+        confirmed_transcript_hash_b64: Option<String>,
+    },
+    MlsRekeyNeeded {
+        party_id: Option<u64>,
+        group_id_b64: String,
+        mls_epoch: u64,
+        min_allowed_mls_epoch: u64,
+        reason: String,
+        proposal_blobs_b64: Vec<String>,
+        elected_committer_device_id: Option<u64>,
+    },
+    MlsWelcomeReady {
+        party_id: Option<u64>,
+        group_id_b64: String,
+        target_epoch: u64,
+        welcome_id: Option<u64>,
+    },
+    EphemeralEvent {
+        seq: Option<u64>,
+        ts_ms: u64,
+        sender: Mp2Sender,
+        mls_epoch: Option<u64>,
+        target: String,
+        kind: Mp2EventKind,
+        body_encoding: String,
+        body: String,
     },
     Error {
         code: String,
@@ -255,6 +350,49 @@ struct RawInboundFrame {
     message: Option<String>,
     #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
     retry_ms: Option<u64>,
+    #[serde(default)]
+    e2ee_mode: Option<u8>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    mls_epoch: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    min_allowed_mls_epoch: Option<u64>,
+    #[serde(default)]
+    mls_rekey_required: Option<bool>,
+    #[serde(default)]
+    group_id_b64: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    parent_epoch: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    target_epoch: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    epoch: Option<u64>,
+    #[serde(default)]
+    commit_sha256_b64: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    committer_account_id: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    committer_device_id: Option<u64>,
+    #[serde(default)]
+    commit_b64: Option<String>,
+    #[serde(default)]
+    proposal_blobs_b64: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    deadline_ms: Option<u64>,
+    #[serde(default)]
+    confirmed_transcript_hash_b64: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    elected_committer_device_id: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string_opt")]
+    welcome_id: Option<u64>,
+}
+
+fn is_mls_control_frame_type(t: &str) -> bool {
+    matches!(
+        t,
+        "mls_commit_tentative" | "mls_commit_finalized" | "mls_rekey_needed" | "mls_welcome_ready"
+    )
 }
 
 /// Parses a single UTF-8 JSON `mp2` server frame (or `"MP2:PONG"`).
@@ -262,14 +400,20 @@ pub fn parse_mp2_server_text(text: &str) -> Result<Mp2RoomEvent, Mp2WsError> {
     if text == MP2_PONG_TEXT {
         return Ok(Mp2RoomEvent::Pong);
     }
-    if text.len() > MAX_MP2_FRAME_BYTES {
+    if text.len() > MAX_MP2_CONTROL_FRAME_BYTES {
+        return Err(Mp2WsError::FrameTooLarge {
+            len: text.len(),
+            max_len: MAX_MP2_CONTROL_FRAME_BYTES,
+        });
+    }
+    let raw: RawInboundFrame =
+        serde_json::from_str(text).map_err(|e| Mp2WsError::InvalidJson(e.to_string()))?;
+    if !is_mls_control_frame_type(&raw.t) && text.len() > MAX_MP2_FRAME_BYTES {
         return Err(Mp2WsError::FrameTooLarge {
             len: text.len(),
             max_len: MAX_MP2_FRAME_BYTES,
         });
     }
-    let raw: RawInboundFrame =
-        serde_json::from_str(text).map_err(|e| Mp2WsError::InvalidJson(e.to_string()))?;
     if raw.v != 0 && raw.v != 2 {
         return Err(Mp2WsError::InvalidJson(format!(
             "unsupported mp2 frame version {}",
@@ -292,6 +436,11 @@ pub fn parse_mp2_server_text(text: &str) -> Result<Mp2RoomEvent, Mp2WsError> {
                 latest_seq: raw.latest_seq.unwrap_or(0),
                 members: raw.members.unwrap_or_default(),
                 history: raw.history.unwrap_or_default(),
+                e2ee_mode: raw.e2ee_mode.unwrap_or(0),
+                mls_epoch: raw.mls_epoch.unwrap_or(0),
+                min_allowed_mls_epoch: raw.min_allowed_mls_epoch.unwrap_or(0),
+                mls_rekey_required: raw.mls_rekey_required.unwrap_or(false),
+                group_id_b64: raw.group_id_b64,
             }))
         }
         "event" => {
@@ -320,6 +469,9 @@ pub fn parse_mp2_server_text(text: &str) -> Result<Mp2RoomEvent, Mp2WsError> {
                 kind,
                 body_encoding: raw.body_encoding.unwrap_or_else(default_body_encoding),
                 body,
+                mls_epoch: raw.mls_epoch,
+                e2ee_mode: raw.e2ee_mode,
+                group_id_b64: raw.group_id_b64,
             }))
         }
         "ack" => {
@@ -338,6 +490,89 @@ pub fn parse_mp2_server_text(text: &str) -> Result<Mp2RoomEvent, Mp2WsError> {
         "presence" => Ok(Mp2RoomEvent::Presence {
             members: raw.members.unwrap_or_default(),
         }),
+        "mls_commit_tentative" => {
+            let group_id_b64 = raw.group_id_b64.ok_or_else(|| {
+                Mp2WsError::InvalidJson("mls_commit_tentative missing group_id_b64".to_owned())
+            })?;
+            let parent_epoch = raw.parent_epoch.ok_or_else(|| {
+                Mp2WsError::InvalidJson("mls_commit_tentative missing parent_epoch".to_owned())
+            })?;
+            let target_epoch = raw.target_epoch.ok_or_else(|| {
+                Mp2WsError::InvalidJson("mls_commit_tentative missing target_epoch".to_owned())
+            })?;
+            let commit_b64 = raw.commit_b64.ok_or_else(|| {
+                Mp2WsError::InvalidJson("mls_commit_tentative missing commit_b64".to_owned())
+            })?;
+            Ok(Mp2RoomEvent::MlsCommitTentative {
+                party_id: raw.party_id,
+                group_id_b64,
+                parent_epoch,
+                target_epoch,
+                commit_sha256_b64: raw.commit_sha256_b64.unwrap_or_default(),
+                committer_account_id: raw.committer_account_id.unwrap_or(0),
+                committer_device_id: raw.committer_device_id.unwrap_or(0),
+                commit_b64,
+                proposal_blobs_b64: raw.proposal_blobs_b64.unwrap_or_default(),
+                deadline_ms: raw.deadline_ms.unwrap_or(0),
+            })
+        }
+        "mls_commit_finalized" => {
+            let group_id_b64 = raw.group_id_b64.ok_or_else(|| {
+                Mp2WsError::InvalidJson("mls_commit_finalized missing group_id_b64".to_owned())
+            })?;
+            let epoch = raw.epoch.or(raw.target_epoch).or(raw.mls_epoch).ok_or_else(|| {
+                Mp2WsError::InvalidJson("mls_commit_finalized missing epoch".to_owned())
+            })?;
+            let commit_b64 = raw.commit_b64.ok_or_else(|| {
+                Mp2WsError::InvalidJson("mls_commit_finalized missing commit_b64".to_owned())
+            })?;
+            Ok(Mp2RoomEvent::MlsCommitFinalized {
+                party_id: raw.party_id,
+                group_id_b64,
+                epoch,
+                commit_sha256_b64: raw.commit_sha256_b64.unwrap_or_default(),
+                commit_b64,
+                proposal_blobs_b64: raw.proposal_blobs_b64.unwrap_or_default(),
+                confirmed_transcript_hash_b64: raw.confirmed_transcript_hash_b64,
+            })
+        }
+        "mls_rekey_needed" => Ok(Mp2RoomEvent::MlsRekeyNeeded {
+            party_id: raw.party_id,
+            group_id_b64: raw.group_id_b64.unwrap_or_default(),
+            mls_epoch: raw.mls_epoch.unwrap_or(0),
+            min_allowed_mls_epoch: raw.min_allowed_mls_epoch.unwrap_or(0),
+            reason: sanitize_server_error(raw.reason.as_deref().unwrap_or("rekey_needed")),
+            proposal_blobs_b64: raw.proposal_blobs_b64.unwrap_or_default(),
+            elected_committer_device_id: raw.elected_committer_device_id,
+        }),
+        "mls_welcome_ready" => Ok(Mp2RoomEvent::MlsWelcomeReady {
+            party_id: raw.party_id,
+            group_id_b64: raw.group_id_b64.unwrap_or_default(),
+            target_epoch: raw.target_epoch.or(raw.mls_epoch).unwrap_or(0),
+            welcome_id: raw.welcome_id,
+        }),
+        "ephemeral_event" => {
+            let sender = raw.sender.ok_or_else(|| {
+                Mp2WsError::InvalidJson("ephemeral_event missing sender".to_owned())
+            })?;
+            let body = raw.body.unwrap_or_default();
+            if body.len() > MAX_MP2_BODY_BYTES {
+                return Err(Mp2WsError::BodyTooLarge {
+                    len: body.len(),
+                    max_len: MAX_MP2_BODY_BYTES,
+                });
+            }
+            Ok(Mp2RoomEvent::EphemeralEvent {
+                seq: raw.seq,
+                ts_ms: raw.ts_ms.unwrap_or(0),
+                sender,
+                mls_epoch: raw.mls_epoch,
+                target: raw.target.unwrap_or_else(|| "*".to_owned()),
+                kind: raw.kind.unwrap_or(Mp2EventKind::E2eeEphemeral),
+                body_encoding: raw.body_encoding.unwrap_or_else(|| "opaque_b64".to_owned()),
+                body,
+            })
+        }
         "error" => Ok(Mp2RoomEvent::Error {
             code: sanitize_server_error(raw.code.as_deref().unwrap_or("error")),
             message: sanitize_server_error(raw.message.as_deref().unwrap_or("room error")),
@@ -360,6 +595,84 @@ struct OutboundSendFrame<'a> {
     target: &'a str,
     body_encoding: &'a str,
     body: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mls_epoch: Option<u64>,
+}
+
+/// Builds a canonical outbound `mp2` `e2ee_app` JSON frame, strictly enforcing
+/// `target == "*"`, `kind == "e2ee_app"`, `body_encoding == "opaque_b64"`, and `<= 32 KiB` body cap.
+pub fn build_e2ee_app_frame_json(
+    client_msg_id: &str,
+    mls_epoch: u64,
+    body_b64: &str,
+) -> Result<String, Mp2WsError> {
+    if body_b64.is_empty() {
+        return Err(Mp2WsError::InvalidJson(
+            "e2ee_app body_b64 must not be empty".to_owned(),
+        ));
+    }
+    if body_b64.len() > MAX_MP2_BODY_BYTES {
+        return Err(Mp2WsError::BodyTooLarge {
+            len: body_b64.len(),
+            max_len: MAX_MP2_BODY_BYTES,
+        });
+    }
+    let frame = OutboundSendFrame {
+        v: 2,
+        t: "send",
+        client_msg_id,
+        kind: Mp2EventKind::E2eeApp,
+        target: "*",
+        body_encoding: "opaque_b64",
+        body: body_b64,
+        mls_epoch: Some(mls_epoch),
+    };
+    let text = serde_json::to_string(&frame).map_err(|e| Mp2WsError::InvalidJson(e.to_string()))?;
+    if text.len() > MAX_MP2_FRAME_BYTES {
+        return Err(Mp2WsError::FrameTooLarge {
+            len: text.len(),
+            max_len: MAX_MP2_FRAME_BYTES,
+        });
+    }
+    Ok(text)
+}
+
+/// Builds a canonical outbound `mp2` `e2ee_ephemeral` JSON frame, strictly enforcing
+/// `target == "*"`, `kind == "e2ee_ephemeral"`, `body_encoding == "opaque_b64"`, and `<= 32 KiB` body cap.
+pub fn build_e2ee_ephemeral_frame_json(
+    client_msg_id: &str,
+    mls_epoch: u64,
+    body_b64: &str,
+) -> Result<String, Mp2WsError> {
+    if body_b64.is_empty() {
+        return Err(Mp2WsError::InvalidJson(
+            "e2ee_ephemeral body_b64 must not be empty".to_owned(),
+        ));
+    }
+    if body_b64.len() > MAX_MP2_BODY_BYTES {
+        return Err(Mp2WsError::BodyTooLarge {
+            len: body_b64.len(),
+            max_len: MAX_MP2_BODY_BYTES,
+        });
+    }
+    let frame = OutboundSendFrame {
+        v: 2,
+        t: "ephemeral",
+        client_msg_id,
+        kind: Mp2EventKind::E2eeEphemeral,
+        target: "*",
+        body_encoding: "opaque_b64",
+        body: body_b64,
+        mls_epoch: Some(mls_epoch),
+    };
+    let text = serde_json::to_string(&frame).map_err(|e| Mp2WsError::InvalidJson(e.to_string()))?;
+    if text.len() > MAX_MP2_FRAME_BYTES {
+        return Err(Mp2WsError::FrameTooLarge {
+            len: text.len(),
+            max_len: MAX_MP2_FRAME_BYTES,
+        });
+    }
+    Ok(text)
 }
 
 #[derive(Serialize)]
@@ -412,6 +725,7 @@ pub struct Mp2RoomSocket {
     stream: WebSocketStream<PrefixedIo<TlsStream<TcpStream>>>,
     path: String,
     last_pong_ms: u64,
+    e2ee_mode: u8,
 }
 
 impl fmt::Debug for Mp2RoomSocket {
@@ -419,6 +733,7 @@ impl fmt::Debug for Mp2RoomSocket {
         f.debug_struct("Mp2RoomSocket")
             .field("path", &self.path)
             .field("last_pong_ms", &self.last_pong_ms)
+            .field("e2ee_mode", &self.e2ee_mode)
             .finish_non_exhaustive()
     }
 }
@@ -491,7 +806,7 @@ impl Mp2RoomSocket {
         .await
         .map_err(|_| WsConnectError::Timeout)??;
 
-        let limits = Limits::default().max_payload_len(Some(MAX_MP2_FRAME_BYTES));
+        let limits = Limits::default().max_payload_len(Some(MAX_MP2_CONTROL_FRAME_BYTES));
         let stream = ClientBuilder::new()
             .limits(limits)
             .take_over(PrefixedIo::new(leftover, tls_stream));
@@ -500,6 +815,7 @@ impl Mp2RoomSocket {
             stream,
             path: path.to_owned(),
             last_pong_ms: sleep_aware_now_ms(),
+            e2ee_mode: 0,
         })
     }
 
@@ -509,6 +825,14 @@ impl Mp2RoomSocket {
 
     pub const fn last_pong_ms(&self) -> u64 {
         self.last_pong_ms
+    }
+
+    pub const fn e2ee_mode(&self) -> u8 {
+        self.e2ee_mode
+    }
+
+    pub fn set_e2ee_mode(&mut self, mode: u8) {
+        self.e2ee_mode = mode;
     }
 
     pub fn silence_ms(&self) -> u64 {
@@ -523,7 +847,9 @@ impl Mp2RoomSocket {
             .map_err(Mp2WsError::Websocket)
     }
 
-    /// Sends an idempotent `mp2` `send` frame (`chat`, `agent_card`, or `system`).
+    /// Sends an idempotent `mp2` `send` frame (`chat`, `agent_card`, `system`, `e2ee_app`, or `e2ee_ephemeral`).
+    ///
+    /// In `e2ee_mode == 1` rooms, fails closed if `target != "*"` or `body_encoding != "opaque_b64"`.
     pub async fn send_event(
         &mut self,
         client_msg_id: &str,
@@ -532,6 +858,12 @@ impl Mp2RoomSocket {
         body_encoding: &str,
         body: &str,
     ) -> Result<(), Mp2WsError> {
+        if self.e2ee_mode == 1 && (target != "*" || body_encoding != "opaque_b64") {
+            return Err(Mp2WsError::InvalidJson(
+                "e2ee_mode == 1 requires target == \"*\" and body_encoding == \"opaque_b64\""
+                    .to_owned(),
+            ));
+        }
         if body.len() > MAX_MP2_BODY_BYTES {
             return Err(Mp2WsError::BodyTooLarge {
                 len: body.len(),
@@ -546,6 +878,7 @@ impl Mp2RoomSocket {
             target,
             body_encoding,
             body,
+            mls_epoch: None,
         };
         let text = serde_json::to_string(&frame)
             .map_err(|e| Mp2WsError::InvalidJson(e.to_string()))?;
@@ -555,6 +888,36 @@ impl Mp2RoomSocket {
                 max_len: MAX_MP2_FRAME_BYTES,
             });
         }
+        self.stream
+            .send(Message::text(text))
+            .await
+            .map_err(Mp2WsError::Websocket)
+    }
+
+    /// Sends an encrypted durable `e2ee_app` frame strictly enforcing outer `target == "*"`
+    /// and `body_encoding == "opaque_b64"`.
+    pub async fn send_e2ee_app(
+        &mut self,
+        client_msg_id: &str,
+        mls_epoch: u64,
+        body_b64: &str,
+    ) -> Result<(), Mp2WsError> {
+        let text = build_e2ee_app_frame_json(client_msg_id, mls_epoch, body_b64)?;
+        self.stream
+            .send(Message::text(text))
+            .await
+            .map_err(Mp2WsError::Websocket)
+    }
+
+    /// Sends an encrypted ephemeral `e2ee_ephemeral` frame strictly enforcing outer `target == "*"`
+    /// and `body_encoding == "opaque_b64"`.
+    pub async fn send_e2ee_ephemeral(
+        &mut self,
+        client_msg_id: &str,
+        mls_epoch: u64,
+        body_b64: &str,
+    ) -> Result<(), Mp2WsError> {
+        let text = build_e2ee_ephemeral_frame_json(client_msg_id, mls_epoch, body_b64)?;
         self.stream
             .send(Message::text(text))
             .await
@@ -606,6 +969,9 @@ impl Mp2RoomSocket {
     }
 
     /// Sends a `status` frame updating local client/agent status pill in room presence.
+    ///
+    /// Suppressed completely (no-op) in `e2ee_mode == 1` rooms so agent name/state/summary
+    /// metadata is NEVER leaked in cleartext to `PartyDO` (use [`Self::send_e2ee_ephemeral`] instead).
     pub async fn send_status(
         &mut self,
         client: &str,
@@ -613,6 +979,9 @@ impl Mp2RoomSocket {
         agent_state: &str,
         agent_summary: Option<&str>,
     ) -> Result<(), Mp2WsError> {
+        if self.e2ee_mode == 1 {
+            return Ok(());
+        }
         let frame = OutboundStatusFrame {
             v: 2,
             t: "status",
@@ -635,8 +1004,8 @@ impl Mp2RoomSocket {
             .map_err(Mp2WsError::Websocket)
     }
 
-    /// Receives the next `mp2` room event (`Hello`, `Event`, `Ack`, `Presence`, `Error`, `Pong`,
-    /// or `Closed`), enforcing `<= 48 KiB` frame cap and answering RFC 6455 Ping automatically.
+    /// Receives the next `mp2` room event (`Hello`, `Event`, `Ack`, `Presence`, MLS signals,
+    /// `EphemeralEvent`, `Error`, `Pong`, or `Closed`), answering RFC 6455 Ping automatically.
     pub async fn next_event(&mut self) -> Result<Option<Mp2RoomEvent>, Mp2WsError> {
         loop {
             let Some(item) = self.stream.next().await else {
@@ -666,18 +1035,24 @@ impl Mp2RoomSocket {
             }
             if msg.is_text() {
                 let payload = msg.as_payload();
-                if payload.len() > MAX_MP2_FRAME_BYTES {
+                if payload.len() > MAX_MP2_CONTROL_FRAME_BYTES {
                     return Err(Mp2WsError::FrameTooLarge {
                         len: payload.len(),
-                        max_len: MAX_MP2_FRAME_BYTES,
+                        max_len: MAX_MP2_CONTROL_FRAME_BYTES,
                     });
                 }
                 let text = msg
                     .as_text()
                     .ok_or_else(|| Mp2WsError::InvalidJson("non-UTF8 text frame".to_owned()))?;
                 let ev = parse_mp2_server_text(text)?;
-                if matches!(ev, Mp2RoomEvent::Pong) {
-                    self.last_pong_ms = sleep_aware_now_ms();
+                match &ev {
+                    Mp2RoomEvent::Pong => {
+                        self.last_pong_ms = sleep_aware_now_ms();
+                    }
+                    Mp2RoomEvent::Hello(hello) => {
+                        self.e2ee_mode = hello.e2ee_mode;
+                    }
+                    _ => {}
                 }
                 return Ok(Some(ev));
             }

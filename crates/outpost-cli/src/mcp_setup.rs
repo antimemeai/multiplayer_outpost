@@ -638,6 +638,72 @@ pub(crate) fn write_mcp_client_config(
     Ok(backup_path)
 }
 
+/// Read-only, zero-secret inspection of known local editor MCP config files for `doctor --trace`.
+/// Never returns file contents, env vars, API keys, tokens, or user home directory prefixes.
+pub(crate) fn inspect_mcp_wiring_redacted() -> Vec<Value> {
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from);
+    inspect_mcp_wiring_redacted_with_home(home.as_deref())
+}
+
+pub(crate) fn inspect_mcp_wiring_redacted_with_home(home: Option<&Path>) -> Vec<Value> {
+    const CLIENTS: [&str; 8] = [
+        "claude",
+        "codex",
+        "cursor",
+        "antigravity",
+        "hermes",
+        "gemini",
+        "opencode",
+        "zed",
+    ];
+    let mut out = Vec::new();
+    for client in CLIENTS {
+        let mut paths = Vec::new();
+        if let Ok(p) = default_mcp_config_paths_from_home(client, true, home) {
+            paths.extend(p);
+        }
+        if matches!(client, "claude" | "cursor")
+            && let Ok(p) = default_mcp_config_paths_from_home(client, false, home)
+        {
+            for item in p {
+                if !paths.contains(&item) {
+                    paths.push(item);
+                }
+            }
+        }
+        let mut config_present = false;
+        let mut local_outpost_configured = false;
+        let mut remote_readonly_mcp_configured = false;
+        for path in paths {
+            if let Ok(raw) = read_regular_file_bounded_nofollow(&path, MAX_MCP_CONFIG_BYTES) {
+                config_present = true;
+                if let Ok(text) = core::str::from_utf8(&raw) {
+                    let lower = text.to_ascii_lowercase();
+                    if lower.contains("mp-outpost")
+                        && (lower.contains("\"multiplayer\"")
+                            || lower.contains("mcp_servers.multiplayer")
+                            || lower.contains("multiplayer:"))
+                    {
+                        local_outpost_configured = true;
+                    }
+                    if lower.contains("multiplayer.tech/mcp") {
+                        remote_readonly_mcp_configured = true;
+                    }
+                }
+            }
+        }
+        out.push(json!({
+            "client": client,
+            "config_present": config_present,
+            "local_outpost_configured": local_outpost_configured,
+            "remote_readonly_mcp_configured": remote_readonly_mcp_configured,
+        }));
+    }
+    out
+}
+
 pub(crate) fn cmd_mcp(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     let Some(sub) = args.first().map(String::as_str) else {
         return Err(format!(
@@ -754,6 +820,10 @@ pub(crate) fn cmd_mcp(opts: &GlobalOpts, args: &[String]) -> Result<(), String> 
             }
             if client == "hermes" {
                 println!("Reload MCP servers in an active Hermes session with `/reload-mcp`.");
+            } else {
+                println!(
+                    "If {client} is already open, reconnect/restart its `multiplayer` MCP server so it uses the updated `mp-outpost` binary."
+                );
             }
         }
         return Ok(());

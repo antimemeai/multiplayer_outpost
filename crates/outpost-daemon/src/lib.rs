@@ -26,12 +26,13 @@ pub use ipc_codec::{
     encode_hello, encode_hello_ack, read_ipc_frame, write_ipc_frame,
 };
 pub use os_unix::{
-    DAEMON_INFO_NAME, DAEMON_LOCK_NAME, DAEMON_LOG_NAME, FlockGuard, ForceStopOutcome, PeerCreds,
+    CACHEDIR_TAG_CONTENT, DAEMON_INFO_NAME, DAEMON_LOCK_NAME, DAEMON_LOG_NAME, FlockGuard,
+    ForceStopOutcome, MACOS_BACKUP_EXCLUDE_BPLIST, MACOS_BACKUP_EXCLUDE_XATTR, PeerCreds,
     PublishedListener, READY_FD, STARTUP_LOCK_NAME, SpawnCommand, current_process_start_token,
-    daemonize_in_child, fill_random, force_stop_daemon, generate_daemon_epoch,
-    install_daemon_process_hygiene, monotonic_boottime_ms, open_rotating_log, process_start_token,
-    publish_unix_listener, send_ready_reply_and_close, spawn_detached_daemon, verify_peer_creds,
-    verify_peer_same_uid, write_log_lock_free,
+    daemonize_in_child, exclude_dir_from_backup, fill_random, force_stop_daemon,
+    generate_daemon_epoch, install_daemon_process_hygiene, monotonic_boottime_ms,
+    open_rotating_log, process_start_token, publish_unix_listener, send_ready_reply_and_close,
+    spawn_detached_daemon, verify_peer_creds, verify_peer_same_uid, write_log_lock_free,
 };
 pub use runtime_dir::{
     MAX_SUN_PATH_BYTES, SOCKET_FILE_NAME, TEMP_SOCKET_SAMPLE_NAME, VerifiedDir,

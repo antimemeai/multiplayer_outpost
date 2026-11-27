@@ -40,6 +40,7 @@ ed25519-dalek = { version = "2.1", default-features = false, features = ["std", 
 getrandom = "0.4"
 icu_normalizer.workspace = true
 libc.workspace = true
+mp-mls.workspace = true
 mp-protocol.workspace = true
 outpost-control = { path = "../outpost-control" }
 outpost-core = { path = "../outpost-core" }

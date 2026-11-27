@@ -11,6 +11,8 @@ pub mod fence;
 pub mod inbox_crypto;
 pub mod ipc_wire;
 pub mod lan_protocol;
+pub mod mls_session;
+pub mod mls_store;
 pub mod p2p_wire;
 pub mod party_state;
 pub mod policy;

@@ -7,10 +7,13 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+aes-gcm.workspace = true
 base64.workspace = true
 blake3.workspace = true
 ed25519-dalek.workspace = true
+mp-mls.workspace = true
 mp-protocol.workspace = true
+openmls.workspace = true
 ring.workspace = true
 sha2.workspace = true
 zeroize.workspace = true

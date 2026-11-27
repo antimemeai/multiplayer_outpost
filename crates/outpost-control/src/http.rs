@@ -66,6 +66,12 @@ pub const MAX_INBOX_RECIPIENT_DEVICES: usize = 8;
 pub const MAX_INBOX_PENDING_DROPS: usize = 16;
 /// Exact decoded byte length of an E2EE encryption subkey certificate (`161` bytes).
 pub const ENC_CERT_BYTES: usize = 161;
+/// Hard cap on MLS HTTPS control-plane request and response bodies (`256 KiB`, Spec v3).
+pub const MAX_MLS_CONTROL_BODY_BYTES: usize = 256 * 1024;
+/// Exact decoded byte length of canonical `MpMlsDeviceBindingV1` (`236` bytes).
+pub const MLS_DEVICE_BINDING_BYTES: usize = 236;
+/// Maximum commits page size accepted by `GET /v1/parties/:id/mls/commits?from_epoch=&limit=`.
+pub const MAX_MLS_COMMITS_PAGE_LIMIT: u8 = 32;
 
 const MAX_ERROR_MESSAGE_CHARS: usize = 256;
 const MAX_FETCH_URL_BYTES: usize = 8 * 1024;
@@ -1918,6 +1924,320 @@ impl ControlClient {
             })
         }
     }
+
+    // -----------------------------------------------------------------------
+    // MLS E2EE Control Plane (`mp2-mls-v1`, <= 256 KiB budget, strict RFC 9421)
+    // -----------------------------------------------------------------------
+
+    /// `POST /v1/devices/reserve` (`.root` signer required; reserves a monotonic `device_id`
+    /// BEFORE signing `MpMlsDeviceBindingV1`).
+    pub async fn reserve_device_id(
+        &self,
+        root_signer: &RequestSigner,
+        req: &ReserveDeviceRequest,
+    ) -> Result<ReserveDeviceResponse, ControlError> {
+        require_root_signer(root_signer)?;
+        let body = encode_json_bounded(req, MAX_MLS_CONTROL_BODY_BYTES)?;
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                root_signer,
+                HttpMethod::Post,
+                "/v1/devices/reserve",
+                "?",
+                body,
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        let decoded: ReserveDeviceResponse = Self::decode_json_response(resp, &[200, 201])?;
+        validate_device_id(decoded.device_id, "reserve_device_id")?;
+        Ok(decoded)
+    }
+
+    /// `PUT /v1/devices/binding` (device or `.root` signer; uploads 236-byte `MpMlsDeviceBindingV1`).
+    pub async fn put_device_binding(
+        &self,
+        signer: &RequestSigner,
+        req: &PutDeviceBindingRequest,
+    ) -> Result<PutDeviceBindingResponse, ControlError> {
+        require_device_or_root_signer(signer)?;
+        let decoded_binding = B64_STD
+            .decode(req.device_binding_b64.as_bytes())
+            .map_err(|_| ControlError::InvalidRequest("invalid device_binding_b64".to_owned()))?;
+        if decoded_binding.len() != MLS_DEVICE_BINDING_BYTES {
+            return Err(ControlError::InvalidRequest(format!(
+                "device_binding must be exactly {MLS_DEVICE_BINDING_BYTES} bytes (got {})",
+                decoded_binding.len()
+            )));
+        }
+        let body = encode_json_bounded(req, MAX_MLS_CONTROL_BODY_BYTES)?;
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Put,
+                "/v1/devices/binding",
+                "?",
+                body,
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        let decoded: PutDeviceBindingResponse = Self::decode_json_response(resp, &[200, 201])?;
+        validate_device_id(decoded.device_id, "put_device_binding")?;
+        Ok(decoded)
+    }
+
+    /// `PUT /v1/devices/list` (`.root` signer required; uploads root-signed `AccountDeviceListV1`).
+    pub async fn put_device_list(
+        &self,
+        root_signer: &RequestSigner,
+        req: &PutDeviceListRequest,
+    ) -> Result<PutDeviceListResponse, ControlError> {
+        require_root_signer(root_signer)?;
+        let body = encode_json_bounded(req, MAX_MLS_CONTROL_BODY_BYTES)?;
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                root_signer,
+                HttpMethod::Put,
+                "/v1/devices/list",
+                "?",
+                body,
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200, 201])
+    }
+
+    /// `GET /v1/devices/list` (device-authenticated; fetches caller account's latest `AccountDeviceListV1`).
+    pub async fn get_device_list(&self) -> Result<GetDeviceListResponse, ControlError> {
+        let signer = self.require_device_signer()?;
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Get,
+                "/v1/devices/list",
+                "?",
+                Bytes::new(),
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
+    /// `POST /v1/parties/<party_id>/mls/init` (strict device signer; bootstraps epoch-0 `PublicGroup`).
+    pub async fn mls_init_group(
+        &self,
+        party_id: PartyId,
+        req: &MlsInitRequest,
+    ) -> Result<MlsInitResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        let path = format!("/v1/parties/{party_id}/mls/init");
+        let body = encode_json_bounded(req, MAX_MLS_CONTROL_BODY_BYTES)?;
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Post,
+                &path,
+                "?",
+                body,
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200, 201])
+    }
+
+    /// `POST /v1/parties/<party_id>/mls/invites` (strict device signer; registers split-secret invite hash).
+    pub async fn mls_create_invite(
+        &self,
+        party_id: PartyId,
+        req: &MlsCreateInviteRequest,
+    ) -> Result<MlsCreateInviteResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        let path = format!("/v1/parties/{party_id}/mls/invites");
+        let body = encode_json_bounded(req, MAX_MLS_CONTROL_BODY_BYTES)?;
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Post,
+                &path,
+                "?",
+                body,
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200, 201])
+    }
+
+    /// `POST /v1/parties/<party_id>/mls/join` (strict device signer; submits single-use KeyPackage + `join_proof`).
+    pub async fn mls_submit_join(
+        &self,
+        party_id: PartyId,
+        req: &MlsJoinRequest,
+    ) -> Result<MlsJoinResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        let path = format!("/v1/parties/{party_id}/mls/join");
+        let body = encode_json_bounded(req, MAX_MLS_CONTROL_BODY_BYTES)?;
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Post,
+                &path,
+                "?",
+                body,
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200, 201, 202])
+    }
+
+    /// `POST /v1/parties/<party_id>/mls/commit` (strict device signer; submits path-bearing MLS Commit).
+    pub async fn mls_submit_commit(
+        &self,
+        party_id: PartyId,
+        req: &MlsCommitRequest,
+    ) -> Result<MlsCommitResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        let path = format!("/v1/parties/{party_id}/mls/commit");
+        let body = encode_json_bounded(req, MAX_MLS_CONTROL_BODY_BYTES)?;
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Post,
+                &path,
+                "?",
+                body,
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200, 201, 202])
+    }
+
+    /// `POST /v1/parties/<party_id>/mls/ack` (strict device signer; submits signed `CommitAckV1`).
+    pub async fn mls_submit_ack(
+        &self,
+        party_id: PartyId,
+        req: &MlsCommitAckRequest,
+    ) -> Result<MlsCommitAckResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        let path = format!("/v1/parties/{party_id}/mls/ack");
+        let body = encode_json_bounded(req, MAX_MLS_CONTROL_BODY_BYTES)?;
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Post,
+                &path,
+                "?",
+                body,
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
+    /// `GET /v1/parties/<party_id>/mls/commits?from_epoch=<n>&limit=<1..=32>`
+    /// (strict device signer; fetches finalized Commit catch-up bundles paired with referenced proposals).
+    pub async fn mls_fetch_commits(
+        &self,
+        party_id: PartyId,
+        from_epoch: u64,
+        limit: u8,
+    ) -> Result<MlsFetchCommitsResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        if from_epoch > MAX_SAFE_ID {
+            return Err(ControlError::InvalidRequest(format!(
+                "from_epoch exceeds MAX_SAFE_ID ({MAX_SAFE_ID})"
+            )));
+        }
+        let clamped_limit = limit.clamp(1, MAX_MLS_COMMITS_PAGE_LIMIT);
+        let path = format!("/v1/parties/{party_id}/mls/commits");
+        let query = format!("?from_epoch={from_epoch}&limit={clamped_limit}");
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Get,
+                &path,
+                &query,
+                Bytes::new(),
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
+    /// `GET /v1/parties/<party_id>/mls/welcome` (strict device signer; fetches pending Welcome + `WelcomeAuthV1`).
+    pub async fn mls_fetch_welcome(
+        &self,
+        party_id: PartyId,
+    ) -> Result<MlsFetchWelcomeResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        let path = format!("/v1/parties/{party_id}/mls/welcome");
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Get,
+                &path,
+                "?",
+                Bytes::new(),
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
+    /// `POST /v1/parties/<party_id>/mls/welcome/ack` (strict device signer; idempotent Welcome ack
+    /// sent ONLY AFTER atomic local Welcome installation!).
+    pub async fn mls_ack_welcome(
+        &self,
+        party_id: PartyId,
+        req: &MlsWelcomeAckRequest,
+    ) -> Result<MlsWelcomeAckResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        let path = format!("/v1/parties/{party_id}/mls/welcome/ack");
+        let body = encode_json_bounded(req, MAX_MLS_CONTROL_BODY_BYTES)?;
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Post,
+                &path,
+                "?",
+                body,
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
+
+    /// `GET /v1/parties/<party_id>/mls/device-lists` (strict device signer; fetches all room members'
+    /// `AccountDeviceListV1` blobs).
+    pub async fn mls_fetch_device_lists(
+        &self,
+        party_id: PartyId,
+    ) -> Result<MlsDeviceListsResponse, ControlError> {
+        let (signer, _, _) = self.require_strict_device_signer()?;
+        let path = format!("/v1/parties/{party_id}/mls/device-lists");
+        let resp = self
+            .execute_signed_with_max_response_bytes(
+                signer,
+                HttpMethod::Get,
+                &path,
+                "?",
+                Bytes::new(),
+                None,
+                MAX_MLS_CONTROL_BODY_BYTES,
+            )
+            .await?;
+        Self::decode_json_response(resp, &[200])
+    }
 }
 
 /// Downloads bounded bytes over TLS 1.3 + HTTP/1.1 using the default `webpki-roots`
@@ -2425,6 +2745,18 @@ fn encode_json<T: Serialize>(value: &T) -> Result<Bytes, ControlError> {
     serde_json::to_vec(value)
         .map(Bytes::from)
         .map_err(|e| ControlError::InvalidRequest(e.to_string()))
+}
+
+fn encode_json_bounded<T: Serialize>(value: &T, max_bytes: usize) -> Result<Bytes, ControlError> {
+    let raw = serde_json::to_vec(value).map_err(|e| ControlError::InvalidRequest(e.to_string()))?;
+    if raw.len() > max_bytes {
+        return Err(ControlError::InvalidRequest(format!(
+            "request body size {} exceeds {} byte budget",
+            raw.len(),
+            max_bytes
+        )));
+    }
+    Ok(Bytes::from(raw))
 }
 
 /// Validates a server-returned device-link code strictly (`XXXX-XXXX`, 9 ASCII bytes
@@ -3446,6 +3778,8 @@ pub struct RoomMemberSummary {
     #[serde(default)]
     pub is_guest: bool,
     #[serde(default)]
+    pub is_browser: bool,
+    #[serde(default)]
     pub agent_name: Option<String>,
     #[serde(default)]
     pub status: String,
@@ -3777,4 +4111,229 @@ struct AckInboxWire<'a> {
 pub struct AckInboxResponse {
     pub acked: u64,
     pub pruned_drops: u64,
+}
+
+// ---------------------------------------------------------------------------
+// MLS E2EE Control Plane Request / Response Models (`mp2-mls-v1`, <= 256 KiB)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReserveDeviceRequest {
+    pub client_class: u8,
+    pub device_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ReserveDeviceResponse {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub device_id: u64,
+    #[serde(default)]
+    pub root_gen: u32,
+    #[serde(default)]
+    pub device_gen: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PutDeviceBindingRequest {
+    pub device_binding_b64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PutDeviceBindingResponse {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub device_id: u64,
+    #[serde(default)]
+    pub device_gen: u32,
+    #[serde(default)]
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PutDeviceListRequest {
+    pub device_list_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PutDeviceListResponse {
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub list_version: u64,
+    #[serde(default)]
+    pub list_hash_b64: String,
+    #[serde(default)]
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GetDeviceListResponse {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub account_id: u64,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub list_version: u64,
+    pub device_list_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MlsInitRequest {
+    pub group_id_b64: String,
+    pub group_info_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsInitResponse {
+    #[serde(default)]
+    pub ok: bool,
+    pub group_id_b64: String,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub mls_epoch: u64,
+    #[serde(default)]
+    pub party_ds_pubkey_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MlsCreateInviteRequest {
+    pub server_token_hash_b64: String,
+    pub max_uses: u32,
+    pub expires_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invite_epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsCreateInviteResponse {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub invite_id: u64,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub invite_epoch: u64,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub expires_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MlsJoinRequest {
+    pub invite_id: u64,
+    pub server_invite_token_b64: String,
+    pub kp_ref_b64: String,
+    pub kp_blob_b64: String,
+    pub join_proof_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsJoinResponse {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub mls_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MlsCommitRequest {
+    pub parent_epoch: u64,
+    pub commit_b64: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub welcome_b64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub welcome_auth_b64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub joiner_device_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsCommitResponse {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub target_epoch: u64,
+    #[serde(default)]
+    pub commit_sha256_b64: String,
+    #[serde(default)]
+    pub finalized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MlsCommitAckRequest {
+    pub group_id_b64: String,
+    pub parent_epoch: u64,
+    pub target_epoch: u64,
+    pub commit_sha256_b64: String,
+    pub status: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch_auth_hash_b64: Option<String>,
+    pub ack_sig_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsCommitAckResponse {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub finalized: bool,
+    #[serde(default)]
+    pub discarded: bool,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub new_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsCommitBundleItem {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub epoch: u64,
+    pub commit_b64: String,
+    #[serde(default)]
+    pub proposal_blobs_b64: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsFetchCommitsResponse {
+    #[serde(default)]
+    pub group_id_b64: String,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub head_epoch: u64,
+    #[serde(default)]
+    pub commits: Vec<MlsCommitBundleItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsFetchWelcomeResponse {
+    #[serde(default)]
+    pub pending: bool,
+    #[serde(default)]
+    pub group_id_b64: String,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub target_epoch: u64,
+    #[serde(default)]
+    pub welcome_b64: Option<String>,
+    #[serde(default)]
+    pub welcome_auth_b64: Option<String>,
+    #[serde(default)]
+    pub party_ds_pubkey_b64: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MlsWelcomeAckRequest {
+    pub group_id_b64: String,
+    pub target_epoch: u64,
+    pub kp_ref_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsWelcomeAckResponse {
+    #[serde(default)]
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsAccountDeviceListItem {
+    #[serde(deserialize_with = "deserialize_u64_or_string")]
+    pub account_id: u64,
+    #[serde(default, deserialize_with = "deserialize_u64_or_string")]
+    pub list_version: u64,
+    pub device_list_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MlsDeviceListsResponse {
+    #[serde(default)]
+    pub device_lists: Vec<MlsAccountDeviceListItem>,
 }

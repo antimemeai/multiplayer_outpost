@@ -9,10 +9,15 @@ use std::time::Duration;
 use base64::Engine as _;
 #[cfg(any(test, feature = "test-tls-overrides"))]
 use base64::engine::general_purpose::STANDARD as B64;
+use mp_mls::MP_GROUP_ID_LEN;
 use mp_protocol::{MAX_SAFE_ID, sha256};
 #[cfg(any(test, feature = "test-tls-overrides"))]
 use outpost_control::build_tls13_client_config_with_roots;
 use outpost_control::{ControlClientConfig, ControlError};
+use outpost_core::mls_store::{
+    MLS_STORE_MAX_FILE_BYTES, MlsRoomSnapshotPlain, decrypt_mls_snapshot, derive_mls_store_key,
+    encrypt_mls_snapshot_random,
+};
 use outpost_core::storage_codec::{
     DefaultDeviceRecord, DeviceRecord, EpochsStoreRecord, PeersStoreRecord, PendingDeviceRecord,
     PendingRegRecord, decode_default_device, decode_device_record, decode_epochs_store,
@@ -21,8 +26,8 @@ use outpost_core::storage_codec::{
     encode_pending_reg,
 };
 use outpost_daemon::{
-    DaemonError, StateLock, VerifiedDir, atomic_write_in_dir, format_device_dir_name,
-    open_or_create_private_dir, read_file_in_dir, resolve_state_dir,
+    DaemonError, StateLock, VerifiedDir, atomic_write_in_dir, exclude_dir_from_backup,
+    format_device_dir_name, open_or_create_private_dir, read_file_in_dir, resolve_state_dir,
 };
 #[cfg(any(test, feature = "test-tls-overrides"))]
 use rustls::pki_types::CertificateDer;
@@ -36,6 +41,7 @@ pub const PENDING_REG_CWT_FILE: &str = "pending_reg.cwt";
 pub const PEERS_FILE: &str = "peers.bin";
 pub const EPOCHS_FILE: &str = "epochs.bin";
 pub const DEVICES_SUBDIR: &str = "devices";
+pub const MLS_SUBDIR: &str = "mls";
 pub const DEFAULT_RELAY_URL: &str = "https://relay.multiplayer.tech";
 
 pub const STATE_LOCK_DEADLINE: Duration = Duration::from_secs(5);
@@ -70,6 +76,95 @@ pub fn open_state_dir(state_dir_path: &Path) -> Result<VerifiedDir, String> {
 pub fn open_devices_dir(state_dir_path: &Path) -> Result<VerifiedDir, String> {
     let _ = open_state_dir(state_dir_path)?;
     open_or_create_private_dir(&state_dir_path.join(DEVICES_SUBDIR)).map_err(|e| e.to_string())
+}
+
+/// Opens (creating if needed) the backup-excluded private MLS directory
+/// `<state_dir>/mls/d<13hex>/` (`0700` + macOS `fsetxattr` / Linux `.nobackup` + `CACHEDIR.TAG`).
+pub fn open_mls_device_dir(state_dir_path: &Path, device_id: u64) -> Result<VerifiedDir, String> {
+    let _ = open_state_dir(state_dir_path)?;
+    let mls_root = open_or_create_private_dir(&state_dir_path.join(MLS_SUBDIR))
+        .map_err(|e| e.to_string())?;
+    exclude_dir_from_backup(&mls_root).map_err(|e| e.to_string())?;
+    let dev_leaf = format_device_dir_name(device_id).map_err(|e| e.to_string())?;
+    let dev_dir = open_or_create_private_dir(&state_dir_path.join(MLS_SUBDIR).join(dev_leaf))
+        .map_err(|e| e.to_string())?;
+    exclude_dir_from_backup(&dev_dir).map_err(|e| e.to_string())?;
+    Ok(dev_dir)
+}
+
+pub fn mls_room_filename(party_id: u64) -> Result<String, String> {
+    if party_id == 0 || party_id > MAX_SAFE_ID {
+        return Err(format!("invalid party_id {party_id}"));
+    }
+    Ok(format!("p{party_id:013x}.mls.bin"))
+}
+
+/// Atomically writes already-encrypted `MPM1` MLS snapshot bytes into `<state_dir>/mls/d<13hex>/`
+/// under `StateLock` BEFORE any WebSocket transmit.
+pub fn save_mls_room_bytes(
+    state_dir_path: &Path,
+    _lock: &StateLock,
+    device_id: u64,
+    party_id: u64,
+    encrypted_bytes: &[u8],
+) -> Result<(), String> {
+    let mls_dir = open_mls_device_dir(state_dir_path, device_id)?;
+    let fname = mls_room_filename(party_id)?;
+    atomic_write_in_dir(mls_dir.as_raw_fd(), &fname, encrypted_bytes).map_err(|e| e.to_string())
+}
+
+/// Encrypts `snapshot` with AES-256-GCM and writes it atomically into `<state_dir>/mls/d<13hex>/`
+/// under `StateLock`.
+#[allow(dead_code)]
+pub fn save_mls_room_snapshot(
+    state_dir_path: &Path,
+    lock: &StateLock,
+    device_secret: &[u8; 32],
+    device_id: u64,
+    party_id: u64,
+    group_id: &[u8; MP_GROUP_ID_LEN],
+    snapshot: &MlsRoomSnapshotPlain,
+) -> Result<(), String> {
+    let key = derive_mls_store_key(device_secret, device_id);
+    let encrypted = encrypt_mls_snapshot_random(&key, device_id, party_id, group_id, snapshot)
+        .map_err(|e| format!("encrypt MLS room snapshot failed: {e}"))?;
+    save_mls_room_bytes(state_dir_path, lock, device_id, party_id, &encrypted)
+}
+
+/// Loads and decrypts an `MPM1` MLS room snapshot from `<state_dir>/mls/d<13hex>/`, failing closed
+/// on any CRC, AAD binding, or AES-256-GCM authentication failure.
+#[allow(dead_code)]
+pub fn load_mls_room_snapshot(
+    state_dir_path: &Path,
+    device_secret: &[u8; 32],
+    device_id: u64,
+    party_id: u64,
+    group_id: &[u8; MP_GROUP_ID_LEN],
+) -> Result<Option<MlsRoomSnapshotPlain>, String> {
+    let mls_dir = open_mls_device_dir(state_dir_path, device_id)?;
+    let fname = mls_room_filename(party_id)?;
+    let Some(raw) = read_file_in_dir(mls_dir.as_raw_fd(), &fname, MLS_STORE_MAX_FILE_BYTES)
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let key = derive_mls_store_key(device_secret, device_id);
+    let plain = decrypt_mls_snapshot(&key, device_id, party_id, group_id, &raw)
+        .map_err(|e| format!("corrupt or mismatched MLS snapshot '{fname}': {e}"))?;
+    Ok(Some(plain))
+}
+
+pub fn remove_mls_room_snapshot(
+    state_dir_path: &Path,
+    _lock: &StateLock,
+    device_id: u64,
+    party_id: u64,
+) {
+    if let Ok(mls_dir) = open_mls_device_dir(state_dir_path, device_id)
+        && let Ok(fname) = mls_room_filename(party_id)
+    {
+        let _ = std::fs::remove_file(mls_dir.path().join(fname));
+    }
 }
 
 pub fn lock_state(state_dir: &VerifiedDir) -> Result<StateLock, String> {
@@ -361,4 +456,121 @@ fn parse_pem_certificates(pem: &str) -> Result<Vec<CertificateDer<'static>>, Con
         }
     }
     Ok(certs)
+}
+
+#[cfg(test)]
+mod tests {
+    use outpost_core::mls_store::{
+        MlsDedupEntry, MlsRoomSnapshotPlain, PersistedOutboxEntry, PersistedPinnedRoot,
+    };
+
+    use super::{
+        load_mls_room_snapshot, lock_state, open_mls_device_dir, open_state_dir,
+        remove_mls_room_snapshot, save_mls_room_snapshot,
+    };
+
+    #[test]
+    fn backup_excluded_encrypted_mls_storage_roundtrip_under_state_lock() -> Result<(), String> {
+        let base = std::env::temp_dir().join(format!(
+            "outpost-cli-mls-store-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let state_dir = open_state_dir(&base)?;
+        let lock = lock_state(&state_dir)?;
+        let device_secret = [0x5Au8; 32];
+        let device_id = 2001u64;
+        let party_id = 7701u64;
+        let group_id = [0x33u8; 24];
+
+        let mls_dir = open_mls_device_dir(&base, device_id)?;
+        #[cfg(target_os = "macos")]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt as _;
+            let p = CString::new(mls_dir.path().as_os_str().as_bytes())
+                .map_err(|e| e.to_string())?;
+            let attr = CString::new(outpost_daemon::MACOS_BACKUP_EXCLUDE_XATTR)
+                .map_err(|e| e.to_string())?;
+            let mut buf = [0u8; 128];
+            #[allow(unsafe_code)]
+            let rc = unsafe {
+                libc::getxattr(
+                    p.as_ptr(),
+                    attr.as_ptr(),
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
+                    buf.len(),
+                    0,
+                    0,
+                )
+            };
+            assert!(rc > 0, "macOS backup exclusion xattr missing on MLS device dir");
+            assert_eq!(
+                buf.get(..rc as usize),
+                Some(outpost_daemon::MACOS_BACKUP_EXCLUDE_BPLIST.as_slice())
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert!(mls_dir.path().join(".nobackup").exists());
+            assert!(mls_dir.path().join("CACHEDIR.TAG").exists());
+        }
+
+        let snap = MlsRoomSnapshotPlain {
+            mls_storage_blob: vec![9, 8, 7, 6],
+            epoch: 3,
+            device_epoch_seq: 12,
+            total_sent_frames_in_epoch: 5,
+            cloned_device_key_suspected: false,
+            local_cache_wiped: false,
+            inviter_unconfirmed: false,
+            outbox: vec![PersistedOutboxEntry {
+                inner_msg_id: [0x11; 16],
+                client_msg_id: "mp2-2001-9".to_string(),
+                msg_class: 1,
+                target_selector: "@all".to_string(),
+                plaintext: b"persist before send".to_vec(),
+                sent_epoch: 3,
+                device_epoch_seq: 12,
+                wire_bytes: vec![0xAB; 32],
+            }],
+            dedup_ring: vec![MlsDedupEntry {
+                group_id,
+                auth_device_id: 2002,
+                inner_msg_id: [0x22; 16],
+            }],
+            pinned_roots: vec![PersistedPinnedRoot {
+                account_id: 1002,
+                root_pubkey: [0x44; 32],
+                root_gen: 1,
+                custody_mode: 1,
+                verified_oob: true,
+                pending_oob_reverify: false,
+            }],
+            pending_key_packages: Vec::new(),
+            device_binding_236b: vec![0x55; 236],
+            device_list_blob: vec![0x66; 64],
+            welcome_receipt: None,
+        };
+
+        save_mls_room_snapshot(
+            &base,
+            &lock,
+            &device_secret,
+            device_id,
+            party_id,
+            &group_id,
+            &snap,
+        )?;
+        let loaded = load_mls_room_snapshot(&base, &device_secret, device_id, party_id, &group_id)?;
+        assert_eq!(loaded, Some(snap));
+
+        remove_mls_room_snapshot(&base, &lock, device_id, party_id);
+        let after_rm =
+            load_mls_room_snapshot(&base, &device_secret, device_id, party_id, &group_id)?;
+        assert_eq!(after_rm, None);
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
 }

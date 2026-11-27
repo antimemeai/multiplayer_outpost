@@ -20,6 +20,8 @@ pub enum PartyEventBody {
         sender_account_id: u64,
         sender_device_id: u64,
         sender_handle: String,
+        is_browser: bool,
+        sender_client: String,
         room_scope: String,
         target_selector: String,
         timestamp_ns: i64,
@@ -29,6 +31,8 @@ pub enum PartyEventBody {
         sender_account_id: u64,
         sender_device_id: u64,
         sender_handle: String,
+        is_browser: bool,
+        sender_client: String,
         room_scope: String,
         payload: Vec<u8>,
     },
@@ -50,17 +54,25 @@ impl PartyEventBody {
         match self {
             Self::Chat {
                 sender_handle,
+                sender_client,
                 room_scope,
                 target_selector,
                 body,
                 ..
-            } => 64 + sender_handle.len() + room_scope.len() + target_selector.len() + body.len(),
+            } => {
+                64 + sender_handle.len()
+                    + sender_client.len()
+                    + room_scope.len()
+                    + target_selector.len()
+                    + body.len()
+            }
             Self::BridgeEnvelope {
                 sender_handle,
+                sender_client,
                 room_scope,
                 payload,
                 ..
-            } => 64 + sender_handle.len() + room_scope.len() + payload.len(),
+            } => 64 + sender_handle.len() + sender_client.len() + room_scope.len() + payload.len(),
             Self::ControlNotice { text, .. } => 48 + text.len(),
             Self::MembershipChanged { summary, .. } => 32 + summary.len(),
         }
@@ -71,6 +83,9 @@ impl PartyEventBody {
 pub struct PartyEvent {
     pub seq: u64,
     pub body: PartyEventBody,
+    /// `true` when this event was ingested from historical catch-up (`hello.history` or catch-up replay).
+    /// Historical catch-up events MUST NEVER trigger automated agent wakeups or mentions.
+    pub is_historical_catchup: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,10 +137,21 @@ impl PartyEventRing {
     }
 
     pub fn push(&mut self, body: PartyEventBody) -> u64 {
+        self.push_with_catchup(body, false)
+    }
+
+    pub fn push_with_catchup(&mut self, body: PartyEventBody, is_historical_catchup: bool) -> u64 {
         self.next_seq = self.next_seq.saturating_add(1);
         let seq = self.next_seq;
         let sz = body.approx_bytes();
-        self.events.push_back((PartyEvent { seq, body }, sz));
+        self.events.push_back((
+            PartyEvent {
+                seq,
+                body,
+                is_historical_catchup,
+            },
+            sz,
+        ));
         self.total_bytes = self.total_bytes.saturating_add(sz);
 
         while self.events.len() > MAX_RING_EVENTS

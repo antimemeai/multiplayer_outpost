@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use outpost_core::fence::SecretMatchKind;
+use outpost_core::mls_session::MlsRoomStatusSnapshot;
 use outpost_core::policy::PartyTrustProfile;
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc};
@@ -188,6 +189,20 @@ pub struct PeerProvenance {
     pub sender_handle: String,
     pub root_pubkey_fingerprint: String,
     pub safety_number: String,
+    /// True when the event originated from a web browser session (`is_browser: true` or `client == "web"`).
+    /// Browser-originated messages MUST always be treated as untrusted remote input even when
+    /// `sender_handle` or `sender_account_id` matches the local operator.
+    pub is_browser: bool,
+    /// Optional sender client tag reported by the room server (e.g. `"web"`, `"outpost"`, `"blackbird"`).
+    pub sender_client: String,
+}
+
+impl PeerProvenance {
+    pub fn is_browser_origin(&self) -> bool {
+        self.is_browser
+            || self.sender_client.trim().eq_ignore_ascii_case("web")
+            || self.sender_client.trim().eq_ignore_ascii_case("browser")
+    }
 }
 
 /// Untrusted remote event payload returned by `party_poll` / `party_wait` before MCP-layer nonce fencing.
@@ -223,6 +238,7 @@ pub struct McpPartyEvent {
     pub event_seq: u64,
     pub party_id: u64,
     pub party_epoch: u64,
+    pub is_historical_catchup: bool,
     pub kind: McpPartyEventKind,
 }
 
@@ -238,6 +254,7 @@ pub struct PartyPollResp {
     pub timed_out: bool,
     pub self_account_id: Option<u64>,
     pub self_handle: Option<String>,
+    pub mls: MlsRoomStatusSnapshot,
     pub events: Vec<McpPartyEvent>,
 }
 
@@ -278,6 +295,11 @@ pub enum BackendError {
     DaemonUnavailable,
     /// Outbound payload matched a forbidden secret (never echoed back).
     SecretRefused(SecretMatchKind),
+    /// Local CLI/daemon is not authenticated (no enrolled device or HTTP 401 credential rejection).
+    Unauthenticated {
+        reason: String,
+        http_status: Option<u16>,
+    },
     /// Invalid tool argument rejected by backend validation.
     InvalidParams(String),
     /// Domain/tool-level error returned as MCP `isError: true`.
@@ -293,6 +315,7 @@ impl fmt::Display for BackendError {
             }
             Self::DaemonUnavailable => write!(f, "outpost daemon unavailable"),
             Self::SecretRefused(kind) => write!(f, "secret material refused ({kind:?})"),
+            Self::Unauthenticated { reason, .. } => write!(f, "not authenticated: {reason}"),
             Self::InvalidParams(msg) => write!(f, "invalid params: {msg}"),
             Self::ToolError { code, message } => write!(f, "{code}: {message}"),
         }

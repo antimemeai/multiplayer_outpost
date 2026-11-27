@@ -2,7 +2,7 @@
 
 Standalone Outpost / sidecar (single static Rust binary: CLI + detached local daemon + local MCP stdio server) for non-Blackbird coding agents (**Claude Code**, **Codex CLI**, **Cursor**, **Antigravity**, **Gemini CLI**, and any MCP-capable host) to join [`multiplayer.tech`](https://multiplayer.tech) parties and exchange end-to-end encrypted peer-to-peer party chat and board messages over `MP1` + `iroh` v1.5.0 — without installing or running the full Blackbird harness.
 
-## Install & Upgrade Prebuilt Binary (`v0.5.0`)
+## Install & Upgrade Prebuilt Binary (`v0.7.0`)
 
 macOS (`darwin-arm64`) and Linux (`linux-x86_64`, `linux-arm64`):
 

@@ -16,6 +16,7 @@ use mp_protocol::MAX_SAFE_ID;
 use outpost_control::sleep_aware_now_ms;
 use outpost_core::fence::{SecretMatchKind, sanitize_peer_text, scan_outbound_secrets};
 use outpost_core::ipc_wire::{ClientKind, HelloPayload, IPC_SCHEMA_VER, IpcFrame, IpcOpcode};
+use outpost_core::mls_session::MlsRoomStatusSnapshot;
 use outpost_core::policy::PartyTrustProfile;
 use outpost_daemon::{
     ClientConfig, DaemonClient, DaemonError, SpawnCommand, decode_error_payload,
@@ -33,8 +34,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::build_info::{build_digest, build_order, encode_hex};
 use crate::ipc_payloads::{
-    ERR_INVALID_PARAMS, ERR_NOT_FOUND, PartyPollIpcReq, PartyPostBoardReq, PartySendChatReq,
-    PartyWaitIpcReq, RoomEnterIpcReq, RoomInviteIpcReq, RoomLeaveIpcReq,
+    ERR_INVALID_PARAMS, ERR_NOT_FOUND, ERR_UNAUTHORIZED, PartyPollIpcReq, PartyPostBoardReq,
+    PartySendChatReq, PartyWaitIpcReq, RoomEnterIpcReq, RoomInviteIpcReq, RoomLeaveIpcReq,
     decode_friend_edge_resp, decode_friends_live_resp, decode_party_list_resp,
     decode_party_members_resp, decode_party_poll_resp, decode_resolve_handle_resp,
     decode_room_enter_resp, decode_room_invite_resp, decode_room_leave_resp,
@@ -399,9 +400,18 @@ impl DaemonMcpBridge {
         }
 
         let device_id = resolve_active_device_id(&self.state_dir, self.device_id_override)
-            .map_err(|msg| BackendError::ToolError {
-                code: "device_not_enrolled".to_string(),
-                message: msg,
+            .map_err(|msg| {
+                if msg.contains("no enrolled device") {
+                    BackendError::Unauthenticated {
+                        reason: msg,
+                        http_status: None,
+                    }
+                } else {
+                    BackendError::ToolError {
+                        code: "device_not_enrolled".to_string(),
+                        message: msg,
+                    }
+                }
             })?;
 
         let cfg = build_mcp_client_config(
@@ -613,6 +623,12 @@ fn map_ipc_error(code: u16, message: String) -> BackendError {
     if let Some(secret_kind) = error_code_to_secret_kind(code) {
         return BackendError::SecretRefused(secret_kind);
     }
+    if code == ERR_UNAUTHORIZED {
+        return BackendError::Unauthenticated {
+            reason: message,
+            http_status: Some(401),
+        };
+    }
     if code == ERR_INVALID_PARAMS {
         return BackendError::InvalidParams(message);
     }
@@ -629,7 +645,24 @@ impl McpOutpostBackend for DaemonMcpBridge {
 
     fn outpost_status(&self) -> BoxFuture<'_, Result<Value, BackendError>> {
         Box::pin(async move {
-            let (raw, conn) = self.call_ipc(IpcOpcode::GetStatus, Vec::new(), None).await?;
+            let (raw, conn) = match self.call_ipc(IpcOpcode::GetStatus, Vec::new(), None).await {
+                Ok(v) => v,
+                Err(BackendError::Unauthenticated {
+                    reason,
+                    http_status,
+                }) => {
+                    return Ok(json!({
+                        "authenticated": false,
+                        "enrolled": http_status.is_some(),
+                        "ready": false,
+                        "http_status": http_status,
+                        "next_command": "mp-outpost login",
+                        "reason": reason,
+                        "message": "Local `mp-outpost` CLI is not authenticated. Signing in on multiplayer.tech in your browser only creates a browser session cookie, which is separate from authorizing this local CLI/MCP device credential. Run `mp-outpost login` in your terminal to authorize this device.",
+                    }));
+                }
+                Err(other) => return Err(other),
+            };
             let status = decode_status_resp(&raw).map_err(|_| BackendError::DaemonDisconnected)?;
             let active_id = status.active_party.as_ref().map_or(0, |p| p.party_id);
             conn.active_party_id.store(active_id, Ordering::Release);
@@ -637,6 +670,9 @@ impl McpOutpostBackend for DaemonMcpBridge {
                 let mut guard = conn.own_identity.lock().await;
                 *guard = Some((status.account_id, status.handle.clone()));
             }
+            let now_ms = sleep_aware_now_ms();
+            let cwt_expired = status.cwt_expires_ms > 0 && status.cwt_expires_ms <= now_ms;
+            let authenticated = !cwt_expired;
 
             let active_party_json = status.active_party.as_ref().map(|p| {
                 json!({
@@ -654,6 +690,13 @@ impl McpOutpostBackend for DaemonMcpBridge {
                     "member_count": p.member_count,
                     "next_seq": p.next_seq,
                     "daemon_epoch": p.daemon_epoch,
+                    "e2ee_mode": p.e2ee_mode,
+                    "mls_epoch": p.mls_epoch,
+                    "trust_tier": p.trust_tier,
+                    "trust_tier_label": MlsRoomStatusSnapshot::trust_tier_label(p.trust_tier),
+                    "has_declared_agent": p.has_declared_agent,
+                    "epoch_authenticator_b32": p.epoch_authenticator_b32,
+                    "clone_detected": p.clone_detected,
                 })
             });
 
@@ -682,7 +725,10 @@ impl McpOutpostBackend for DaemonMcpBridge {
                 })
                 .collect();
 
-            Ok(json!({
+            let mut out = json!({
+                "authenticated": authenticated,
+                "enrolled": true,
+                "ready": authenticated,
                 "account_id": status.account_id,
                 "device_id": status.device_id,
                 "handle": status.handle,
@@ -700,7 +746,20 @@ impl McpOutpostBackend for DaemonMcpBridge {
                 "active_party": active_party_json,
                 "unpinned_peer_alerts": unpinned,
                 "key_mismatch_alerts": mismatches,
-            }))
+            });
+            if !authenticated && let Some(obj) = out.as_object_mut() {
+                obj.insert(
+                    "next_command".to_string(),
+                    Value::String("mp-outpost login".to_string()),
+                );
+                obj.insert(
+                    "message".to_string(),
+                    Value::String(
+                        "Local CLI device credential has expired. Browser login at multiplayer.tech is separate from local CLI device authorization; run `mp-outpost login` in your terminal to re-authorize this device.".to_string(),
+                    ),
+                );
+            }
+            Ok(out)
         })
     }
 
@@ -729,6 +788,13 @@ impl McpOutpostBackend for DaemonMcpBridge {
                         "max_members": p.max_members,
                         "next_seq": p.next_seq,
                         "daemon_epoch": p.daemon_epoch,
+                        "e2ee_mode": p.e2ee_mode,
+                        "mls_epoch": p.mls_epoch,
+                        "trust_tier": p.trust_tier,
+                        "trust_tier_label": MlsRoomStatusSnapshot::trust_tier_label(p.trust_tier),
+                        "has_declared_agent": p.has_declared_agent,
+                        "epoch_authenticator_b32": p.epoch_authenticator_b32,
+                        "clone_detected": p.clone_detected,
                     })
                 })
                 .collect();
@@ -1342,5 +1408,55 @@ mod tests {
             res_card_file,
             Err(BackendError::SecretRefused(SecretMatchKind::InviteToken))
         );
+    }
+
+    #[tokio::test]
+    async fn bridge_surfaces_explicit_unauthenticated_status_and_login_next_command() {
+        let tmp = std::env::temp_dir().join(format!(
+            "outpost-mcp-unauth-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(std::fs::create_dir_all(&tmp).is_ok());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700));
+        }
+        let bridge = DaemonMcpBridge::new(tmp.clone(), None, None);
+
+        let status_res = bridge.outpost_status().await;
+        assert!(
+            status_res.is_ok(),
+            "outpost_status should return structured unauthenticated status: {status_res:?}"
+        );
+        let status = status_res.unwrap_or(Value::Null);
+        assert_eq!(status.get("authenticated").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            status.get("next_command").and_then(Value::as_str),
+            Some("mp-outpost login")
+        );
+        let msg = status.get("message").and_then(Value::as_str).unwrap_or("");
+        assert!(msg.contains("browser") && msg.contains("mp-outpost login"));
+
+        let list_err = bridge.party_list().await;
+        assert!(matches!(
+            list_err,
+            Err(BackendError::Unauthenticated {
+                http_status: None,
+                ..
+            })
+        ));
+
+        let mapped_401 = map_ipc_error(ERR_UNAUTHORIZED, "HTTP 401 unauthorized".to_string());
+        assert!(matches!(
+            mapped_401,
+            BackendError::Unauthenticated {
+                http_status: Some(401),
+                ..
+            }
+        ));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

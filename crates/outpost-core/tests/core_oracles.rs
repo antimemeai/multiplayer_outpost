@@ -569,7 +569,7 @@ fn ipc_wire_2mib_bounds_ready_pipe_and_zero_respawn_war_policy() {
     }
 
     // A/B/A version coexistence oracle: compatible builds NEVER kill each other; mcp NEVER kills!
-    assert_eq!(IPC_SCHEMA_VER, 4);
+    assert_eq!(IPC_SCHEMA_VER, 5);
     let local_a = HelloPayload {
         ipc_schema_ver: IPC_SCHEMA_VER,
         build_order: 100,
@@ -635,6 +635,8 @@ fn party_ring_cursor_reset_byte_budget_dedupe_and_send_planner() {
             sender_account_id: 1001,
             sender_device_id: 2002,
             sender_handle: "alice".to_string(),
+            is_browser: false,
+            sender_client: String::new(),
             room_scope: "party/main".to_string(),
             target_selector: "@all".to_string(),
             timestamp_ns: (i as i64) * 1000,
@@ -799,6 +801,8 @@ proptest! {
                 sender_account_id: 1,
                 sender_device_id: 2,
                 sender_handle: "a".to_string(),
+                is_browser: false,
+                sender_client: String::new(),
                 room_scope: "r".to_string(),
                 target_selector: "@all".to_string(),
                 timestamp_ns: 0,
@@ -855,6 +859,8 @@ fn dst_100k_steps_ring_cursor_epochs_and_dedupe_invariants() {
                     sender_account_id: 1001,
                     sender_device_id: 2002,
                     sender_handle: "alice".to_string(),
+                    is_browser: false,
+                    sender_client: String::new(),
                     room_scope: "party/main".to_string(),
                     target_selector: "@all".to_string(),
                     timestamp_ns: step as i64,
@@ -1050,6 +1056,8 @@ fn gate1_poll_filtered_skips_chat_for_board_read_and_clamps_max_bytes() {
             sender_account_id: 1,
             sender_device_id: 2,
             sender_handle: "alice".to_string(),
+            is_browser: false,
+            sender_client: String::new(),
             room_scope: "party/main".to_string(),
             target_selector: "@all".to_string(),
             timestamp_ns: i as i64,
@@ -1060,6 +1068,8 @@ fn gate1_poll_filtered_skips_chat_for_board_read_and_clamps_max_bytes() {
         sender_account_id: 1,
         sender_device_id: 2,
         sender_handle: "alice".to_string(),
+        is_browser: false,
+        sender_client: String::new(),
         room_scope: "party/ops".to_string(),
         payload: vec![1, 2, 3],
     });
@@ -1067,6 +1077,8 @@ fn gate1_poll_filtered_skips_chat_for_board_read_and_clamps_max_bytes() {
         sender_account_id: 1,
         sender_device_id: 2,
         sender_handle: "alice".to_string(),
+        is_browser: false,
+        sender_client: String::new(),
         room_scope: "party/ops".to_string(),
         payload: vec![4, 5, 6],
     });
@@ -1075,6 +1087,8 @@ fn gate1_poll_filtered_skips_chat_for_board_read_and_clamps_max_bytes() {
             sender_account_id: 1,
             sender_device_id: 2,
             sender_handle: "alice".to_string(),
+            is_browser: false,
+            sender_client: String::new(),
             room_scope: "party/main".to_string(),
             target_selector: "@all".to_string(),
             timestamp_ns: (200 + i) as i64,
@@ -1085,6 +1099,8 @@ fn gate1_poll_filtered_skips_chat_for_board_read_and_clamps_max_bytes() {
         sender_account_id: 1,
         sender_device_id: 2,
         sender_handle: "alice".to_string(),
+        is_browser: false,
+        sender_client: String::new(),
         room_scope: "party/ops".to_string(),
         payload: vec![7, 8, 9],
     });
@@ -1113,6 +1129,8 @@ fn gate1_poll_filtered_skips_chat_for_board_read_and_clamps_max_bytes() {
         sender_account_id: 1,
         sender_device_id: 2,
         sender_handle: "alice".to_string(),
+        is_browser: false,
+        sender_client: String::new(),
         room_scope: "party/main".to_string(),
         target_selector: "@all".to_string(),
         timestamp_ns: 999,
@@ -1131,6 +1149,8 @@ fn gate1_poll_filtered_skips_chat_for_board_read_and_clamps_max_bytes() {
             sender_account_id: 1,
             sender_device_id: 2,
             sender_handle: "alice".to_string(),
+            is_browser: false,
+            sender_client: String::new(),
             room_scope: "party/ops".to_string(),
             payload: vec![0xAB; 200 * 1024],
         });

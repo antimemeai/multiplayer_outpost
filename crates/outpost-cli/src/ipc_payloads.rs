@@ -2,12 +2,14 @@
 
 use outpost_core::fence::SecretMatchKind;
 use outpost_core::ipc_wire::IpcWireError;
+use outpost_core::mls_session::MlsRoomStatusSnapshot;
 use outpost_core::storage_codec::TrustState;
 use outpost_mcp::{
     BoardEnvelopeEvent, McpPartyEvent, McpPartyEventKind, PartyPollResp, PeerProvenance,
 };
 
 pub const ERR_INVALID_PARAMS: u16 = 4000;
+pub const ERR_UNAUTHORIZED: u16 = 4010;
 pub const ERR_NOT_FOUND: u16 = 4040;
 pub const ERR_CONFLICT: u16 = 4090;
 pub const ERR_IDEMPOTENCY_CONFLICT: u16 = 4091;
@@ -319,6 +321,12 @@ pub struct ActivePartySummary {
     pub room_code: String,
     pub room_name: String,
     pub share_url: String,
+    pub e2ee_mode: u8,
+    pub mls_epoch: u64,
+    pub trust_tier: u8,
+    pub has_declared_agent: bool,
+    pub epoch_authenticator_b32: String,
+    pub clone_detected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -449,6 +457,8 @@ pub struct IpcProvenance {
     pub sender_handle: String,
     pub root_pubkey_fingerprint: String,
     pub safety_number: String,
+    pub is_browser: bool,
+    pub sender_client: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -482,6 +492,7 @@ pub struct IpcPartyEvent {
     pub event_seq: u64,
     pub party_id: u64,
     pub party_epoch: u64,
+    pub is_historical_catchup: bool,
     pub kind: IpcPartyEventKind,
 }
 
@@ -494,6 +505,12 @@ pub struct PartyPollIpcResp {
     pub cursor_reset: bool,
     pub gap_possible: bool,
     pub timed_out: bool,
+    pub e2ee_mode: u8,
+    pub mls_epoch: u64,
+    pub trust_tier: u8,
+    pub has_declared_agent: bool,
+    pub epoch_authenticator_b32: String,
+    pub clone_detected: bool,
     pub events: Vec<IpcPartyEvent>,
 }
 
@@ -750,6 +767,12 @@ fn write_party_summary(w: &mut Writer, p: &ActivePartySummary) -> Result<(), Ipc
     w.str_u16(&p.room_code)?;
     w.str_u16(&p.room_name)?;
     w.str_u16(&p.share_url)?;
+    w.u8(p.e2ee_mode);
+    w.u64(p.mls_epoch);
+    w.u8(p.trust_tier);
+    w.bool(p.has_declared_agent);
+    w.str_u16(&p.epoch_authenticator_b32)?;
+    w.bool(p.clone_detected);
     Ok(())
 }
 
@@ -771,6 +794,12 @@ fn read_party_summary(r: &mut Reader<'_>) -> Result<ActivePartySummary, IpcWireE
         room_code: r.str_u16(32)?,
         room_name: r.str_u16(128)?,
         share_url: r.str_u16(512)?,
+        e2ee_mode: r.u8()?,
+        mls_epoch: r.u64()?,
+        trust_tier: r.u8()?,
+        has_declared_agent: r.bool()?,
+        epoch_authenticator_b32: r.str_u16(64)?,
+        clone_detected: r.bool()?,
     })
 }
 
@@ -1200,6 +1229,8 @@ fn write_provenance(w: &mut Writer, p: &IpcProvenance) -> Result<(), IpcWireErro
     w.str_u16(&p.sender_handle)?;
     w.str_u16(&p.root_pubkey_fingerprint)?;
     w.str_u16(&p.safety_number)?;
+    w.bool(p.is_browser);
+    w.str_u16(&p.sender_client)?;
     Ok(())
 }
 
@@ -1210,6 +1241,8 @@ fn read_provenance(r: &mut Reader<'_>) -> Result<IpcProvenance, IpcWireError> {
         sender_handle: r.str_u16(128)?,
         root_pubkey_fingerprint: r.str_u16(128)?,
         safety_number: r.str_u16(64)?,
+        is_browser: r.bool()?,
+        sender_client: r.str_u16(64)?,
     })
 }
 
@@ -1222,12 +1255,19 @@ pub fn encode_party_poll_resp(resp: &PartyPollIpcResp) -> Result<Vec<u8>, IpcWir
     w.bool(resp.cursor_reset);
     w.bool(resp.gap_possible);
     w.bool(resp.timed_out);
+    w.u8(resp.e2ee_mode);
+    w.u64(resp.mls_epoch);
+    w.u8(resp.trust_tier);
+    w.bool(resp.has_declared_agent);
+    w.str_u16(&resp.epoch_authenticator_b32)?;
+    w.bool(resp.clone_detected);
     let len = u16::try_from(resp.events.len()).map_err(|_| IpcWireError::BodyTooLarge)?;
     w.u16(len);
     for ev in &resp.events {
         w.u64(ev.event_seq);
         w.u64(ev.party_id);
         w.u64(ev.party_epoch);
+        w.bool(ev.is_historical_catchup);
         match &ev.kind {
             IpcPartyEventKind::Chat {
                 provenance,
@@ -1287,6 +1327,12 @@ pub fn decode_party_poll_resp(bytes: &[u8]) -> Result<PartyPollIpcResp, IpcWireE
     let cursor_reset = r.bool()?;
     let gap_possible = r.bool()?;
     let timed_out = r.bool()?;
+    let e2ee_mode = r.u8()?;
+    let mls_epoch = r.u64()?;
+    let trust_tier = r.u8()?;
+    let has_declared_agent = r.bool()?;
+    let epoch_authenticator_b32 = r.str_u16(64)?;
+    let clone_detected = r.bool()?;
     let count = usize::from(r.u16()?);
     if count > MAX_LIST_ITEMS {
         return Err(IpcWireError::BodyTooLarge);
@@ -1296,6 +1342,7 @@ pub fn decode_party_poll_resp(bytes: &[u8]) -> Result<PartyPollIpcResp, IpcWireE
         let event_seq = r.u64()?;
         let ev_party_id = r.u64()?;
         let party_epoch = r.u64()?;
+        let is_historical_catchup = r.bool()?;
         let tag = r.u8()?;
         let kind = match tag {
             1 => IpcPartyEventKind::Chat {
@@ -1326,6 +1373,7 @@ pub fn decode_party_poll_resp(bytes: &[u8]) -> Result<PartyPollIpcResp, IpcWireE
             event_seq,
             party_id: ev_party_id,
             party_epoch,
+            is_historical_catchup,
             kind,
         });
     }
@@ -1338,6 +1386,12 @@ pub fn decode_party_poll_resp(bytes: &[u8]) -> Result<PartyPollIpcResp, IpcWireE
         cursor_reset,
         gap_possible,
         timed_out,
+        e2ee_mode,
+        mls_epoch,
+        trust_tier,
+        has_declared_agent,
+        epoch_authenticator_b32,
+        clone_detected,
         events,
     })
 }
@@ -1802,6 +1856,8 @@ impl From<IpcProvenance> for PeerProvenance {
             sender_handle: p.sender_handle,
             root_pubkey_fingerprint: p.root_pubkey_fingerprint,
             safety_number: p.safety_number,
+            is_browser: p.is_browser,
+            sender_client: p.sender_client,
         }
     }
 }
@@ -1854,6 +1910,7 @@ impl From<IpcPartyEvent> for McpPartyEvent {
             event_seq: ev.event_seq,
             party_id: ev.party_id,
             party_epoch: ev.party_epoch,
+            is_historical_catchup: ev.is_historical_catchup,
             kind,
         }
     }
@@ -1871,6 +1928,16 @@ impl From<PartyPollIpcResp> for PartyPollResp {
             timed_out: r.timed_out,
             self_account_id: None,
             self_handle: None,
+            mls: MlsRoomStatusSnapshot {
+                e2ee_mode: r.e2ee_mode,
+                mls_epoch: r.mls_epoch,
+                trust_tier: r.trust_tier,
+                has_declared_agent: r.has_declared_agent,
+                epoch_authenticator_b32: r.epoch_authenticator_b32,
+                clone_detected: r.clone_detected,
+                has_pending_removals: false,
+                mls_rekey_required: false,
+            },
             events: r.events.into_iter().map(McpPartyEvent::from).collect(),
         }
     }

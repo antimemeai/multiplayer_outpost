@@ -140,7 +140,7 @@ pub fn tool_catalog() -> Vec<Value> {
     vec![
         json!({
             "name": "outpost_status",
-            "description": "Return local multiplayer-outpost identity, CWT expiry, daemon epoch/PID, active party summary, unpinned/key-mismatch alerts, and dual-host churn status.",
+            "description": "Return local multiplayer-outpost authentication readiness (including explicit authenticated: false and `mp-outpost login` guidance when unauthenticated), identity, CWT expiry, daemon epoch/PID, active party summary, unpinned/key-mismatch alerts, and dual-host churn status.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -324,14 +324,14 @@ pub fn tool_catalog() -> Vec<Value> {
         }),
         json!({
             "name": "party_join",
-            "description": "Join a party by @handle, 4-character room code, share URL (multiplayer.tech, mp.gg, clank.party), or omit target to accept your latest pending incoming invite.",
+            "description": "Join a party by #fragment invite URL (multiplayer.tech/p/i/<id>#<secret>, clank.party/i/<id>#<secret>), numeric party ID, @handle, or omit target to accept your latest pending incoming invite. Fragment secrets are sent only in the POST body and never echoed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "target": {
                         "type": "string",
                         "minLength": 0,
-                        "maxLength": 256
+                        "maxLength": 512
                     }
                 },
                 "additionalProperties": false
@@ -880,7 +880,7 @@ pub fn parse_tool_call(
         }
         "party_join" => {
             reject_unknown_keys(args, &["target"])?;
-            let target = optional_string(args, "target", 0, 256)?;
+            let target = optional_string(args, "target", 0, 512)?;
             Ok(ParsedToolCall::PartyJoin(PartyJoinReq { target }))
         }
         "party_leave" => {

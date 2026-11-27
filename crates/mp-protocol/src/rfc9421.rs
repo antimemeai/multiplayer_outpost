@@ -221,12 +221,30 @@ fn is_party_requests_path(path: &str) -> bool {
     }
 }
 
+fn is_party_mls_commits_path(path: &str) -> bool {
+    let mut segs = path.split('/').skip(1);
+    match (
+        segs.next(),
+        segs.next(),
+        segs.next(),
+        segs.next(),
+        segs.next(),
+        segs.next(),
+    ) {
+        (Some("v1"), Some("parties"), Some(id_str), Some("mls"), Some("commits"), None) => {
+            PartyId::parse_decimal(id_str).is_ok()
+        }
+        _ => false,
+    }
+}
+
 /// Validates path and query hygiene strictly per Spec v2.1 §6.1:
 /// - `@path` must start with `/`, be ASCII printable without whitespace, contain NO `%`
 ///   (all API paths are static ASCII or decimal integer IDs; rejecting `%` kills `%2e`, `%2f`, `%5c`,
 ///   and malformed percent escapes), NO `//`, NO `\`, and NO `.` or `..` segments.
 /// - `@query` per RFC 9421 §2.2.7 is always `?<raw_query>` (leading `?` even when empty).
-///   Non-empty queries are permitted ONLY on `GET /v1/accounts/resolve` and `GET /v1/parties/<id>/requests`.
+///   Non-empty queries are permitted ONLY on `GET /v1/accounts/resolve`,
+///   `GET /v1/parties/<id>/requests`, and `GET /v1/parties/<id>/mls/commits`.
 pub fn validate_path_and_query(
     method: HttpMethod,
     path: &str,
@@ -255,7 +273,9 @@ pub fn validate_path_and_query(
     }
     if query.len() > 1 {
         let query_allowed = method == HttpMethod::Get
-            && (path == "/v1/accounts/resolve" || is_party_requests_path(path));
+            && (path == "/v1/accounts/resolve"
+                || is_party_requests_path(path)
+                || is_party_mls_commits_path(path));
         if !query_allowed {
             return Err(Rfc9421Error::QueryNotAllowed);
         }

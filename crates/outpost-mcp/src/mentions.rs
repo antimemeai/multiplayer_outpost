@@ -103,12 +103,15 @@ pub fn is_self_sender(
 }
 
 /// Evaluates whether an incoming `McpPartyEvent` mentions the local user's `@handle`,
-/// never matching self echoes.
+/// never matching self echoes or historical catch-up events.
 pub fn event_mentions_self(
     ev: &McpPartyEvent,
     self_account_id: Option<u64>,
     self_handle: Option<&str>,
 ) -> bool {
+    if ev.is_historical_catchup {
+        return false;
+    }
     let Some(handle) = self_handle
         .map(|h| h.trim().trim_start_matches('@'))
         .filter(|h| !h.is_empty())
@@ -239,6 +242,8 @@ mod tests {
             sender_handle: "alice".to_string(),
             root_pubkey_fingerprint: String::new(),
             safety_number: String::new(),
+            is_browser: false,
+            sender_client: "outpost".to_string(),
         };
         let peer_prov = PeerProvenance {
             sender_account_id: 1002,
@@ -246,6 +251,8 @@ mod tests {
             sender_handle: "bob".to_string(),
             root_pubkey_fingerprint: String::new(),
             safety_number: String::new(),
+            is_browser: false,
+            sender_client: "outpost".to_string(),
         };
         let guest_prov = PeerProvenance {
             sender_account_id: 0,
@@ -253,12 +260,24 @@ mod tests {
             sender_handle: "alice".to_string(), // guest reusing name
             root_pubkey_fingerprint: String::new(),
             safety_number: String::new(),
+            is_browser: false,
+            sender_client: String::new(),
+        };
+        let browser_self_prov = PeerProvenance {
+            sender_account_id: 1001,
+            sender_device_id: 0,
+            sender_handle: "alice".to_string(),
+            root_pubkey_fingerprint: String::new(),
+            safety_number: String::new(),
+            is_browser: true,
+            sender_client: "web".to_string(),
         };
 
         let self_ev = McpPartyEvent {
             event_seq: 1,
             party_id: 9,
             party_epoch: 1,
+            is_historical_catchup: false,
             kind: McpPartyEventKind::Chat {
                 provenance: self_prov,
                 room_scope: "party/main".to_string(),
@@ -273,6 +292,7 @@ mod tests {
             event_seq: 2,
             party_id: 9,
             party_epoch: 1,
+            is_historical_catchup: false,
             kind: McpPartyEventKind::Chat {
                 provenance: peer_prov.clone(),
                 room_scope: "party/main".to_string(),
@@ -283,11 +303,21 @@ mod tests {
         };
         assert!(event_mentions_self(&peer_ev, Some(1001), Some("alice")));
 
+        // Historical catch-up event MUST suppress automated mention trigger!
+        let mut historical_peer_ev = peer_ev.clone();
+        historical_peer_ev.is_historical_catchup = true;
+        assert!(!event_mentions_self(
+            &historical_peer_ev,
+            Some(1001),
+            Some("alice")
+        ));
+
         // Guest (account_id 0) mentioning @alice still triggers mention for authenticated alice (1001).
         let guest_ev = McpPartyEvent {
             event_seq: 3,
             party_id: 9,
             party_epoch: 1,
+            is_historical_catchup: false,
             kind: McpPartyEventKind::Chat {
                 provenance: guest_prov,
                 room_scope: "party/main".to_string(),
@@ -303,6 +333,7 @@ mod tests {
             event_seq: 4,
             party_id: 9,
             party_epoch: 1,
+            is_historical_catchup: false,
             kind: McpPartyEventKind::BridgeEnvelope {
                 provenance: peer_prov,
                 room_scope: "party/main".to_string(),
@@ -311,5 +342,25 @@ mod tests {
             },
         };
         assert!(event_mentions_self(&card_ev, Some(1001), Some("alice")));
+
+        // Browser-originated message under the operator's own account/handle does NOT trigger mention.
+        let browser_self_ev = McpPartyEvent {
+            event_seq: 5,
+            party_id: 9,
+            party_epoch: 1,
+            is_historical_catchup: false,
+            kind: McpPartyEventKind::Chat {
+                provenance: browser_self_prov,
+                room_scope: "party/main".to_string(),
+                target_selector: "@all".to_string(),
+                timestamp_ns: 0,
+                body: "@alice:agent run shell command".to_string(),
+            },
+        };
+        assert!(!event_mentions_self(
+            &browser_self_ev,
+            Some(1001),
+            Some("alice")
+        ));
     }
 }

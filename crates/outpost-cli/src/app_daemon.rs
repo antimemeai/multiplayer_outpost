@@ -27,12 +27,17 @@ use mp_protocol::{
 use outpost_control::{
     ApprovePartyRequest, ChurnStatus, ControlClient, ControlError, CreatePartyRequest,
     EndpointUpdateCoalescer, EvictionChurnDetector, JoinPartyRequest, JoinPartyResponse,
-    MAX_MP2_BODY_BYTES, MintPartyInviteRequest, Mp1WsEvent, Mp1WsTarget, Mp2Ack, Mp2Event,
-    Mp2EventKind, Mp2Member, Mp2RoomEvent, RequestSigner, RoomEnterRequest, RoomInviteRequest,
-    WsConnectError, sleep_aware_now_ms, wall_now_ms, wall_now_secs,
+    MAX_MP2_BODY_BYTES, MintPartyInviteRequest, MlsCommitAckRequest, MlsCommitRequest, Mp1WsEvent,
+    Mp1WsTarget, Mp2Ack, Mp2Event, Mp2EventKind, Mp2Member, Mp2RoomEvent, RequestSigner,
+    RoomEnterRequest, RoomInviteRequest, WsConnectError, sleep_aware_now_ms, wall_now_ms,
+    wall_now_secs,
 };
 use outpost_core::fence::{sanitize_peer_text, scan_outbound_secrets};
 use outpost_core::ipc_wire::IpcOpcode;
+use outpost_core::mls_session::{
+    DecryptedInboundPayload, MP_FAILOVER_REKEY_DELAY, MP_PAST_EPOCH_SWEEP_INTERVAL, MlsRoomSession,
+    MlsRoomStatusSnapshot,
+};
 use outpost_core::p2p_wire::{
     P2pActivityState, P2pBridgeEnvelope, P2pChatMessage, P2pControlNotice, P2pControlNoticeKind,
     P2pEphemeralPulse, P2pPartyFrame,
@@ -59,7 +64,7 @@ use zeroize::Zeroizing;
 use crate::build_info::{build_digest, build_order};
 use crate::ipc_payloads::{
     ActivePartySummary, ERR_CANCELLED, ERR_CONFLICT, ERR_CONTROL_PLANE, ERR_IDEMPOTENCY_CONFLICT,
-    ERR_INTERNAL, ERR_INVALID_PARAMS, ERR_NOT_FOUND, FriendItem, FriendsListResp,
+    ERR_INTERNAL, ERR_INVALID_PARAMS, ERR_NOT_FOUND, ERR_UNAUTHORIZED, FriendItem, FriendsListResp,
     FriendsLiveIpcResp, IpcPartyEvent, IpcPartyEventKind, IpcProvenance, JoinRequestItem,
     KeyMismatchAlert, LiveFriendIpc, MemberInfo, PartyCreateResp, PartyEpochResp,
     PartyInviteMintResp, PartyJoinResp, PartyListResp, PartyMembersResp, PartyPollIpcResp,
@@ -83,8 +88,8 @@ use crate::ipc_payloads::{
 };
 use crate::storage::{
     build_control_client_config, load_device_record, load_epochs_store, load_peers_store,
-    lock_state, open_state_dir, pubkey_fingerprint_hex, save_device_record, save_epochs_store,
-    save_peers_store,
+    lock_state, open_state_dir, pubkey_fingerprint_hex, remove_mls_room_snapshot,
+    save_device_record, save_epochs_store, save_mls_room_bytes, save_peers_store,
 };
 
 const WS_PING_INTERVAL: Duration = Duration::from_secs(20);
@@ -164,6 +169,18 @@ enum Mp2OutboundCmd {
         body: String,
         ack_tx: oneshot::Sender<Result<Mp2Ack, String>>,
     },
+    SendE2eeApp {
+        client_msg_id: String,
+        mls_epoch: u64,
+        body_b64: String,
+        ack_tx: oneshot::Sender<Result<Mp2Ack, String>>,
+    },
+    #[allow(dead_code)]
+    SendE2eeEphemeral {
+        client_msg_id: String,
+        mls_epoch: u64,
+        body_b64: String,
+    },
 }
 
 struct ActivePartySession {
@@ -181,6 +198,12 @@ struct ActivePartySession {
     room_name: String,
     share_url: String,
     ws_path: String,
+    e2ee_mode: u8,
+    mls_epoch: u64,
+    min_allowed_mls_epoch: u64,
+    mls_rekey_required: bool,
+    group_id_b64: Option<String>,
+    mls_session: Option<MlsRoomSession>,
     members: HashMap<u64, PartyMemberState>,
     mp2_members: Vec<Mp2Member>,
     mp2_connected: bool,
@@ -202,8 +225,26 @@ struct ActivePartySession {
 }
 
 impl ActivePartySession {
+    fn mls_status_snapshot(&self) -> MlsRoomStatusSnapshot {
+        if let Some(ref mls) = self.mls_session {
+            mls.status_snapshot()
+        } else {
+            MlsRoomStatusSnapshot {
+                e2ee_mode: self.e2ee_mode,
+                mls_epoch: self.mls_epoch,
+                trust_tier: 0,
+                has_declared_agent: false,
+                epoch_authenticator_b32: String::new(),
+                clone_detected: false,
+                has_pending_removals: false,
+                mls_rekey_required: self.mls_rekey_required,
+            }
+        }
+    }
+
     fn summary(&self) -> ActivePartySummary {
         let member_count = self.members.len().max(self.mp2_members.len());
+        let mls = self.mls_status_snapshot();
         ActivePartySummary {
             party_id: self.party_id,
             party_epoch: self.party_epoch,
@@ -221,11 +262,21 @@ impl ActivePartySession {
             room_code: self.room_code.clone(),
             room_name: self.room_name.clone(),
             share_url: self.share_url.clone(),
+            e2ee_mode: mls.e2ee_mode,
+            mls_epoch: mls.mls_epoch,
+            trust_tier: mls.trust_tier,
+            has_declared_agent: mls.has_declared_agent,
+            epoch_authenticator_b32: mls.epoch_authenticator_b32,
+            clone_detected: mls.clone_detected,
         }
     }
 
     fn push_event(&mut self, body: PartyEventBody) -> u64 {
-        let seq = self.ring.push(body);
+        self.push_event_with_catchup(body, false)
+    }
+
+    fn push_event_with_catchup(&mut self, body: PartyEventBody, is_historical_catchup: bool) -> u64 {
+        let seq = self.ring.push_with_catchup(body, is_historical_catchup);
         self.wait_notify.notify_waiters();
         seq
     }
@@ -909,6 +960,8 @@ impl AppDaemon {
                     sender_account_id,
                     sender_device_id,
                     sender_handle,
+                    is_browser: false,
+                    sender_client: String::new(),
                     room_scope: chat.room_scope,
                     target_selector: chat.target_selector,
                     timestamp_ns: chat.timestamp_ns,
@@ -919,6 +972,8 @@ impl AppDaemon {
                 sender_account_id,
                 sender_device_id,
                 sender_handle,
+                is_browser: false,
+                sender_client: String::new(),
                 room_scope: env.room_scope,
                 payload: env.payload,
             },
@@ -1079,12 +1134,22 @@ impl AppDaemon {
                     let mut ping_iv = tokio::time::interval(WS_PING_INTERVAL);
                     ping_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     ping_iv.tick().await;
+                    let mut mls_prune_iv = tokio::time::interval(MP_PAST_EPOCH_SWEEP_INTERVAL);
+                    mls_prune_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    mls_prune_iv.tick().await;
+                    let mut failover_rekey_deadline: Option<tokio::time::Instant> = None;
                     let mut ack_waiters: VecDeque<(
                         String,
                         oneshot::Sender<Result<Mp2Ack, String>>,
                     )> = VecDeque::new();
 
                     loop {
+                        let rekey_sleep = async {
+                            match failover_rekey_deadline {
+                                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        };
                         tokio::select! {
                             biased;
                             _ = stop.cancelled() => {
@@ -1094,6 +1159,10 @@ impl AppDaemon {
                             _ = self.shutdown.cancelled() => {
                                 let _ = ws.close(1000, "daemon_shutdown").await;
                                 return;
+                            }
+                            _ = rekey_sleep => {
+                                failover_rekey_deadline = None;
+                                self.submit_failover_rekey_commit(party_id).await;
                             }
                             maybe_cmd = mp2_rx.recv() => {
                                 let Some(cmd) = maybe_cmd else {
@@ -1129,7 +1198,42 @@ impl AppDaemon {
                                             }
                                         }
                                     }
+                                    Mp2OutboundCmd::SendE2eeApp {
+                                        client_msg_id,
+                                        mls_epoch,
+                                        body_b64,
+                                        ack_tx,
+                                    } => {
+                                        match ws
+                                            .send_e2ee_app(&client_msg_id, mls_epoch, &body_b64)
+                                            .await
+                                        {
+                                            Ok(()) => {
+                                                ack_waiters.push_back((client_msg_id, ack_tx));
+                                            }
+                                            Err(e) => {
+                                                let _ = ack_tx.send(Err(e.to_string()));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Mp2OutboundCmd::SendE2eeEphemeral {
+                                        client_msg_id,
+                                        mls_epoch,
+                                        body_b64,
+                                    } => {
+                                        if ws
+                                            .send_e2ee_ephemeral(&client_msg_id, mls_epoch, &body_b64)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
                                 }
+                            }
+                            _ = mls_prune_iv.tick() => {
+                                self.sweep_mls_past_epochs(party_id).await;
                             }
                             _ = ping_iv.tick() => {
                                 ack_waiters.retain(|(_, tx)| !tx.is_closed());
@@ -1145,20 +1249,135 @@ impl AppDaemon {
                                 match ev {
                                     Ok(Some(Mp2RoomEvent::Pong)) => {}
                                     Ok(Some(Mp2RoomEvent::Hello(hello))) => {
+                                        let hello_e2ee_mode = hello.e2ee_mode;
+                                        let hello_rekey_required = hello.mls_rekey_required;
+                                        ws.set_e2ee_mode(hello_e2ee_mode);
                                         let resume_seq = self.handle_mp2_hello(party_id, hello).await;
                                         if let Some(seq) = resume_seq
                                             && ws.send_resume(seq).await.is_err()
                                         {
                                             break;
                                         }
-                                        let _ = ws
-                                            .send_status("outpost", "Outpost", "idle", None)
-                                            .await;
+                                        if hello_e2ee_mode == 1 {
+                                            // Spec v3 §4.5: NEVER send clear `status` in `e2ee_mode == 1` rooms;
+                                            // emit encrypted `e2ee_ephemeral` status instead when MLS session is ready.
+                                            if let Some(prep) = self
+                                                .prepare_e2ee_ephemeral_status(
+                                                    party_id,
+                                                    "Outpost",
+                                                    "idle",
+                                                    None,
+                                                )
+                                                .await
+                                            {
+                                                let _ = ws
+                                                    .send_e2ee_ephemeral(
+                                                        &prep.client_msg_id,
+                                                        prep.mls_epoch,
+                                                        &prep.body_b64,
+                                                    )
+                                                    .await;
+                                            }
+                                            if hello_rekey_required && failover_rekey_deadline.is_none() {
+                                                failover_rekey_deadline =
+                                                    Some(tokio::time::Instant::now() + MP_FAILOVER_REKEY_DELAY);
+                                            }
+                                        } else {
+                                            let _ = ws
+                                                .send_status("outpost", "Outpost", "idle", None)
+                                                .await;
+                                        }
                                     }
                                     Ok(Some(Mp2RoomEvent::Event(room_ev))) => {
                                         self.handle_mp2_event(party_id, room_ev).await;
                                     }
+                                    Ok(Some(Mp2RoomEvent::EphemeralEvent {
+                                        mls_epoch,
+                                        body_encoding,
+                                        body,
+                                        ..
+                                    })) => {
+                                        self.handle_mp2_ephemeral_event(
+                                            party_id,
+                                            mls_epoch.unwrap_or(0),
+                                            &body_encoding,
+                                            &body,
+                                        )
+                                        .await;
+                                    }
+                                    Ok(Some(Mp2RoomEvent::MlsCommitTentative {
+                                        target_epoch,
+                                        commit_b64,
+                                        proposal_blobs_b64,
+                                        ..
+                                    })) => {
+                                        self.handle_mp2_mls_commit_tentative(
+                                            party_id,
+                                            target_epoch,
+                                            &proposal_blobs_b64,
+                                            &commit_b64,
+                                        )
+                                        .await;
+                                    }
+                                    Ok(Some(Mp2RoomEvent::MlsCommitFinalized {
+                                        epoch,
+                                        commit_b64,
+                                        proposal_blobs_b64,
+                                        ..
+                                    })) => {
+                                        failover_rekey_deadline = None;
+                                        let flush_frames = self
+                                            .handle_mp2_mls_commit_finalized(
+                                                party_id,
+                                                epoch,
+                                                &proposal_blobs_b64,
+                                                &commit_b64,
+                                            )
+                                            .await;
+                                        for frame in flush_frames {
+                                            if ws
+                                                .send_e2ee_app(
+                                                    &frame.client_msg_id,
+                                                    frame.mls_epoch,
+                                                    &frame.body_b64,
+                                                )
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Ok(Some(Mp2RoomEvent::MlsRekeyNeeded {
+                                        elected_committer_device_id,
+                                        proposal_blobs_b64,
+                                        ..
+                                    })) => {
+                                        self.handle_mp2_mls_rekey_needed(
+                                            party_id,
+                                            &proposal_blobs_b64,
+                                        )
+                                        .await;
+                                        if elected_committer_device_id == Some(self.device_id) {
+                                            failover_rekey_deadline = None;
+                                            self.submit_failover_rekey_commit(party_id).await;
+                                        } else {
+                                            failover_rekey_deadline = Some(
+                                                tokio::time::Instant::now()
+                                                    + MP_FAILOVER_REKEY_DELAY,
+                                            );
+                                        }
+                                    }
+                                    Ok(Some(Mp2RoomEvent::MlsWelcomeReady {
+                                        target_epoch,
+                                        ..
+                                    })) => {
+                                        log_line(&format!(
+                                            "Party {party_id} MLS welcome ready for local device at epoch {target_epoch}"
+                                        ));
+                                    }
                                     Ok(Some(Mp2RoomEvent::Ack(ack))) => {
+                                        self.handle_mp2_ack(party_id, &ack.client_msg_id).await;
                                         ack_waiters.retain(|(_, tx)| !tx.is_closed());
                                         if let Some(pos) = ack_waiters
                                             .iter()
@@ -1177,6 +1396,21 @@ impl AppDaemon {
                                         retry_ms,
                                     })) => {
                                         ack_waiters.retain(|(_, tx)| !tx.is_closed());
+                                        if code == "device_seq_rollback" {
+                                            self.handle_mls_clone_detected(party_id).await;
+                                        } else if code == "mls_epoch_stale" {
+                                            let flush_frames =
+                                                self.handle_mls_epoch_stale(party_id).await;
+                                            for frame in flush_frames {
+                                                let _ = ws
+                                                    .send_e2ee_app(
+                                                        &frame.client_msg_id,
+                                                        frame.mls_epoch,
+                                                        &frame.body_b64,
+                                                    )
+                                                    .await;
+                                            }
+                                        }
                                         let err_text = if let Some(ms) = retry_ms {
                                             format!("mp2 room error ({code}, retry_ms={ms}): {message}")
                                         } else {
@@ -1247,8 +1481,13 @@ impl AppDaemon {
                 Err(_) => {
                     // Drain any waiting outbound sends so callers fail fast instead of hanging.
                     while let Ok(cmd) = mp2_rx.try_recv() {
-                        let Mp2OutboundCmd::Send { ack_tx, .. } = cmd;
-                        let _ = ack_tx.send(Err("reconnecting to party room...".to_string()));
+                        match cmd {
+                            Mp2OutboundCmd::Send { ack_tx, .. }
+                            | Mp2OutboundCmd::SendE2eeApp { ack_tx, .. } => {
+                                let _ = ack_tx.send(Err("reconnecting to party room...".to_string()));
+                            }
+                            Mp2OutboundCmd::SendE2eeEphemeral { .. } => {}
+                        }
                     }
                 }
             }
@@ -1295,13 +1534,28 @@ impl AppDaemon {
                 sess.room_name = hello.name;
             }
             sess.mp2_connected = true;
+            sess.e2ee_mode = hello.e2ee_mode;
+            sess.mls_epoch = hello.mls_epoch;
+            sess.min_allowed_mls_epoch = sess
+                .min_allowed_mls_epoch
+                .max(hello.min_allowed_mls_epoch);
+            sess.mls_rekey_required = hello.mls_rekey_required;
+            if hello.group_id_b64.is_some() {
+                sess.group_id_b64 = hello.group_id_b64;
+            }
+            if let Some(ref mut mls) = sess.mls_session {
+                mls.set_min_allowed_mls_epoch(sess.min_allowed_mls_epoch);
+                if hello.mls_rekey_required {
+                    mls.set_mls_rekey_required(true);
+                }
+            }
             sess.mp2_members = hello.members.clone();
             update_mp2_provenance_cache(sess, &hello.members, auth_hash, &peers_clone);
 
             let earliest_history_seq = hello.history.first().map(|e| e.seq);
             let history_was_empty = hello.history.is_empty();
             for ev in hello.history {
-                ingest_mp2_event_into_session(sess, ev);
+                ingest_mp2_event_into_session(sess, ev, true);
             }
             // If we reconnected after having seen `prev_seq > 0`, check whether `hello.history`
             // left a gap between `prev_seq` and the earliest history event (or was empty while
@@ -1341,7 +1595,7 @@ impl AppDaemon {
                         safety_number: String::new(),
                     });
             }
-            ingest_mp2_event_into_session(sess, ev);
+            ingest_mp2_event_into_session(sess, ev, false);
         }
     }
 
@@ -1359,6 +1613,345 @@ impl AppDaemon {
         {
             sess.mp2_members = members.clone();
             update_mp2_provenance_cache(sess, &members, auth_hash, &peers_clone);
+        }
+    }
+
+    fn persist_mls_bytes_locked(&self, party_id: u64, encrypted: &[u8]) -> Result<(), String> {
+        let state_dir = open_state_dir(&self.state_dir_path)?;
+        let lock = lock_state(&state_dir)?;
+        save_mls_room_bytes(&self.state_dir_path, &lock, self.device_id, party_id, encrypted)
+    }
+
+    async fn handle_mp2_ack(&self, party_id: u64, client_msg_id: &str) {
+        let mut st = self.inner.lock().await;
+        let Some(sess) = st.active_party.as_mut() else {
+            return;
+        };
+        if sess.party_id != party_id {
+            return;
+        }
+        if let Some(ref mut mls) = sess.mls_session {
+            let _ = mls.ack_outbox(client_msg_id, |enc| {
+                self.persist_mls_bytes_locked(party_id, enc)
+            });
+        }
+    }
+
+    async fn handle_mp2_ephemeral_event(
+        &self,
+        party_id: u64,
+        _mls_epoch: u64,
+        body_encoding: &str,
+        body: &str,
+    ) {
+        let mut st = self.inner.lock().await;
+        let Some(sess) = st.active_party.as_mut() else {
+            return;
+        };
+        if sess.party_id != party_id {
+            return;
+        }
+        let Some(ref mut mls) = sess.mls_session else {
+            return;
+        };
+        if let Ok(dec) = mls.decrypt_inbound_mp2(body_encoding, body, false)
+            && !dec.is_duplicate
+            && let DecryptedInboundPayload::EphemeralStatus(status) = dec.payload
+        {
+            apply_decrypted_ephemeral_status(sess, dec.auth_account_id, dec.auth_device_id, status);
+        }
+    }
+
+    async fn prepare_e2ee_ephemeral_status(
+        &self,
+        party_id: u64,
+        agent_name: &str,
+        agent_state: &str,
+        agent_summary: Option<&str>,
+    ) -> Option<outpost_core::mls_session::PreparedOutboundE2ee> {
+        let mut st = self.inner.lock().await;
+        let sess = st.active_party.as_mut()?;
+        if sess.party_id != party_id || sess.e2ee_mode != 1 {
+            return None;
+        }
+        let mls = sess.mls_session.as_mut()?;
+        let cid = format!("mp2-eph-{}-{}", self.device_id, wall_now_ms());
+        let now_s = u64::try_from(wall_now_secs()).unwrap_or(0);
+        mls.prepare_outbound_ephemeral_status(
+            &cid,
+            agent_name,
+            agent_state,
+            agent_summary,
+            now_s,
+            |enc| self.persist_mls_bytes_locked(party_id, enc),
+        )
+        .ok()
+    }
+
+    async fn handle_mp2_mls_commit_tentative(
+        &self,
+        party_id: u64,
+        commit_epoch: u64,
+        proposals_b64: &[String],
+        commit_b64: &str,
+    ) {
+        let Ok(commit_bytes) = B64.decode(commit_b64.as_bytes()) else {
+            return;
+        };
+        let mut proposal_blobs = Vec::with_capacity(proposals_b64.len());
+        for p in proposals_b64 {
+            if let Ok(b) = B64.decode(p.as_bytes()) {
+                proposal_blobs.push(b);
+            }
+        }
+        let Ok(pid) = PartyId::new(party_id) else {
+            return;
+        };
+        let (control, ack_req) = {
+            let mut st = self.inner.lock().await;
+            let control = st.control.clone();
+            let Some(sess) = st.active_party.as_mut() else {
+                return;
+            };
+            if sess.party_id != party_id {
+                return;
+            }
+            let Some(ref mut mls) = sess.mls_session else {
+                return;
+            };
+            let Ok(ack) = mls.handle_tentative_commit(&proposal_blobs, &commit_bytes) else {
+                return;
+            };
+            let req = MlsCommitAckRequest {
+                group_id_b64: B64.encode(ack.group_id),
+                parent_epoch: ack.parent_epoch,
+                target_epoch: ack.target_epoch,
+                commit_sha256_b64: B64.encode(ack.commit_sha256),
+                status: ack.status as u8,
+                epoch_auth_hash_b64: ack.epoch_auth_hash.map(|h| B64.encode(h)),
+                ack_sig_b64: B64.encode(ack.ack_sig),
+            };
+            (control, req)
+        };
+        if let Err(e) = control.mls_submit_ack(pid, &ack_req).await {
+            log_line(&format!(
+                "Party {party_id} POST /mls/ack failed for epoch {commit_epoch}: {e}"
+            ));
+        }
+    }
+
+    async fn handle_mp2_mls_commit_finalized(
+        &self,
+        party_id: u64,
+        commit_epoch: u64,
+        proposals_b64: &[String],
+        commit_b64: &str,
+    ) -> Vec<outpost_core::mls_session::PreparedOutboundE2ee> {
+        let Ok(commit_bytes) = B64.decode(commit_b64.as_bytes()) else {
+            return Vec::new();
+        };
+        let mut proposal_blobs = Vec::with_capacity(proposals_b64.len());
+        for p in proposals_b64 {
+            if let Ok(b) = B64.decode(p.as_bytes()) {
+                proposal_blobs.push(b);
+            }
+        }
+        let now_s = u64::try_from(wall_now_secs()).unwrap_or(0);
+        let mut st = self.inner.lock().await;
+        let Some(sess) = st.active_party.as_mut() else {
+            return Vec::new();
+        };
+        if sess.party_id != party_id {
+            return Vec::new();
+        }
+        sess.mls_epoch = sess.mls_epoch.max(commit_epoch);
+        let Some(ref mut mls) = sess.mls_session else {
+            return Vec::new();
+        };
+        if let Err(e) = mls.handle_finalized_commit(&proposal_blobs, &commit_bytes, now_s) {
+            log_line(&format!(
+                "Party {party_id} failed to merge finalized MLS commit epoch {commit_epoch}: {e}"
+            ));
+            return Vec::new();
+        }
+        sess.mls_epoch = mls.epoch();
+        sess.mls_rekey_required = mls.mls_rekey_required();
+        if let Ok(enc) = mls.export_encrypted_snapshot() {
+            let _ = self.persist_mls_bytes_locked(party_id, &enc);
+        }
+        let stale_ids = mls.stale_outbox_client_msg_ids();
+        let mut flushed = Vec::new();
+        for cid in stale_ids {
+            if let Ok(prep) = mls.requeue_stale_outbox_entry(&cid, now_s, |enc| {
+                self.persist_mls_bytes_locked(party_id, enc)
+            }) {
+                flushed.push(prep);
+            }
+        }
+        flushed
+    }
+
+    async fn handle_mp2_mls_rekey_needed(&self, party_id: u64, proposals_b64: &[String]) {
+        let mut proposal_blobs = Vec::with_capacity(proposals_b64.len());
+        for p in proposals_b64 {
+            if let Ok(b) = B64.decode(p.as_bytes()) {
+                proposal_blobs.push(b);
+            }
+        }
+        let mut st = self.inner.lock().await;
+        let Some(sess) = st.active_party.as_mut() else {
+            return;
+        };
+        if sess.party_id != party_id {
+            return;
+        }
+        sess.mls_rekey_required = true;
+        if let Some(ref mut mls) = sess.mls_session {
+            mls.handle_rekey_needed(&proposal_blobs);
+        }
+    }
+
+    async fn submit_failover_rekey_commit(&self, party_id: u64) {
+        let Ok(pid) = PartyId::new(party_id) else {
+            return;
+        };
+        let (control, req) = {
+            let mut st = self.inner.lock().await;
+            let control = st.control.clone();
+            let Some(sess) = st.active_party.as_mut() else {
+                return;
+            };
+            if sess.party_id != party_id || !sess.mls_rekey_required {
+                return;
+            }
+            let Some(ref mut mls) = sess.mls_session else {
+                return;
+            };
+            let parent_epoch = mls.epoch();
+            let Ok(commit_bytes) = mls.build_failover_rekey_commit(None) else {
+                return;
+            };
+            let req = MlsCommitRequest {
+                parent_epoch,
+                commit_b64: B64.encode(&commit_bytes),
+                welcome_b64: None,
+                welcome_auth_b64: None,
+                joiner_device_id: None,
+            };
+            (control, req)
+        };
+        if let Err(e) = control.mls_submit_commit(pid, &req).await {
+            log_line(&format!(
+                "Party {party_id} failover rekey commit submission failed: {e}"
+            ));
+        }
+    }
+
+    async fn submit_pcs_self_update_commit(&self, party_id: u64) {
+        let Ok(pid) = PartyId::new(party_id) else {
+            return;
+        };
+        let (control, req) = {
+            let mut st = self.inner.lock().await;
+            let control = st.control.clone();
+            let Some(sess) = st.active_party.as_mut() else {
+                return;
+            };
+            if sess.party_id != party_id {
+                return;
+            }
+            let Some(ref mut mls) = sess.mls_session else {
+                return;
+            };
+            if !mls.needs_pcs_self_update() {
+                return;
+            }
+            let parent_epoch = mls.epoch();
+            let Ok(commit_bytes) = mls.build_pcs_self_update_commit() else {
+                return;
+            };
+            let req = MlsCommitRequest {
+                parent_epoch,
+                commit_b64: B64.encode(&commit_bytes),
+                welcome_b64: None,
+                welcome_auth_b64: None,
+                joiner_device_id: None,
+            };
+            (control, req)
+        };
+        if let Err(e) = control.mls_submit_commit(pid, &req).await {
+            log_line(&format!(
+                "Party {party_id} PCS self-Update commit failed: {e}"
+            ));
+        }
+    }
+
+    async fn handle_mls_epoch_stale(
+        &self,
+        party_id: u64,
+    ) -> Vec<outpost_core::mls_session::PreparedOutboundE2ee> {
+        let Ok(pid) = PartyId::new(party_id) else {
+            return Vec::new();
+        };
+        let (control, from_epoch) = {
+            let st = self.inner.lock().await;
+            let Some(sess) = st.active_party.as_ref() else {
+                return Vec::new();
+            };
+            if sess.party_id != party_id {
+                return Vec::new();
+            }
+            let cur = sess.mls_session.as_ref().map_or(sess.mls_epoch, |m| m.epoch());
+            (st.control.clone(), cur.saturating_add(1))
+        };
+        let Ok(page) = control.mls_fetch_commits(pid, from_epoch, 32).await else {
+            return Vec::new();
+        };
+        let mut flushed = Vec::new();
+        for rec in page.commits {
+            let mut batch = self
+                .handle_mp2_mls_commit_finalized(
+                    party_id,
+                    rec.epoch,
+                    &rec.proposal_blobs_b64,
+                    &rec.commit_b64,
+                )
+                .await;
+            flushed.append(&mut batch);
+        }
+        flushed
+    }
+
+    async fn handle_mls_clone_detected(&self, party_id: u64) {
+        let mut st = self.inner.lock().await;
+        let Some(sess) = st.active_party.as_mut() else {
+            return;
+        };
+        if sess.party_id != party_id {
+            return;
+        }
+        if let Some(ref mut mls) = sess.mls_session {
+            mls.mark_clone_detected();
+            if let Ok(enc) = mls.export_encrypted_snapshot() {
+                let _ = self.persist_mls_bytes_locked(party_id, &enc);
+            }
+        }
+    }
+
+    async fn sweep_mls_past_epochs(&self, party_id: u64) {
+        let mut st = self.inner.lock().await;
+        let Some(sess) = st.active_party.as_mut() else {
+            return;
+        };
+        if sess.party_id != party_id {
+            return;
+        }
+        let now_s = u64::try_from(wall_now_secs()).unwrap_or(0);
+        if let Some(ref mut mls) = sess.mls_session
+            && mls.prune_past_epochs(now_s).is_ok()
+            && let Ok(enc) = mls.export_encrypted_snapshot()
+        {
+            let _ = self.persist_mls_bytes_locked(party_id, &enc);
         }
     }
 
@@ -2543,6 +3136,12 @@ impl AppDaemon {
                 room_name: String::new(),
                 share_url: String::new(),
                 ws_path: format!("/v1/parties/{party_id}/ws"),
+                e2ee_mode: 0,
+                mls_epoch: 0,
+                min_allowed_mls_epoch: 0,
+                mls_rekey_required: false,
+                group_id_b64: None,
+                mls_session: None,
                 members: HashMap::new(),
                 mp2_members: Vec::new(),
                 mp2_connected: false,
@@ -2865,6 +3464,15 @@ impl AppDaemon {
                 delivered_preview: Vec<u64>,
                 withheld_unpinned: Vec<u64>,
             },
+            Mp2E2ee {
+                tx: mpsc::Sender<Mp2OutboundCmd>,
+                mp2_msg_id: String,
+                mls_epoch: u64,
+                body_b64: String,
+                needs_pcs_self_update: bool,
+                delivered_preview: Vec<u64>,
+                withheld_unpinned: Vec<u64>,
+            },
             P2p {
                 p2p: Arc<PartyP2pHandle>,
                 target_pks: Vec<(u64, [u8; 32])>,
@@ -2940,14 +3548,40 @@ impl AppDaemon {
                 )?;
                 let target = resolve_mp2_target_selector(sess, req.target_device_id);
                 let mp2_msg_id = format!("mp2-{}-{client_msg_id}", self.device_id);
-                sess.record_sent_mp2_msg_id(mp2_msg_id.clone());
-                ChatDispatch::Mp2 {
-                    tx,
-                    mp2_msg_id,
-                    target,
-                    body: req.body,
-                    delivered_preview,
-                    withheld_unpinned,
+                if sess.e2ee_mode == 1 {
+                    let Some(ref mut mls) = sess.mls_session else {
+                        return Err(ipc_err(
+                            ERR_CONFLICT,
+                            true,
+                            "E2EE room requires initialized MLS group before sending",
+                        ));
+                    };
+                    let now_s = u64::try_from(wall_now_secs()).unwrap_or(0);
+                    let prepared = mls
+                        .prepare_outbound_chat(&mp2_msg_id, &target, &req.body, now_s, |enc| {
+                            self.persist_mls_bytes_locked(party_id, enc)
+                        })
+                        .map_err(|e| ipc_err(ERR_CONFLICT, false, e.to_string()))?;
+                    sess.record_sent_mp2_msg_id(mp2_msg_id.clone());
+                    ChatDispatch::Mp2E2ee {
+                        tx,
+                        mp2_msg_id,
+                        mls_epoch: prepared.mls_epoch,
+                        body_b64: prepared.body_b64,
+                        needs_pcs_self_update: prepared.needs_pcs_self_update,
+                        delivered_preview,
+                        withheld_unpinned,
+                    }
+                } else {
+                    sess.record_sent_mp2_msg_id(mp2_msg_id.clone());
+                    ChatDispatch::Mp2 {
+                        tx,
+                        mp2_msg_id,
+                        target,
+                        body: req.body,
+                        delivered_preview,
+                        withheld_unpinned,
+                    }
                 }
             } else {
                 let Some(p2p) = sess.p2p.as_ref().map(Arc::clone) else {
@@ -3047,6 +3681,52 @@ impl AppDaemon {
                     .map_err(|msg| ipc_err(ERR_CONFLICT, true, msg))?;
                 (delivered_preview, withheld_unpinned, Vec::new())
             }
+            ChatDispatch::Mp2E2ee {
+                tx,
+                mp2_msg_id,
+                mls_epoch,
+                body_b64,
+                needs_pcs_self_update,
+                delivered_preview,
+                withheld_unpinned,
+            } => {
+                let (ack_tx, ack_rx) = oneshot::channel();
+                tx.send(Mp2OutboundCmd::SendE2eeApp {
+                    client_msg_id: mp2_msg_id,
+                    mls_epoch,
+                    body_b64,
+                    ack_tx,
+                })
+                .await
+                .map_err(|_| {
+                    ipc_err(
+                        ERR_CONFLICT,
+                        true,
+                        "party room socket is not active; reconnect or rejoin",
+                    )
+                })?;
+                let _ack = tokio::time::timeout(MP2_ACK_TIMEOUT, ack_rx)
+                    .await
+                    .map_err(|_| {
+                        ipc_err(
+                            ERR_CONFLICT,
+                            true,
+                            "timed out waiting for E2EE room acknowledgement",
+                        )
+                    })?
+                    .map_err(|_| {
+                        ipc_err(
+                            ERR_CONFLICT,
+                            true,
+                            "party room socket closed before E2EE acknowledgement",
+                        )
+                    })?
+                    .map_err(|msg| ipc_err(ERR_CONFLICT, true, msg))?;
+                if needs_pcs_self_update {
+                    self.submit_pcs_self_update_commit(party_id).await;
+                }
+                (delivered_preview, withheld_unpinned, Vec::new())
+            }
             ChatDispatch::P2p {
                 p2p,
                 target_pks,
@@ -3142,6 +3822,15 @@ impl AppDaemon {
                 delivered_preview: Vec<u64>,
                 withheld_unpinned: Vec<u64>,
             },
+            Mp2E2ee {
+                tx: mpsc::Sender<Mp2OutboundCmd>,
+                mp2_msg_id: String,
+                mls_epoch: u64,
+                body_b64: String,
+                needs_pcs_self_update: bool,
+                delivered_preview: Vec<u64>,
+                withheld_unpinned: Vec<u64>,
+            },
             P2p {
                 p2p: Arc<PartyP2pHandle>,
                 target_pks: Vec<(u64, [u8; 32])>,
@@ -3207,34 +3896,60 @@ impl AppDaemon {
                     self.strict_pins,
                     None,
                 )?;
-                let (body_encoding, body) = match std::str::from_utf8(&req.payload) {
-                    Ok(text) if text.len() <= MAX_MP2_BODY_BYTES => {
-                        ("utf8".to_string(), text.to_string())
-                    }
-                    _ => {
-                        let enc = B64.encode(&req.payload);
-                        if enc.len() > MAX_MP2_BODY_BYTES {
-                            return Err(ipc_err(
-                                ERR_INVALID_PARAMS,
-                                false,
-                                format!(
-                                    "agent_card payload exceeds mp2 32 KiB body limit ({} bytes)",
-                                    enc.len()
-                                ),
-                            ));
-                        }
-                        ("opaque_b64".to_string(), enc)
-                    }
-                };
                 let mp2_msg_id = format!("mp2-card-{}-{client_msg_id}", self.device_id);
-                sess.record_sent_mp2_msg_id(mp2_msg_id.clone());
-                BoardDispatch::Mp2 {
-                    tx,
-                    mp2_msg_id,
-                    body_encoding,
-                    body,
-                    delivered_preview,
-                    withheld_unpinned,
+                if sess.e2ee_mode == 1 {
+                    let Some(ref mut mls) = sess.mls_session else {
+                        return Err(ipc_err(
+                            ERR_CONFLICT,
+                            true,
+                            "E2EE room requires initialized MLS group before posting agent card",
+                        ));
+                    };
+                    let now_s = u64::try_from(wall_now_secs()).unwrap_or(0);
+                    let prepared = mls
+                        .prepare_outbound_agent_card(&mp2_msg_id, &req.payload, now_s, |enc| {
+                            self.persist_mls_bytes_locked(party_id, enc)
+                        })
+                        .map_err(|e| ipc_err(ERR_CONFLICT, false, e.to_string()))?;
+                    sess.record_sent_mp2_msg_id(mp2_msg_id.clone());
+                    BoardDispatch::Mp2E2ee {
+                        tx,
+                        mp2_msg_id,
+                        mls_epoch: prepared.mls_epoch,
+                        body_b64: prepared.body_b64,
+                        needs_pcs_self_update: prepared.needs_pcs_self_update,
+                        delivered_preview,
+                        withheld_unpinned,
+                    }
+                } else {
+                    let (body_encoding, body) = match std::str::from_utf8(&req.payload) {
+                        Ok(text) if text.len() <= MAX_MP2_BODY_BYTES => {
+                            ("utf8".to_string(), text.to_string())
+                        }
+                        _ => {
+                            let enc = B64.encode(&req.payload);
+                            if enc.len() > MAX_MP2_BODY_BYTES {
+                                return Err(ipc_err(
+                                    ERR_INVALID_PARAMS,
+                                    false,
+                                    format!(
+                                        "agent_card payload exceeds mp2 32 KiB body limit ({} bytes)",
+                                        enc.len()
+                                    ),
+                                ));
+                            }
+                            ("opaque_b64".to_string(), enc)
+                        }
+                    };
+                    sess.record_sent_mp2_msg_id(mp2_msg_id.clone());
+                    BoardDispatch::Mp2 {
+                        tx,
+                        mp2_msg_id,
+                        body_encoding,
+                        body,
+                        delivered_preview,
+                        withheld_unpinned,
+                    }
                 }
             } else {
                 let Some(p2p) = sess.p2p.as_ref().map(Arc::clone) else {
@@ -3315,6 +4030,52 @@ impl AppDaemon {
                         )
                     })?
                     .map_err(|msg| ipc_err(ERR_CONFLICT, true, msg))?;
+                (delivered_preview, withheld_unpinned, Vec::new())
+            }
+            BoardDispatch::Mp2E2ee {
+                tx,
+                mp2_msg_id,
+                mls_epoch,
+                body_b64,
+                needs_pcs_self_update,
+                delivered_preview,
+                withheld_unpinned,
+            } => {
+                let (ack_tx, ack_rx) = oneshot::channel();
+                tx.send(Mp2OutboundCmd::SendE2eeApp {
+                    client_msg_id: mp2_msg_id,
+                    mls_epoch,
+                    body_b64,
+                    ack_tx,
+                })
+                .await
+                .map_err(|_| {
+                    ipc_err(
+                        ERR_CONFLICT,
+                        true,
+                        "party room socket is not active; reconnect or rejoin",
+                    )
+                })?;
+                let _ack = tokio::time::timeout(MP2_ACK_TIMEOUT, ack_rx)
+                    .await
+                    .map_err(|_| {
+                        ipc_err(
+                            ERR_CONFLICT,
+                            true,
+                            "timed out waiting for E2EE room acknowledgement",
+                        )
+                    })?
+                    .map_err(|_| {
+                        ipc_err(
+                            ERR_CONFLICT,
+                            true,
+                            "party room socket closed before E2EE acknowledgement",
+                        )
+                    })?
+                    .map_err(|msg| ipc_err(ERR_CONFLICT, true, msg))?;
+                if needs_pcs_self_update {
+                    self.submit_pcs_self_update_commit(party_id).await;
+                }
                 (delivered_preview, withheld_unpinned, Vec::new())
             }
             BoardDispatch::P2p {
@@ -3536,6 +4297,12 @@ impl AppDaemon {
                         cursor_reset: true,
                         gap_possible: true,
                         timed_out: false,
+                        e2ee_mode: 0,
+                        mls_epoch: 0,
+                        trust_tier: 0,
+                        has_declared_agent: false,
+                        epoch_authenticator_b32: String::new(),
+                        clone_detected: false,
                         events: Vec::new(),
                     };
                     return encode_party_poll_resp(&resp)
@@ -3582,6 +4349,12 @@ impl AppDaemon {
                             cursor_reset: false,
                             gap_possible: false,
                             timed_out: true,
+                            e2ee_mode: 0,
+                            mls_epoch: 0,
+                            trust_tier: 0,
+                            has_declared_agent: false,
+                            epoch_authenticator_b32: String::new(),
+                            clone_detected: false,
                             events: Vec::new(),
                         }
                     };
@@ -3845,6 +4618,12 @@ impl AppDaemon {
                 room_name: String::new(),
                 share_url: String::new(),
                 ws_path: format!("/v1/parties/{party_id}/ws"),
+                e2ee_mode: 0,
+                mls_epoch: 0,
+                min_allowed_mls_epoch: 0,
+                mls_rekey_required: false,
+                group_id_b64: None,
+                mls_session: None,
                 members: HashMap::new(),
                 mp2_members: Vec::new(),
                 mp2_connected: false,
@@ -4113,6 +4892,12 @@ impl AppDaemon {
                         room_name: String::new(),
                         share_url: String::new(),
                         ws_path: format!("/v1/parties/{}/ws", req.party_id),
+                        e2ee_mode: 0,
+                        mls_epoch: 0,
+                        min_allowed_mls_epoch: 0,
+                        mls_rekey_required: false,
+                        group_id_b64: None,
+                        mls_session: None,
                         members: HashMap::new(),
                         mp2_members: Vec::new(),
                         mp2_connected: false,
@@ -4174,6 +4959,11 @@ impl AppDaemon {
             .await
             .map_err(|e| ipc_err(ERR_CONTROL_PLANE, true, e.to_string()))?;
         self.teardown_active_party(party_id, "operator_leave").await;
+        if let Ok(state_dir) = open_state_dir(&self.state_dir_path)
+            && let Ok(lock) = lock_state(&state_dir)
+        {
+            remove_mls_room_snapshot(&self.state_dir_path, &lock, self.device_id, party_id);
+        }
         Ok(encode_party_epoch_resp(&PartyEpochResp {
             ok: resp.left,
             party_epoch: resp.party_epoch,
@@ -4559,6 +5349,12 @@ impl AppDaemon {
                 room_name,
                 share_url,
                 ws_path: eff_ws_path,
+                e2ee_mode: 0,
+                mls_epoch: 0,
+                min_allowed_mls_epoch: 0,
+                mls_rekey_required: false,
+                group_id_b64: None,
+                mls_session: None,
                 members: HashMap::new(),
                 mp2_members: initial_members.clone(),
                 mp2_connected: false,
@@ -4612,7 +5408,7 @@ impl AppDaemon {
         let resp = control
             .room_invite(&rest_req)
             .await
-            .map_err(|e| ipc_err(ERR_CONTROL_PLANE, true, e.to_string()))?;
+            .map_err(|e| map_control_err_to_ipc(&e))?;
 
         let validated_ws_path = validate_party_ws_path(resp.party_id, &resp.ws_path)?;
 
@@ -4651,7 +5447,7 @@ impl AppDaemon {
         let resp = control
             .room_enter(&rest_req)
             .await
-            .map_err(|e| ipc_err(ERR_CONTROL_PLANE, true, e.to_string()))?;
+            .map_err(|e| map_control_err_to_ipc(&e))?;
 
         let validated_ws_path = validate_party_ws_path(resp.party_id, &resp.ws_path)?;
 
@@ -4660,11 +5456,15 @@ impl AppDaemon {
             .iter()
             .map(|m| {
                 let is_guest = m.is_guest || m.account_id == 0;
+                let is_browser = m.is_browser
+                    || m.client.trim().eq_ignore_ascii_case("web")
+                    || m.client.trim().eq_ignore_ascii_case("browser");
                 Mp2Member {
                     account_id: if is_guest { 0 } else { m.account_id },
                     handle: m.handle.clone(),
                     client: m.client.clone(),
                     is_guest,
+                    is_browser,
                     agent_name: m.agent_name.clone(),
                     agent_state: None,
                     agent_summary: None,
@@ -4738,8 +5538,8 @@ impl AppDaemon {
                 .leave_party(pid)
                 .await
                 .map(|r| r.left)
-                .map_err(|e| ipc_err(ERR_CONTROL_PLANE, true, e.to_string()))?,
-            Err(e) => return Err(ipc_err(ERR_CONTROL_PLANE, true, e.to_string())),
+                .map_err(|e| map_control_err_to_ipc(&e))?,
+            Err(e) => return Err(map_control_err_to_ipc(&e)),
         };
         self.teardown_active_party(party_id, "operator_leave").await;
         Ok(encode_room_leave_resp(&RoomLeaveIpcResp { left, party_id }))
@@ -4819,7 +5619,7 @@ impl AppDaemon {
                 })
                 .map_err(|e| ipc_err(ERR_INTERNAL, false, e.to_string()))
             }
-            Err(e) => Err(ipc_err(ERR_CONTROL_PLANE, true, e.to_string())),
+            Err(e) => Err(map_control_err_to_ipc(&e)),
         }
     }
 }
@@ -5274,6 +6074,21 @@ fn lookup_mp2_member_trust(
     }
 }
 
+fn map_control_err_to_ipc(err: &ControlError) -> IpcErr {
+    match err {
+        ControlError::Api {
+            status: 401, error, ..
+        } => ipc_err(
+            ERR_UNAUTHORIZED,
+            false,
+            format!(
+                "HTTP 401 ({error}): local CLI device credential was rejected or expired. Signing in on multiplayer.tech in your browser is separate from authorizing this local CLI device; run `mp-outpost login` to authorize this device."
+            ),
+        ),
+        other => ipc_err(ERR_CONTROL_PLANE, true, other.to_string()),
+    }
+}
+
 fn validate_party_ws_path(party_id: u64, ws_path: &str) -> Result<String, IpcErr> {
     let canonical = format!("/v1/parties/{party_id}/ws");
     if ws_path.is_empty() {
@@ -5299,17 +6114,22 @@ fn format_guest_display_name(raw: &str) -> String {
     }
 }
 
-/// Normalizes room join targets including short invite domains (`multiplayer.tech`, `mp.gg`,
-/// and `clank.party`) into canonical `@handle` or 4-char room code tokens.
+/// Normalizes room join targets including `#fragment` invite links
+/// (`multiplayer.tech/p/i/<id>#<secret>`, `clank.party/i/<id>#<secret>`) and short invite domains
+/// (`multiplayer.tech`, `mp.gg`, `clank.party`) while NEVER stripping `#<secret>` on `/p/i/` or
+/// `/i/` invite URLs.
 fn normalize_room_enter_target(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return String::new();
     }
-    let without_scheme = trimmed
-        .strip_prefix("https://")
-        .or_else(|| trimmed.strip_prefix("http://"))
-        .unwrap_or(trimmed);
+    let (has_scheme, without_scheme) = if let Some(rest) = trimmed.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        (true, rest)
+    } else {
+        (false, trimmed)
+    };
     let Some((host_raw, path_raw)) = without_scheme.split_once('/') else {
         return trimmed.to_string();
     };
@@ -5329,6 +6149,18 @@ fn normalize_room_enter_target(raw: &str) -> String {
     );
     if !is_known_invite_host {
         return trimmed.to_string();
+    }
+    let path_without_leading = path_raw.trim_start_matches('/');
+    let path_lower = path_without_leading.to_ascii_lowercase();
+    // Preserve `#fragment` invite links verbatim (`multiplayer.tech/p/i/<id>#<secret>`,
+    // `clank.party/i/<id>#<secret>`, `mp.gg/i/<id>#<secret>`, etc.) so `/v1/rooms/enter`
+    // receives the full `#<secret>` in the POST body without ever stripping it.
+    if path_lower.starts_with("p/i/") || path_lower.starts_with("i/") {
+        return if has_scheme && trimmed.starts_with("https://") {
+            trimmed.to_string()
+        } else {
+            format!("https://{host}/{path_without_leading}")
+        };
     }
     let path = path_raw
         .split(['?', '#'])
@@ -5393,7 +6225,27 @@ fn update_mp2_provenance_cache(
     }
 }
 
-fn ingest_mp2_event_into_session(sess: &mut ActivePartySession, ev: Mp2Event) {
+fn apply_decrypted_ephemeral_status(
+    sess: &mut ActivePartySession,
+    auth_account_id: u64,
+    auth_device_id: u64,
+    status: outpost_core::mls_session::InnerEphemeralStatus,
+) {
+    if let Some(member) = sess.mp2_members.iter_mut().find(|m| {
+        m.device_id == Some(auth_device_id)
+            || (m.device_id.is_none() && m.account_id == auth_account_id)
+    }) {
+        member.agent_name = Some(status.agent_name);
+        member.agent_state = Some(status.agent_state);
+        member.agent_summary = status.agent_summary;
+    }
+}
+
+fn ingest_mp2_event_into_session(
+    sess: &mut ActivePartySession,
+    ev: Mp2Event,
+    is_historical_catchup: bool,
+) {
     if !sess.mark_mp2_seq_seen(ev.seq) {
         return;
     }
@@ -5404,9 +6256,106 @@ fn ingest_mp2_event_into_session(sess: &mut ActivePartySession, ev: Mp2Event) {
         return;
     }
 
+    // Spec v3 §4.5 / §7.3 fail-closed E2EE boundary:
+    // In `e2ee_mode == 1` rooms, NEVER render or agent-trigger non-`opaque_b64` app frames!
+    let room_is_e2ee = sess.e2ee_mode == 1 || ev.e2ee_mode == Some(1);
+    if room_is_e2ee && ev.kind != Mp2EventKind::System {
+        if ev.body_encoding != "opaque_b64" {
+            log_line(&format!(
+                "Party {} rejected non-opaque_b64 frame (encoding='{}') in e2ee_mode=1 room",
+                sess.party_id, ev.body_encoding
+            ));
+            return;
+        }
+        let Some(ref mut mls) = sess.mls_session else {
+            return;
+        };
+        let dec = match mls.decrypt_inbound_mp2(&ev.body_encoding, &ev.body, is_historical_catchup)
+        {
+            Ok(d) => d,
+            Err(e) => {
+                log_line(&format!(
+                    "Party {} failed to decrypt inbound E2EE frame seq={}: {e}",
+                    sess.party_id, ev.seq
+                ));
+                return;
+            }
+        };
+        if dec.is_duplicate {
+            return;
+        }
+        let sender_account_id = dec.auth_account_id;
+        let sender_device_id = dec.auth_device_id;
+        let is_browser = dec.sender_is_browser;
+        let sender_client = if is_browser {
+            "web".to_string()
+        } else if !ev.sender.client.is_empty() {
+            ev.sender.client
+        } else {
+            "outpost".to_string()
+        };
+        let sender_handle = sess
+            .provenance_by_account
+            .get(&sender_account_id)
+            .map(|p| p.handle.clone())
+            .filter(|h| !h.is_empty())
+            .or(
+                if !ev.sender.handle.is_empty() && ev.sender.account_id == sender_account_id {
+                    Some(ev.sender.handle)
+                } else {
+                    None
+                },
+            )
+            .unwrap_or_else(|| format!("account-{sender_account_id}"));
+
+        let body = match dec.payload {
+            DecryptedInboundPayload::Chat {
+                target_selector,
+                body,
+            } => PartyEventBody::Chat {
+                sender_account_id,
+                sender_device_id,
+                sender_handle,
+                is_browser,
+                sender_client,
+                room_scope: "party/main".to_string(),
+                target_selector,
+                timestamp_ns: i64::try_from(ev.ts_ms)
+                    .unwrap_or(0)
+                    .saturating_mul(1_000_000),
+                body,
+            },
+            DecryptedInboundPayload::AgentCard { payload } => PartyEventBody::BridgeEnvelope {
+                sender_account_id,
+                sender_device_id,
+                sender_handle,
+                is_browser,
+                sender_client,
+                room_scope: "party/main".to_string(),
+                payload,
+            },
+            DecryptedInboundPayload::EphemeralStatus(status) => {
+                apply_decrypted_ephemeral_status(sess, sender_account_id, sender_device_id, status);
+                return;
+            }
+            DecryptedInboundPayload::InviteControl(_) => {
+                return;
+            }
+        };
+        let _ = sess.push_event_with_catchup(body, is_historical_catchup);
+        return;
+    }
+
     let is_guest = ev.sender.is_guest || ev.sender.account_id == 0;
+    let is_browser = ev.sender.is_browser_origin();
+    let sender_client = if is_browser && ev.sender.client.trim().is_empty() {
+        "web".to_string()
+    } else {
+        ev.sender.client.clone()
+    };
     let sender_account_id = if is_guest { 0 } else { ev.sender.account_id };
-    let sender_device_id = if is_guest {
+    // Browser sessions are account-level web participants, never native enrolled devices.
+    let sender_device_id = if is_guest || is_browser {
         0
     } else {
         ev.sender.device_id.unwrap_or(sender_account_id)
@@ -5424,6 +6373,8 @@ fn ingest_mp2_event_into_session(sess: &mut ActivePartySession, ev: Mp2Event) {
             sender_account_id,
             sender_device_id,
             sender_handle,
+            is_browser,
+            sender_client,
             room_scope: "party/main".to_string(),
             target_selector: ev.target,
             timestamp_ns: i64::try_from(ev.ts_ms)
@@ -5442,6 +6393,8 @@ fn ingest_mp2_event_into_session(sess: &mut ActivePartySession, ev: Mp2Event) {
                 sender_account_id,
                 sender_device_id,
                 sender_handle,
+                is_browser,
+                sender_client,
                 room_scope: "party/main".to_string(),
                 payload,
             }
@@ -5450,9 +6403,12 @@ fn ingest_mp2_event_into_session(sess: &mut ActivePartySession, ev: Mp2Event) {
             party_epoch: sess.party_epoch,
             summary: ev.body,
         },
+        Mp2EventKind::E2eeApp | Mp2EventKind::E2eeEphemeral => {
+            return;
+        }
     };
 
-    let _ = sess.push_event(body);
+    let _ = sess.push_event_with_catchup(body, is_historical_catchup);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5799,6 +6755,8 @@ fn build_provenance(
     sender_account_id: u64,
     sender_device_id: u64,
     fallback_handle: &str,
+    is_browser: bool,
+    sender_client: &str,
 ) -> IpcProvenance {
     if let Some(prov) = sess.provenance_by_account.get(&sender_account_id) {
         let handle = if !prov.handle.is_empty() {
@@ -5814,6 +6772,8 @@ fn build_provenance(
             sender_handle: handle,
             root_pubkey_fingerprint: prov.fingerprint.clone(),
             safety_number: prov.safety_number.clone(),
+            is_browser,
+            sender_client: sender_client.to_string(),
         }
     } else {
         IpcProvenance {
@@ -5826,6 +6786,8 @@ fn build_provenance(
             },
             root_pubkey_fingerprint: String::new(),
             safety_number: String::new(),
+            is_browser,
+            sender_client: sender_client.to_string(),
         }
     }
 }
@@ -5843,6 +6805,8 @@ fn build_ipc_poll_resp(
                 sender_account_id,
                 sender_device_id,
                 sender_handle,
+                is_browser,
+                sender_client,
                 room_scope,
                 target_selector,
                 timestamp_ns,
@@ -5857,6 +6821,8 @@ fn build_ipc_poll_resp(
                         sender_account_id,
                         sender_device_id,
                         &sender_handle,
+                        is_browser,
+                        &sender_client,
                     ),
                     room_scope,
                     target_selector,
@@ -5868,6 +6834,8 @@ fn build_ipc_poll_resp(
                 sender_account_id,
                 sender_device_id,
                 sender_handle,
+                is_browser,
+                sender_client,
                 room_scope,
                 payload,
             } => IpcPartyEventKind::BridgeEnvelope {
@@ -5876,6 +6844,8 @@ fn build_ipc_poll_resp(
                     sender_account_id,
                     sender_device_id,
                     &sender_handle,
+                    is_browser,
+                    &sender_client,
                 ),
                 room_scope,
                 payload,
@@ -5891,7 +6861,14 @@ fn build_ipc_poll_resp(
                     continue;
                 }
                 IpcPartyEventKind::ControlNotice {
-                    provenance: build_provenance(sess, sender_account_id, sender_device_id, ""),
+                    provenance: build_provenance(
+                        sess,
+                        sender_account_id,
+                        sender_device_id,
+                        "",
+                        false,
+                        "",
+                    ),
                     notice_kind,
                     party_epoch,
                     text,
@@ -5914,10 +6891,12 @@ fn build_ipc_poll_resp(
             event_seq: ev.seq,
             party_id: sess.party_id,
             party_epoch: sess.party_epoch,
+            is_historical_catchup: ev.is_historical_catchup,
             kind,
         });
     }
 
+    let mls = sess.mls_status_snapshot();
     PartyPollIpcResp {
         party_id: sess.party_id,
         daemon_epoch: poll.daemon_epoch,
@@ -5926,6 +6905,12 @@ fn build_ipc_poll_resp(
         cursor_reset: poll.cursor_reset,
         gap_possible: poll.gap_possible,
         timed_out,
+        e2ee_mode: mls.e2ee_mode,
+        mls_epoch: mls.mls_epoch,
+        trust_tier: mls.trust_tier,
+        has_declared_agent: mls.has_declared_agent,
+        epoch_authenticator_b32: mls.epoch_authenticator_b32,
+        clone_detected: mls.clone_detected,
         events,
     }
 }
@@ -6165,6 +7150,12 @@ mod tests {
             room_name: "Squad".to_string(),
             share_url: "https://clank.party/KAIH".to_string(),
             ws_path: "/v1/parties/8801/ws".to_string(),
+            e2ee_mode: 0,
+            mls_epoch: 0,
+            min_allowed_mls_epoch: 0,
+            mls_rekey_required: false,
+            group_id_b64: None,
+            mls_session: None,
             members: HashMap::new(),
             mp2_members: members,
             mp2_connected: true,
@@ -6218,6 +7209,7 @@ mod tests {
             handle: "alice".to_string(),
             client: "outpost".to_string(),
             is_guest: false,
+            is_browser: false,
             agent_name: None,
             agent_state: None,
             agent_summary: None,
@@ -6229,6 +7221,7 @@ mod tests {
             handle: "bob".to_string(),
             client: "outpost".to_string(),
             is_guest: false,
+            is_browser: false,
             agent_name: None,
             agent_state: None,
             agent_summary: None,
@@ -6240,6 +7233,7 @@ mod tests {
             handle: "carol".to_string(),
             client: "blackbird".to_string(),
             is_guest: false,
+            is_browser: false,
             agent_name: None,
             agent_state: None,
             agent_summary: None,
@@ -6251,6 +7245,7 @@ mod tests {
             handle: "mallory".to_string(),
             client: "outpost".to_string(),
             is_guest: false,
+            is_browser: false,
             agent_name: None,
             agent_state: None,
             agent_summary: None,
@@ -6262,6 +7257,7 @@ mod tests {
             handle: "phall".to_string(),
             client: "web".to_string(),
             is_guest: true,
+            is_browser: true,
             agent_name: None,
             agent_state: None,
             agent_summary: None,
@@ -6372,6 +7368,7 @@ mod tests {
             handle: "phall".to_string(),
             client: "web".to_string(),
             is_guest: true,
+            is_browser: true,
             agent_name: None,
             agent_state: None,
             agent_summary: None,
@@ -6396,6 +7393,7 @@ mod tests {
                     handle: "phall".to_string(),
                     client: "web".to_string(),
                     is_guest: true,
+                    is_browser: true,
                     agent_name: None,
                     device_id: None,
                 },
@@ -6403,19 +7401,90 @@ mod tests {
                 kind: Mp2EventKind::Chat,
                 body_encoding: "utf8".to_string(),
                 body: "hello from browser guest".to_string(),
+                mls_epoch: None,
+                e2ee_mode: None,
+                group_id_b64: None,
             },
+            false,
+        );
+        // Signed-in browser message under operator's own account/handle MUST be flagged is_browser=true & sender_device_id=0!
+        ingest_mp2_event_into_session(
+            &mut sess,
+            Mp2Event {
+                seq: 2,
+                ts_ms: 1_700_000_000_100,
+                client_msg_id: None,
+                sender: outpost_control::Mp2Sender {
+                    account_id: 1001,
+                    handle: "alice".to_string(),
+                    client: "web".to_string(),
+                    is_guest: false,
+                    is_browser: false,
+                    agent_name: None,
+                    device_id: Some(9999),
+                },
+                target: "@all".to_string(),
+                kind: Mp2EventKind::Chat,
+                body_encoding: "utf8".to_string(),
+                body: "same handle browser chat".to_string(),
+                mls_epoch: None,
+                e2ee_mode: None,
+                group_id_b64: None,
+            },
+            false,
+        );
+        ingest_mp2_event_into_session(
+            &mut sess,
+            Mp2Event {
+                seq: 3,
+                ts_ms: 1_700_000_000_200,
+                client_msg_id: None,
+                sender: outpost_control::Mp2Sender {
+                    account_id: 1001,
+                    handle: "alice".to_string(),
+                    client: String::new(),
+                    is_guest: false,
+                    is_browser: true,
+                    agent_name: None,
+                    device_id: None,
+                },
+                target: "@all".to_string(),
+                kind: Mp2EventKind::Chat,
+                body_encoding: "utf8".to_string(),
+                body: "explicit is_browser flag".to_string(),
+                mls_epoch: None,
+                e2ee_mode: None,
+                group_id_b64: None,
+            },
+            false,
         );
         let polled = sess.ring.poll(None, 0, 10, 65_536);
-        assert_eq!(polled.events.len(), 1);
+        assert_eq!(polled.events.len(), 3);
         if let Some(ev) = polled.events.first() {
             assert!(matches!(
                 &ev.body,
                 PartyEventBody::Chat {
                     sender_account_id: 0,
                     sender_handle,
+                    is_browser: true,
                     ..
                 } if sender_handle == "phall (guest)"
             ));
+        }
+        for idx in [1usize, 2usize] {
+            if let Some(ev) = polled.events.get(idx) {
+                assert!(matches!(
+                    &ev.body,
+                    PartyEventBody::Chat {
+                        sender_account_id: 1001,
+                        sender_device_id: 0,
+                        sender_handle,
+                        is_browser: true,
+                        sender_client,
+                        ..
+                    } if sender_handle == "alice" && sender_client == "web"
+                ));
+            }
         }
 
         // Server-supplied ws_path validation
@@ -6430,6 +7499,30 @@ mod tests {
         assert!(validate_party_ws_path(8801, "/v1/parties/9999/ws").is_err());
         assert!(validate_party_ws_path(8801, "/v1/parties/8801/ws?evil=1").is_err());
 
+        // `#fragment` invite links MUST preserve `#<secret>` verbatim (NEVER stripped or uppercased!)
+        assert_eq!(
+            normalize_room_enter_target(
+                "https://multiplayer.tech/p/i/123456789#AbCdEf0123456789_-xYz"
+            ),
+            "https://multiplayer.tech/p/i/123456789#AbCdEf0123456789_-xYz"
+        );
+        assert_eq!(
+            normalize_room_enter_target(
+                "multiplayer.tech/p/i/123456789#AbCdEf0123456789_-xYz"
+            ),
+            "https://multiplayer.tech/p/i/123456789#AbCdEf0123456789_-xYz"
+        );
+        assert_eq!(
+            normalize_room_enter_target(
+                "https://clank.party/i/123456789#AbCdEf0123456789_-xYz"
+            ),
+            "https://clank.party/i/123456789#AbCdEf0123456789_-xYz"
+        );
+        assert_eq!(
+            normalize_room_enter_target("clank.party/i/123456789#AbCdEf0123456789_-xYz"),
+            "https://clank.party/i/123456789#AbCdEf0123456789_-xYz"
+        );
+
         // Short invite domains (`clank.party`, `multiplayer.tech`, `mp.gg`)
         assert_eq!(normalize_room_enter_target("https://clank.party/@phall"), "@phall");
         assert_eq!(normalize_room_enter_target("clank.party/kaih"), "KAIH");
@@ -6439,5 +7532,221 @@ mod tests {
         assert_eq!(normalize_room_enter_target("@phall"), "@phall");
         assert_eq!(normalize_room_enter_target("KAIH"), "KAIH");
         assert_eq!(normalize_room_enter_target(""), "");
+    }
+
+    #[test]
+    fn e2ee_session_rejects_plaintext_decrypts_opaque_and_marks_historical_catchup()
+    -> Result<(), String> {
+        use mp_mls::{
+            AccountDeviceListV1, ActiveDeviceEntryV1, ClientClass, CustodyMode, DeviceIdentity,
+            InviteRecordV1, InviteSecrets, MpCryptoProvider, MpMlsClient, MpMlsDeviceBindingBodyV1,
+            MpMlsDeviceBindingV1, MpMlsLeafCredV1, MpRoomPolicyExtV1, compute_join_proof,
+            generate_single_use_key_package,
+        };
+        use outpost_core::mls_session::MlsRoomSession;
+        use outpost_core::mls_store::derive_mls_store_key;
+
+        let now_s = 1_760_000_000u64;
+        let party_id = 8801u64;
+        let ds_pk = SigningKey::from_bytes(&[0xD5; 32]).verifying_key().to_bytes();
+
+        let make_id = |acc: u64, dev: u64, rseed: u8, dseed: u8, agent: bool| -> Result<([u8; 32], DeviceIdentity), String> {
+            let rsk = SigningKey::from_bytes(&[rseed; 32]);
+            let dsk = SigningKey::from_bytes(&[dseed; 32]);
+            let body = MpMlsDeviceBindingBodyV1 {
+                version: 1,
+                account_id: acc,
+                root_gen: 1,
+                device_id: dev,
+                device_gen: 1,
+                client_class: ClientClass::Outpost,
+                agent_capable: agent,
+                custody_mode: CustodyMode::SelfCustody,
+                iat_s: now_s - 60,
+                exp_s: now_s + 29 * 86_400,
+                root_pubkey: rsk.verifying_key().to_bytes(),
+                mls_sig_pubkey: dsk.verifying_key().to_bytes(),
+            };
+            let binding = MpMlsDeviceBindingV1::sign(body, &rsk, &dsk).map_err(|e| e.to_string())?;
+            let device_list = AccountDeviceListV1::sign(
+                acc,
+                1,
+                1,
+                now_s - 60,
+                now_s + 29 * 86_400,
+                vec![ActiveDeviceEntryV1 {
+                    device_id: dev,
+                    device_gen: 1,
+                    mls_sig_pubkey: dsk.verifying_key().to_bytes(),
+                }],
+                &rsk,
+            )
+            .map_err(|e| e.to_string())?;
+            let cred = MpMlsLeafCredV1 {
+                binding,
+                list_version: device_list.list_version,
+                list_hash: device_list.list_hash().map_err(|e| e.to_string())?,
+            };
+            Ok((
+                rsk.verifying_key().to_bytes(),
+                DeviceIdentity::new(cred, device_list, dsk).map_err(|e| e.to_string())?,
+            ))
+        };
+
+        let (alice_root_pk, alice_id) = make_id(1001, 2001, 0x11, 0x21, true)?;
+        let (_bob_root_pk, bob_id) = make_id(1002, 2002, 0x12, 0x22, false)?;
+        let policy = MpRoomPolicyExtV1 {
+            version: 1,
+            party_id,
+            e2ee_mode: 1,
+            require_self_custody: false,
+            allow_browser_devices: true,
+            org_id: 0,
+            invite_epoch: 0,
+            host_account_ids: vec![1001],
+            banned_account_ids: Vec::new(),
+        };
+        let (alice_client, _gi) =
+            MpMlsClient::create_room(party_id, [9u8; 8], &ds_pk, policy, alice_id)
+                .map_err(|e| e.to_string())?;
+        let gid = alice_client.group_id();
+        let mut alice_mls =
+            MlsRoomSession::new(alice_client, *derive_mls_store_key(&[0xA1; 32], 2001));
+
+        let secrets = InviteSecrets::derive(&gid, &[0x44; 32]).map_err(|e| e.to_string())?;
+        alice_mls.client_mut().register_active_invite(InviteRecordV1 {
+            invite_id: 101,
+            invite_epoch: 0,
+            max_uses: 2,
+            expires_at_s: now_s + 3600,
+            inviter_root_pk: alice_root_pk,
+            member_join_mac_key: secrets.member_join_mac_key,
+        });
+        let mut bob_provider = MpCryptoProvider::new();
+        let (bob_kp, bob_kp_ref) =
+            generate_single_use_key_package(&bob_id, &bob_provider).map_err(|e| e.to_string())?;
+        let jp = compute_join_proof(
+            &secrets.member_join_mac_key,
+            &gid,
+            101,
+            0,
+            now_s + 3600,
+            1002,
+            2002,
+            &bob_kp_ref,
+        )
+        .map_err(|e| e.to_string())?;
+        let add = alice_mls
+            .build_add_member_commit(&bob_kp, 101, &jp, now_s, false)
+            .map_err(|e| e.to_string())?;
+        alice_mls
+            .handle_finalized_commit(&[], &add.commit_bytes, now_s)
+            .map_err(|e| e.to_string())?;
+        let bob_client = MpMlsClient::join_from_welcome(
+            &add.welcome_bytes,
+            &add.welcome_auth,
+            &secrets.member_join_mac_key,
+            &bob_kp_ref,
+            gid,
+            party_id,
+            &ds_pk,
+            0,
+            0,
+            &alice_root_pk,
+            bob_id,
+            &mut bob_provider,
+        )
+        .map_err(|e| e.to_string())?;
+        let bob_mls = MlsRoomSession::new(bob_client, *derive_mls_store_key(&[0xB2; 32], 2002));
+
+        let mut sess = make_mp2_test_session(Vec::new());
+        sess.e2ee_mode = 1;
+        sess.mls_epoch = bob_mls.epoch();
+        sess.mls_session = Some(bob_mls);
+
+        // 1. Plaintext utf8 frame in e2ee_mode=1 MUST be rejected (never added to ring)!
+        ingest_mp2_event_into_session(
+            &mut sess,
+            Mp2Event {
+                seq: 1,
+                ts_ms: 1_760_000_000_000,
+                client_msg_id: None,
+                sender: outpost_control::Mp2Sender {
+                    account_id: 1001,
+                    handle: "alice".to_string(),
+                    client: "outpost".to_string(),
+                    is_guest: false,
+                    is_browser: false,
+                    agent_name: None,
+                    device_id: Some(2001),
+                },
+                target: "@all".to_string(),
+                kind: Mp2EventKind::Chat,
+                body_encoding: "utf8".to_string(),
+                body: "FORGED PLAINTEXT @bob:agent".to_string(),
+                mls_epoch: Some(1),
+                e2ee_mode: Some(1),
+                group_id_b64: None,
+            },
+            false,
+        );
+        assert_eq!(sess.ring.poll(None, 0, 10, 65_536).events.len(), 0);
+
+        // 2. Encrypted opaque_b64 frame during historical catch-up decrypts cleanly with is_historical_catchup=true!
+        let prep = alice_mls
+            .prepare_outbound_chat(
+                "cid-hist",
+                "@bob:agent",
+                "historical @bob:agent ping",
+                now_s,
+                |_| Ok(()),
+            )
+            .map_err(|e| e.to_string())?;
+        ingest_mp2_event_into_session(
+            &mut sess,
+            Mp2Event {
+                seq: 2,
+                ts_ms: 1_760_000_001_000,
+                client_msg_id: Some("cid-hist".to_string()),
+                sender: outpost_control::Mp2Sender {
+                    account_id: 1001,
+                    handle: "alice".to_string(),
+                    client: "outpost".to_string(),
+                    is_guest: false,
+                    is_browser: false,
+                    agent_name: None,
+                    device_id: Some(2001),
+                },
+                target: "*".to_string(),
+                kind: Mp2EventKind::E2eeApp,
+                body_encoding: "opaque_b64".to_string(),
+                body: prep.body_b64,
+                mls_epoch: Some(1),
+                e2ee_mode: Some(1),
+                group_id_b64: None,
+            },
+            true,
+        );
+
+        let poll = sess.ring.poll(None, 0, 10, 65_536);
+        let ipc_resp = super::build_ipc_poll_resp(&sess, poll, false, false);
+        assert_eq!(ipc_resp.e2ee_mode, 1);
+        assert_eq!(ipc_resp.mls_epoch, 1);
+        assert_eq!(ipc_resp.trust_tier, 2);
+        assert!(ipc_resp.has_declared_agent);
+        assert_eq!(ipc_resp.epoch_authenticator_b32.len(), 29);
+        assert!(!ipc_resp.clone_detected);
+        assert_eq!(ipc_resp.events.len(), 1);
+        assert_eq!(
+            ipc_resp.events.first().map(|e| e.is_historical_catchup),
+            Some(true)
+        );
+
+        let summary = sess.summary();
+        assert_eq!(summary.e2ee_mode, 1);
+        assert_eq!(summary.trust_tier, 2);
+        assert!(summary.has_declared_agent);
+        assert_eq!(summary.epoch_authenticator_b32, ipc_resp.epoch_authenticator_b32);
+        Ok(())
     }
 }

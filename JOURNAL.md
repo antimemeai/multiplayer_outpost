@@ -141,3 +141,15 @@ Authored `docs/OUTPOST_ARCHITECTURE_AND_SPEC.md` (v1 Draft) and ran all 5 indepe
    - **Auth UX Stage 2:** Interactive `mp-outpost login`, guided `mp-outpost add-device` (with pure-Rust ISO/IEC 18004 V1 ECC-L terminal QR code for link code only + local 128-bit `mpdevfp2:` verification), and offline `mp-outpost account emergency-kit --out <path.html>` (mode `0600`, zero JS, zero external URLs, strict HTML escaping, no-clobber unless `--force`, zero stdout key echo).
    - **Unified Policy & Party Trust Tiers:** Verified `O_NOFOLLOW` fail-closed loader for `/etc/multiplayer/policy.toml` (with legacy `lan.toml` backward compatibility and `MP_DISABLE_LAN` / `MP_BRAKES` overrides), `mp-outpost policy status [--json]`, `mp-outpost doctor [--json]` policy reporting, and `DaemonMcpBridge::effective_trust_profile` (clamping to `Advisory` on policy failure).
    - **Compiled-Binary E2E Oracle 8:** Added `oracle_8_v050_dead_drop_inbox_auth_ux_and_unified_policy` covering full TLS 1.3 dead-drop inbox E2EE roundtrip + outbound secret refusal + ack pruning, Emergency Kit HTML security invariants, `policy status` + `doctor` reporting, and 12-tool `mp-outpost mcp` `tools/list`.
+
+## 2026-11-27 — `v0.7.0` MLS (RFC 9420) E2EE, `is_browser` Containment & Onboarding Hardening
+
+1. **Wave 2 Onboarding & Browser-Origin Containment (`IPC_SCHEMA_VER = 5`):**
+   - Fixed `?code=` query-string link URL generation and enforced `#fragment` invite redaction across CLI/logs so invite secrets never leak via query parameters or diagnostics.
+   - Bumped `IPC_SCHEMA_VER = 5` to propagate `is_browser` origin tagging across daemon IPC and MCP provenance fences for untrusted browser-origin containment.
+   - Added explicit unauthenticated / HTTP `401` operator recovery guidance and `mp-outpost doctor --trace` diagnostics.
+
+2. **MLS (RFC 9420) End-to-End Encryption (`openmls = "=0.9.2"`, vendored `crates/mp-mls`):**
+   - Vendored `crates/mp-mls` into the workspace for 100% self-contained GitHub Actions builds and `--locked` verification.
+   - Implemented backup-excluded AES-256-GCM MLS state persistence (`crates/outpost-core/src/mls_store.rs`) and MLS group session lifecycle (`crates/outpost-core/src/mls_session.rs`) with exact `512 / 2048 / 8192 / 24000 B` wire padding buckets.
+   - Added epoch-stale outbound requeue on commit races, historical-catchup `@mention` suppression, Tier 0–3 trust/verification state + `epoch_authenticator` MCP surface, and unit/control oracles (`mls_e2ee_oracles.rs`, `mls_control_oracles.rs`).

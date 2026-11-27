@@ -1622,8 +1622,120 @@ fn cleanup_dead_socket(dir: &VerifiedDir) {
     }
 }
 
+/// macOS Time Machine backup exclusion extended attribute name.
+pub const MACOS_BACKUP_EXCLUDE_XATTR: &str = "com.apple.metadata:com_apple_backup_excludeItem";
+
+/// Exact Apple binary plist (`bplist00`) encoding the string `"com.apple.backupd"`.
+pub const MACOS_BACKUP_EXCLUDE_BPLIST: &[u8; 61] = &[
+    0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x30, 0x30, 0x5f, 0x10, 0x11, 0x63, 0x6f, 0x6d, 0x2e,
+    0x61, 0x70, 0x70, 0x6c, 0x65, 0x2e, 0x62, 0x61, 0x63, 0x6b, 0x75, 0x70, 0x64, 0x08, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x1c,
+];
+
+/// Standard Cache Directory Tagging Specification (`CACHEDIR.TAG`) marker for Linux backups.
+pub const CACHEDIR_TAG_CONTENT: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by mp-outpost.\n# For information about cache directory tags, see https://bford.info/cachedir/\n";
+
+/// Marks a private MLS state directory as excluded from OS backups so live ratchet state
+/// is never cloned onto backup media (Spec v3 §7.2):
+/// - macOS: `fsetxattr` `com.apple.metadata:com_apple_backup_excludeItem` with `bplist00` `"com.apple.backupd"`.
+/// - Linux/other Unix: atomic `0o600` `.nobackup` and `CACHEDIR.TAG` marker files inside `dir`.
+pub fn exclude_dir_from_backup(dir: &VerifiedDir) -> Result<(), DaemonError> {
+    #[cfg(target_os = "macos")]
+    {
+        let attr_name = CString::new(MACOS_BACKUP_EXCLUDE_XATTR).map_err(|_| {
+            DaemonError::Protocol("invalid backup exclude xattr name".to_string())
+        })?;
+        let rc = unsafe {
+            libc::fsetxattr(
+                dir.as_raw_fd(),
+                attr_name.as_ptr(),
+                MACOS_BACKUP_EXCLUDE_BPLIST.as_ptr().cast(),
+                MACOS_BACKUP_EXCLUDE_BPLIST.len(),
+                0,
+                0,
+            )
+        };
+        if rc != 0 {
+            return Err(DaemonError::io(
+                "fsetxattr(com_apple_backup_excludeItem)",
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::state_io::atomic_write_in_dir(dir.as_raw_fd(), ".nobackup", b"")?;
+        crate::state_io::atomic_write_in_dir(
+            dir.as_raw_fd(),
+            "CACHEDIR.TAG",
+            CACHEDIR_TAG_CONTENT,
+        )?;
+        Ok(())
+    }
+}
+
 /// Helper to expose the raw OsStr check when building paths.
 #[allow(dead_code)]
 pub(crate) fn os_str_len(s: &OsStr) -> usize {
     s.as_bytes().len()
+}
+
+#[cfg(test)]
+mod backup_exclude_tests {
+    use super::*;
+    use crate::runtime_dir::open_or_create_private_dir;
+
+    #[test]
+    fn exclude_dir_from_backup_applies_platform_exclusion_markers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let mls_dir_path = tmp.path().join("mls_state");
+        let verified = open_or_create_private_dir(&mls_dir_path)?;
+        exclude_dir_from_backup(&verified)?;
+
+        #[cfg(target_os = "macos")]
+        {
+            let attr_name = CString::new(MACOS_BACKUP_EXCLUDE_XATTR)?;
+            let mut buf = [0u8; 128];
+            let got = unsafe {
+                libc::fgetxattr(
+                    verified.as_raw_fd(),
+                    attr_name.as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    0,
+                    0,
+                )
+            };
+            assert!(
+                got > 0,
+                "fgetxattr failed: {:?}",
+                io::Error::last_os_error()
+            );
+            assert_eq!(got as usize, MACOS_BACKUP_EXCLUDE_BPLIST.len());
+            assert_eq!(buf.get(..got as usize), Some(MACOS_BACKUP_EXCLUDE_BPLIST.as_slice()));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let nobackup = mls_dir_path.join(".nobackup");
+            let cachedir = mls_dir_path.join("CACHEDIR.TAG");
+            assert_eq!(
+                std::fs::symlink_metadata(&nobackup)?.permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::symlink_metadata(&cachedir)?.permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(std::fs::read(&cachedir)?, CACHEDIR_TAG_CONTENT);
+        }
+
+        Ok(())
+    }
 }

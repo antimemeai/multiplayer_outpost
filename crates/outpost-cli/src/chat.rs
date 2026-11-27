@@ -2794,10 +2794,17 @@ impl ChatApp {
                             sanitize_terminal_inline(&resp.name)
                         };
                         let code = sanitize_terminal_inline(&resp.room_code);
-                        self.push_system(&format!(
-                            "Joined {name} (code {code}) · {} live",
-                            resp.members.len()
-                        ));
+                        if code.is_empty() {
+                            self.push_system(&format!(
+                                "Joined {name} · {} live (mp2 rooms are server-persisted over TLS 1.3, not E2EE)",
+                                resp.members.len()
+                            ));
+                        } else {
+                            self.push_system(&format!(
+                                "Joined {name} (code {code}) · {} live (mp2 rooms are server-persisted over TLS 1.3, not E2EE)",
+                                resp.members.len()
+                            ));
+                        }
                         if let Ok(list) = rpc_party_list(&mut self.cmd_client).await
                             && let Some(p) = list
                                 .parties
@@ -2823,6 +2830,12 @@ impl ChatApp {
                                 room_code: resp.room_code,
                                 room_name: resp.name,
                                 share_url: resp.share_url,
+                                e2ee_mode: 0,
+                                mls_epoch: 0,
+                                trust_tier: 0,
+                                has_declared_agent: false,
+                                epoch_authenticator_b32: String::new(),
+                                clone_detected: false,
                             };
                             self.attach_to_party(summary, false).await;
                         }
@@ -3481,6 +3494,7 @@ mod tests {
             event_seq: seq,
             party_id: 8801,
             party_epoch: 1,
+            is_historical_catchup: false,
             kind: IpcPartyEventKind::Chat {
                 provenance: IpcProvenance {
                     sender_account_id: 1002,
@@ -3488,6 +3502,8 @@ mod tests {
                     sender_handle: "bob".to_string(),
                     root_pubkey_fingerprint: String::new(),
                     safety_number: String::new(),
+                    is_browser: false,
+                    sender_client: String::new(),
                 },
                 room_scope: "party/main".to_string(),
                 target_selector: "@all".to_string(),
@@ -3505,6 +3521,12 @@ mod tests {
             cursor_reset: false,
             gap_possible: false,
             timed_out: false,
+            e2ee_mode: 0,
+            mls_epoch: 0,
+            trust_tier: 0,
+            has_declared_agent: false,
+            epoch_authenticator_b32: String::new(),
+            clone_detected: false,
             events: vec![make_ev(1, "one"), make_ev(2, "two")],
         };
         let fresh1 = dedup.filter_and_advance(batch1);
@@ -3520,6 +3542,12 @@ mod tests {
             cursor_reset: false,
             gap_possible: false,
             timed_out: false,
+            e2ee_mode: 0,
+            mls_epoch: 0,
+            trust_tier: 0,
+            has_declared_agent: false,
+            epoch_authenticator_b32: String::new(),
+            clone_detected: false,
             events: vec![make_ev(2, "two"), make_ev(3, "three")],
         };
         let fresh2 = dedup.filter_and_advance(batch2);
@@ -3536,6 +3564,12 @@ mod tests {
             cursor_reset: true,
             gap_possible: true,
             timed_out: false,
+            e2ee_mode: 0,
+            mls_epoch: 0,
+            trust_tier: 0,
+            has_declared_agent: false,
+            epoch_authenticator_b32: String::new(),
+            clone_detected: false,
             events: vec![make_ev(1, "after restart")],
         };
         let fresh3 = dedup.filter_and_advance(batch3);

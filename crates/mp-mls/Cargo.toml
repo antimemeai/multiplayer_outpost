@@ -1,0 +1,38 @@
+[package]
+name = "mp-mls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+wasm = [
+    "openmls/js",
+    "dep:getrandom_02",
+    "getrandom_02/js",
+    "dep:getrandom_03",
+    "getrandom_03/wasm_js",
+    "dep:getrandom",
+    "getrandom/wasm_js",
+]
+
+[dependencies]
+base64.workspace = true
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"] }
+hkdf = "0.12"
+hmac = "0.12"
+openmls = { version = "=0.9.2" }
+openmls_basic_credential = { version = "=0.6.0", features = ["clonable"] }
+openmls_memory_storage = "=0.6.0"
+openmls_rust_crypto = "=0.6.0"
+openmls_traits = "=0.6.0"
+sha2.workspace = true
+thiserror = "2.0"
+tls_codec = { version = "0.5", features = ["std"] }
+zeroize = { version = "1.9", features = ["derive"] }
+
+# Direct getrandom feature forwarding for wasm32-unknown-unknown across transitive versions.
+getrandom = { version = "0.4", optional = true }
+getrandom_02 = { package = "getrandom", version = "0.2", optional = true }
+getrandom_03 = { package = "getrandom", version = "0.3", optional = true }
+

@@ -229,6 +229,9 @@ pub(crate) fn contains_private_pem_header_local(haystack: &[u8]) -> bool {
 }
 
 pub(crate) fn redact_unknown_arg(arg: &str) -> String {
+    if let Some((before_frag, _frag)) = arg.split_once('#') {
+        return format!("{}#[REDACTED]", sanitize_cli_url(before_frag));
+    }
     if let Some((flag, _val)) = arg.split_once('=') {
         let fl = flag.to_ascii_lowercase();
         if fl == "--passphrase"
@@ -461,7 +464,7 @@ Advanced Commands:\n\
   account register|rename|recovery-key|export-mpkey|emergency-kit|recover\n\
   device init|install-cwt|enroll|renew|revoke|link <create|join|approve>\n\
   web approve <XXXX-XXXX>\n\
-  doctor | relays | upgrade"
+  doctor [--trace] | relays | upgrade"
     );
 }
 
@@ -935,6 +938,184 @@ fn sanitize_cli_meta(input: &str) -> String {
     out
 }
 
+/// Sanitizes a URL for terminal printing: strips complete ANSI CSI/OSC escape sequences,
+/// C0/C1/DEL control chars, BiDi overrides/isolates, zero-width/Tag characters, and
+/// newlines/angle/square brackets, while preserving RFC 3986 URL punctuation
+/// (`=`, `?`, `&`, `#`, `/`, `:`, `.`, `-`, `_`, `%`, `@`, etc.) so login and invite URLs
+/// such as `https://multiplayer.tech/login?code=ABCD-EFGH` render verbatim.
+pub(crate) fn sanitize_cli_url(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut stripped = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes.get(i) == Some(&0x1B) {
+            if bytes.get(i + 1) == Some(&b'[') {
+                // ANSI CSI sequence: ESC [ <params/intermediates> <final 0x40..=0x7E>
+                i += 2;
+                while let Some(&b) = bytes.get(i) {
+                    i += 1;
+                    if (0x40..=0x7E).contains(&b) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if bytes.get(i + 1) == Some(&b']') {
+                // ANSI OSC sequence: ESC ] ... (BEL 0x07 | ST ESC \)
+                i += 2;
+                while let Some(&b) = bytes.get(i) {
+                    if b == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if b == 0x1B && bytes.get(i + 1) == Some(&b'\\') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(ch) = input.get(i..).and_then(|s| s.chars().next()) {
+            stripped.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let cleaned = sanitize_peer_text(&stripped);
+    let mut out = String::with_capacity(cleaned.len());
+    for ch in cleaned.chars() {
+        match ch {
+            '\n' | '\r' | '\t' | '<' | '>' | '[' | ']' => {}
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Redacts home-directory paths (`$HOME/...` -> `~/...`) for safe support trace output.
+fn redact_home_path(path: &str) -> String {
+    if let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok())
+        && !home.is_empty()
+    {
+        let trimmed = home.trim_end_matches('/');
+        if path == trimmed {
+            return "~".to_string();
+        }
+        if let Some(rest) = path.strip_prefix(trimmed)
+            && rest.starts_with('/')
+        {
+            return format!("~{rest}");
+        }
+    }
+    path.to_string()
+}
+
+/// Sweeps arbitrary diagnostic/trace text to redact any accidental secrets, bearer tokens,
+/// cookies, PEM blocks, invite `#fragment` secrets, or sensitive query parameters.
+pub(crate) fn redact_trace_secrets(input: &str) -> String {
+    let mut text = sanitize_peer_text(input);
+    // 1. Redact PEM private/recovery/secret blocks
+    if contains_private_pem_header_local(text.as_bytes()) {
+        return "[REDACTED_PEM_MATERIAL]".to_string();
+    }
+    // 2. Redact known Multiplayer secret/token prefixes and session cookies
+    const PREFIXES: [&str; 13] = [
+        "mprk1_",
+        "mpinv1_",
+        "mppi1_",
+        "mpdl1_",
+        "mpcs1_",
+        "mpws1_",
+        "mpguest1_",
+        "__Host-mp_session=",
+        "__Host-mp_pending_invite=",
+        "__Host-mp_oauth_flow=",
+        "Bearer ",
+        "Cookie: ",
+        "Set-Cookie: ",
+    ];
+    for prefix in PREFIXES {
+        text = redact_after_prefix_ci(&text, prefix);
+    }
+    // 3. Redact sensitive query/kv parameters (?code=, ticket=, token=, secret=)
+    for param in ["ticket=", "token=", "secret=", "code="] {
+        text = redact_after_prefix_ci(&text, param);
+    }
+    // 4. Redact URL `#fragment` secrets (e.g. multiplayer.tech/p/i/<id>#<secret>)
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes.get(i) == Some(&b'#')
+            && i > 0
+            && bytes
+                .get(i - 1)
+                .is_some_and(|&prev| prev.is_ascii_alphanumeric() || prev == b'/' || prev == b'-')
+        {
+            out.push_str("#[REDACTED]");
+            i += 1;
+            while let Some(&b) = bytes.get(i) {
+                if b.is_ascii_whitespace()
+                    || matches!(b, b'"' | b'\'' | b')' | b',' | b'>' | b']')
+                {
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(ch) = text.get(i..).and_then(|s| s.chars().next()) {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn redact_after_prefix_ci(input: &str, prefix: &str) -> String {
+    let plen = prefix.len();
+    if plen == 0 || input.len() < plen {
+        return input.to_string();
+    }
+    let bytes = input.as_bytes();
+    let pbytes = prefix.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes
+            .get(i..i + plen)
+            .is_some_and(|w| w.eq_ignore_ascii_case(pbytes))
+        {
+            if let Some(matched) = input.get(i..i + plen) {
+                out.push_str(matched);
+            }
+            out.push_str("[REDACTED]");
+            i += plen;
+            while let Some(&b) = bytes.get(i) {
+                if b.is_ascii_whitespace()
+                    || matches!(b, b'"' | b'\'' | b';' | b'&' | b')' | b',' | b'>' | b']' | b'}')
+                {
+                    break;
+                }
+                i += 1;
+            }
+        } else if let Some(ch) = input.get(i..).and_then(|s| s.chars().next()) {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
 fn read_all_stdin_trimmed(max_bytes: usize) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     let mut handle = io::stdin().take((max_bytes as u64).saturating_add(1));
@@ -1185,7 +1366,7 @@ async fn cmd_login(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("failed to start login session: {e}"))?;
 
     let safe_code = sanitize_cli_meta(&start.user_code);
-    let safe_url = sanitize_cli_meta(&start.verify_url);
+    let safe_url = sanitize_cli_url(&start.verify_url);
     if !opts.json {
         let opened = if no_open {
             false
@@ -1194,6 +1375,7 @@ async fn cmd_login(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
         };
         if opened {
             println!("Opening browser to sign in...");
+            println!("If the browser did not open, visit: {safe_url}");
         } else {
             println!("Open this URL to sign in: {safe_url}");
         }
@@ -1292,6 +1474,9 @@ async fn cmd_login(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
                     }));
                 } else {
                     println!("Signed in as @{clean_handle}");
+                    println!(
+                        "Note: mp2 party rooms are server-persisted over TLS 1.3 (not E2EE)."
+                    );
                 }
                 return Ok(());
             }
@@ -1446,19 +1631,28 @@ async fn cmd_invite(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
         }));
     } else {
         let code = sanitize_cli_meta(&resp.room_code);
-        let share = sanitize_cli_meta(&resp.share_url);
+        let share = sanitize_cli_url(&resp.share_url);
         if let Some(ref inv) = resp.invited_handle
             && !inv.is_empty()
         {
-            println!(
-                "Invited @{} — code {code} ({share})",
-                sanitize_cli_meta(inv.trim_start_matches('@'))
-            );
+            if code.is_empty() {
+                println!(
+                    "Invited @{} ({share})",
+                    sanitize_cli_meta(inv.trim_start_matches('@'))
+                );
+            } else {
+                println!(
+                    "Invited @{} — code {code} ({share})",
+                    sanitize_cli_meta(inv.trim_start_matches('@'))
+                );
+            }
+        } else if code.is_empty() {
+            println!("Party ready ({share})");
         } else {
             println!("Party ready — code {code} ({share})");
         }
         if !resp.handle_url.is_empty() {
-            println!("Link: {}", sanitize_cli_meta(&resp.handle_url));
+            println!("Link: {}", sanitize_cli_url(&resp.handle_url));
         }
         if opts.debug {
             println!("debug: party_id={} ws_path={}", resp.party_id, resp.ws_path);
@@ -1545,7 +1739,12 @@ async fn cmd_join(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
             sanitize_cli_meta(&resp.name)
         };
         let code = sanitize_cli_meta(&resp.room_code);
-        println!("Joined {name} (code {code}) · {} live", resp.members.len());
+        if code.is_empty() {
+            println!("Joined {name} · {} live", resp.members.len());
+        } else {
+            println!("Joined {name} (code {code}) · {} live", resp.members.len());
+        }
+        println!("Note: mp2 party rooms are server-persisted over TLS 1.3 (not E2EE).");
         for m in &resp.members {
             let display = format_member_display(m.account_id, &m.handle);
             let badge = if m.status == "live" || m.status.is_empty() {
@@ -6320,6 +6519,7 @@ async fn cmd_relays(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
 async fn cmd_doctor(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
     let mut api_authority_override: Option<String> = None;
     let mut relay_url_override: Option<String> = None;
+    let mut trace_mode = false;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -6331,6 +6531,10 @@ async fn cmd_doctor(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
             }
             "--relay-url" => {
                 relay_url_override = Some(next_val(args, &mut i, "--relay-url")?.to_string())
+            }
+            "--trace" => {
+                trace_mode = true;
+                i += 1;
             }
             other => {
                 return Err(format!(
@@ -6583,6 +6787,211 @@ async fn cmd_doctor(opts: &GlobalOpts, args: &[String]) -> Result<(), String> {
         }),
     };
 
+    if trace_mode {
+        let mcp_wiring = crate::mcp_setup::inspect_mcp_wiring_redacted();
+        let enrolled = device_opt.is_some();
+        let cwt_valid = device_json
+            .get("cwt_valid")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let authenticated = enrolled && cwt_valid;
+        let cwt_status = device_json
+            .get("cwt_status")
+            .and_then(Value::as_str)
+            .unwrap_or(if enrolled { "unknown" } else { "not_enrolled" });
+        let cwt_remaining_days = device_json
+            .get("cwt_remaining_days")
+            .and_then(Value::as_u64);
+        let daemon_status = daemon_json
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let daemon_running = daemon_json
+            .get("running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let daemon_error = daemon_json
+            .get("error")
+            .and_then(Value::as_str)
+            .map(redact_trace_secrets);
+        let daemon_ws = daemon_json
+            .get("control_ws_connected")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let in_active_party = daemon_json
+            .get("active_party_id")
+            .and_then(Value::as_u64)
+            .is_some();
+        let control_ok = control_json
+            .get("ok")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let control_error = control_json
+            .get("error")
+            .and_then(Value::as_str)
+            .map(redact_trace_secrets);
+        let relay_ok = relay_json
+            .get("ok")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let relay_error = relay_json
+            .get("error")
+            .and_then(Value::as_str)
+            .map(redact_trace_secrets);
+        let safe_exe = redact_trace_secrets(&redact_home_path(&exe_path));
+        let safe_authority = redact_trace_secrets(&sanitize_cli_meta(&effective_authority));
+
+        let trace_bundle = json!({
+            "trace_version": 1,
+            "redacted": true,
+            "binary": {
+                "version": PKG_VERSION,
+                "ipc_schema_ver": IPC_SCHEMA_VER,
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "exe_path": safe_exe,
+                "on_disk_exe_matches_local": exe_matches,
+                "build_order": build_order(),
+            },
+            "auth": {
+                "authenticated": authenticated,
+                "enrolled": enrolled,
+                "cwt_status": cwt_status,
+                "cwt_remaining_days": cwt_remaining_days,
+                "api_authority": safe_authority,
+                "next_command": if authenticated { Value::Null } else { Value::String("mp-outpost login".to_string()) },
+            },
+            "daemon": {
+                "running": daemon_running,
+                "status": daemon_status,
+                "control_ws_connected": daemon_ws,
+                "in_active_party": in_active_party,
+                "error": daemon_error,
+            },
+            "control_plane": {
+                "ok": control_ok,
+                "authority": safe_authority,
+                "rtt_ms": control_json.get("rtt_ms").and_then(Value::as_u64),
+                "clock_skew_ms": control_json.get("clock_skew_ms").and_then(Value::as_i64),
+                "error": control_error,
+            },
+            "relay": {
+                "ok": relay_ok,
+                "rtt_ms": relay_json.get("rtt_ms").and_then(Value::as_u64),
+                "error": relay_error,
+            },
+            "mcp_wiring": mcp_wiring,
+            "policy": policy_json,
+        });
+
+        if opts.json {
+            let serialized = serde_json::to_string_pretty(&trace_bundle)
+                .unwrap_or_else(|_| "{}".to_string());
+            println!("{}", redact_trace_secrets(&serialized));
+        } else {
+            let mut lines = Vec::new();
+            lines.push("=== mp-outpost support trace (redacted, zero secrets) ===".to_string());
+            lines.push(format!(
+                "version: {} (ipc_schema={} os={} arch={} exe_match={})",
+                PKG_VERSION,
+                IPC_SCHEMA_VER,
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                exe_matches
+            ));
+            lines.push(format!("binary: {safe_exe}"));
+            if authenticated {
+                lines.push(format!(
+                    "auth: authenticated=true enrolled=true cwt_status={cwt_status} authority={safe_authority}"
+                ));
+            } else {
+                lines.push(format!(
+                    "auth: authenticated=false enrolled={enrolled} cwt_status={cwt_status} authority={safe_authority} next=`mp-outpost login`"
+                ));
+            }
+            if let Some(ref derr) = daemon_error {
+                lines.push(format!(
+                    "daemon: status={daemon_status} running={daemon_running} error={derr}"
+                ));
+            } else {
+                lines.push(format!(
+                    "daemon: status={daemon_status} running={daemon_running} ws_connected={daemon_ws} in_active_party={in_active_party}"
+                ));
+            }
+            if control_ok {
+                lines.push(format!(
+                    "control_plane: ok ({safe_authority}, rtt={}ms, clock_skew={}ms)",
+                    control_json
+                        .get("rtt_ms")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    control_json
+                        .get("clock_skew_ms")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0)
+                ));
+            } else {
+                lines.push(format!(
+                    "control_plane: error ({safe_authority}: {})",
+                    control_error.as_deref().unwrap_or("unreachable")
+                ));
+            }
+            if relay_ok {
+                lines.push(format!(
+                    "relay: ok (rtt={}ms)",
+                    relay_json
+                        .get("rtt_ms")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                ));
+            } else {
+                lines.push(format!(
+                    "relay: error ({})",
+                    relay_error.as_deref().unwrap_or("unreachable")
+                ));
+            }
+            lines.push("mcp_wiring:".to_string());
+            for entry in &mcp_wiring {
+                let c = entry
+                    .get("client")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let present = entry
+                    .get("config_present")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let local = entry
+                    .get("local_outpost_configured")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let remote = entry
+                    .get("remote_readonly_mcp_configured")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if present || local || remote {
+                    lines.push(format!(
+                        "  {c}: config_present={present} local_outpost={local} remote_readonly_mcp={remote}"
+                    ));
+                }
+            }
+            match &policy_res {
+                Ok(loaded) => lines.push(format!(
+                    "policy: ok (brakes={}, party_trust={}, lan_disabled={})",
+                    loaded.effective.brakes.active_profile.as_str(),
+                    loaded.effective.party_trust.max_default_profile.as_str(),
+                    loaded.effective.lan.config.disabled
+                )),
+                Err(err) => lines.push(format!(
+                    "policy: error ({})",
+                    redact_trace_secrets(&sanitize_cli_meta(err))
+                )),
+            }
+            lines.push("=== end trace ===".to_string());
+            println!("{}", redact_trace_secrets(&lines.join("\n")));
+        }
+        return Ok(());
+    }
+
     if opts.json {
         print_json(&json!({
             "binary": {
@@ -6810,34 +7219,66 @@ fn print_poll_resp(
                     target_selector,
                     timestamp_ns,
                     body,
-                } => json!({
-                    "event_seq": ev.event_seq,
-                    "kind": "chat_message",
-                    "untrusted_remote": true,
-                    "sender_account_id": provenance.sender_account_id,
-                    "sender_device_id": provenance.sender_device_id,
-                    "sender_handle": sanitize_peer_text(&provenance.sender_handle),
-                    "safety_number": provenance.safety_number,
-                    "room_scope": sanitize_peer_text(room_scope),
-                    "target_selector": sanitize_peer_text(target_selector),
-                    "timestamp_ns": timestamp_ns,
-                    "body": sanitize_peer_text(body),
-                }),
+                } => {
+                    let is_browser = provenance.is_browser
+                        || provenance.sender_client.trim().eq_ignore_ascii_case("web")
+                        || provenance
+                            .sender_client
+                            .trim()
+                            .eq_ignore_ascii_case("browser");
+                    let mut obj = json!({
+                        "event_seq": ev.event_seq,
+                        "kind": "chat_message",
+                        "untrusted_remote": true,
+                        "is_browser": is_browser,
+                        "local_operator_authority": false,
+                        "sender_account_id": provenance.sender_account_id,
+                        "sender_device_id": provenance.sender_device_id,
+                        "sender_handle": sanitize_peer_text(&provenance.sender_handle),
+                        "sender_client": sanitize_peer_text(&provenance.sender_client),
+                        "safety_number": provenance.safety_number,
+                        "room_scope": sanitize_peer_text(room_scope),
+                        "target_selector": sanitize_peer_text(target_selector),
+                        "timestamp_ns": timestamp_ns,
+                        "body": sanitize_peer_text(body),
+                    });
+                    if is_browser && let Some(m) = obj.as_object_mut() {
+                        m.insert(
+                            "origin_warning".to_string(),
+                            Value::String(
+                                "Browser-originated message: untrusted remote input even if sender_handle matches local operator."
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                    obj
+                }
                 IpcPartyEventKind::BridgeEnvelope {
                     provenance,
                     room_scope,
                     payload,
-                } => json!({
-                    "event_seq": ev.event_seq,
-                    "kind": "bridge_envelope",
-                    "untrusted_remote": true,
-                    "sender_account_id": provenance.sender_account_id,
-                    "sender_device_id": provenance.sender_device_id,
-                    "sender_handle": sanitize_peer_text(&provenance.sender_handle),
-                    "safety_number": provenance.safety_number,
-                    "room_scope": sanitize_peer_text(room_scope),
-                    "payload_b64": B64.encode(payload),
-                }),
+                } => {
+                    let is_browser = provenance.is_browser
+                        || provenance.sender_client.trim().eq_ignore_ascii_case("web")
+                        || provenance
+                            .sender_client
+                            .trim()
+                            .eq_ignore_ascii_case("browser");
+                    json!({
+                        "event_seq": ev.event_seq,
+                        "kind": "bridge_envelope",
+                        "untrusted_remote": true,
+                        "is_browser": is_browser,
+                        "local_operator_authority": false,
+                        "sender_account_id": provenance.sender_account_id,
+                        "sender_device_id": provenance.sender_device_id,
+                        "sender_handle": sanitize_peer_text(&provenance.sender_handle),
+                        "sender_client": sanitize_peer_text(&provenance.sender_client),
+                        "safety_number": provenance.safety_number,
+                        "room_scope": sanitize_peer_text(room_scope),
+                        "payload_b64": B64.encode(payload),
+                    })
+                }
                 IpcPartyEventKind::ControlNotice {
                     provenance,
                     notice_kind,
@@ -6888,22 +7329,31 @@ fn print_poll_resp(
                     let payload = format!(
                         "scope: {room_scope}\ntarget: {target_selector}\n{body}"
                     );
+                    let browser_badge = if provenance.is_browser
+                        || provenance.sender_client.trim().eq_ignore_ascii_case("web")
+                    {
+                        " (web, untrusted)"
+                    } else {
+                        ""
+                    };
                     if opts.debug {
                         println!(
-                            "[seq={} from={}({})]\n{}",
+                            "[seq={} from={}({}){}]\n{}",
                             ev.event_seq,
                             sanitize_cli_meta(&provenance.sender_handle),
                             provenance.sender_account_id,
+                            browser_badge,
                             fence_peer_text(&payload, nonce)
                         );
                     } else {
                         println!(
-                            "[#{} {}]\n{}",
+                            "[#{} {}{}]\n{}",
                             ev.event_seq,
                             format_member_display(
                                 provenance.sender_account_id,
                                 &provenance.sender_handle,
                             ),
+                            browser_badge,
                             fence_peer_text(&payload, nonce)
                         );
                     }
@@ -7144,5 +7594,62 @@ mod tests {
         assert_eq!(format_member_display(0, ""), "guest");
         assert_eq!(format_member_display(1001, "phall"), "@phall");
         assert_eq!(format_member_display(1001, "@phall"), "@phall");
+    }
+
+    #[test]
+    fn sanitize_cli_url_preserves_login_and_fragment_urls_and_strips_controls() {
+        // Regression test: login URL `?code=ABCD-EFGH` MUST NOT be mangled to `?code ABCD-EFGH`!
+        let login_url = "https://multiplayer.tech/login?code=ABCD-EFGH";
+        assert_eq!(sanitize_cli_url(login_url), login_url);
+
+        // Preserve query parameters and `#fragment` invite URLs verbatim
+        let frag_url =
+            "https://multiplayer.tech/p/i/4503599627370495#aB12_-SecretTokenXYZ&x=1";
+        assert_eq!(sanitize_cli_url(frag_url), frag_url);
+
+        // Strip ANSI CSI, OSC, C0/C1, BiDi override, zero-width, and angle/square brackets
+        let hostile = "\x1b[31mhttps://multiplayer.tech/login?code=ABCD-EFGH\x1b]8;;https://evil.example\x07\u{202E}\u{200B}\u{0085}\r\n<>[]";
+        assert_eq!(
+            sanitize_cli_url(hostile),
+            "https://multiplayer.tech/login?code=ABCD-EFGH"
+        );
+    }
+
+    #[test]
+    fn redact_unknown_arg_and_trace_secrets_never_leak_tokens_or_fragments() {
+        let bad_frag =
+            redact_unknown_arg("https://multiplayer.tech/p/i/12345#SuperSecretFrag999");
+        assert!(bad_frag.contains("#[REDACTED]"));
+        assert!(!bad_frag.contains("SuperSecretFrag999"));
+
+        let dirty = concat!(
+            "err url=https://multiplayer.tech/p/i/8801#FragSecretXYZ ",
+            "login=https://multiplayer.tech/login?code=ABCD-EFGH ",
+            "auth=Bearer secret_bearer_123 ",
+            "Cookie: __Host-mp_session=cookie_val_999; ",
+            "tok=mpcs1_session999 mpinv1_inv999 mppi1_pi999 mpdl1_dl999 mpws1_ws999 mprk1_rk999"
+        );
+        let clean = redact_trace_secrets(dirty);
+        for leaked in [
+            "FragSecretXYZ",
+            "ABCD-EFGH",
+            "secret_bearer_123",
+            "cookie_val_999",
+            "session999",
+            "inv999",
+            "pi999",
+            "dl999",
+            "ws999",
+            "rk999",
+        ] {
+            assert!(
+                !clean.contains(leaked),
+                "redact_trace_secrets leaked '{leaked}' in: {clean}"
+            );
+        }
+        assert_eq!(
+            redact_trace_secrets("-----BEGIN PRIVATE KEY-----\nabc"),
+            "[REDACTED_PEM_MATERIAL]"
+        );
     }
 }

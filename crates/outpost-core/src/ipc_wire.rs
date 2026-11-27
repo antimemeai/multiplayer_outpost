@@ -5,7 +5,7 @@ use core::fmt;
 
 use mp_protocol::MAX_SAFE_ID;
 
-pub const IPC_SCHEMA_VER: u32 = 4;
+pub const IPC_SCHEMA_VER: u32 = 5;
 pub const IPC_WIRE_VER: u16 = 1;
 pub const IPC_HEADER_BYTES: usize = 16;
 pub const MAX_IPC_BODY_BYTES: usize = 2 * 1024 * 1024;
