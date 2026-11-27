@@ -101,7 +101,7 @@ mp-outpost lan host --name "hack-night" --require-pin   # PIN read from hidden /
 mp-outpost lan join <lobby_id|ip:port> --host-pk <b64url>
 ```
 
-Security controls: `MP_DISABLE_LAN=1` / `BLACKBIRD_DISABLE_LAN=1`, unified `/etc/multiplayer/policy.toml` (`[lan] disabled = true`), or legacy `/etc/multiplayer/lan.toml` (`disabled = true`) fail closed before opening any socket; `--pin` / `-pin` is forbidden globally on CLI argv; first-time peers require interactive Safety Number verification (or explicit `--yes-safety-number <SN>`).
+Security controls: `MP_DISABLE_LAN=1` / `BLACKBIRD_DISABLE_LAN=1`, unified `/etc/multiplayer/policy.toml` (`[lan] disabled = true`), or legacy `/etc/multiplayer/lan.toml` (`disabled = true`) fail closed before opening any socket; `--pin` / `-pin` is forbidden globally on CLI argv; first-time peers require interactive Safety Number verification (or explicit `--yes-safety-number <SN>`). See [LAN_Party.md](LAN_Party.md) for the full `mp1-lan/1` specification and wire contract.
 
 ## Unified Policy (`mp-outpost policy status`)
 
