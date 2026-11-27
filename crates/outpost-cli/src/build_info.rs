@@ -17,7 +17,8 @@ static BUILD_STAMP_EMBED: &[u8] = concat!(
 )
 .as_bytes();
 
-const MAX_ON_DISK_EXE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_ON_DISK_EXE_BYTES: u64 = 1024 * 1024 * 1024;
+const EXE_STAMP_SCAN_CHUNK_BYTES: usize = 1024 * 1024;
 
 pub fn build_order() -> u64 {
     BUILD_ORDER_STR.parse::<u64>().unwrap_or(1)
@@ -94,11 +95,40 @@ pub fn on_disk_exe_matches_local() -> bool {
     if !meta.is_file() || meta.len() > MAX_ON_DISK_EXE_BYTES {
         return false;
     }
-    let Ok(bytes) = std::fs::read(&path) else {
+    let expected = expected_build_stamp();
+    if expected.is_empty() {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(&path) else {
         return false;
     };
-    let expected = expected_build_stamp();
-    binary_matches_stamp(&bytes, &expected)
+    use std::io::Read;
+    let overlap = expected.len().saturating_sub(1);
+    let mut buf = vec![0u8; EXE_STAMP_SCAN_CHUNK_BYTES.max(expected.len() * 2)];
+    let mut carry = 0usize;
+    loop {
+        let Some(dst) = buf.get_mut(carry..) else {
+            return false;
+        };
+        let Ok(n) = file.read(dst) else {
+            return false;
+        };
+        if n == 0 {
+            return false;
+        }
+        let filled = carry.saturating_add(n);
+        if let Some(window) = buf.get(..filled)
+            && binary_matches_stamp(window, &expected)
+        {
+            return true;
+        }
+        if overlap > 0 && filled > overlap {
+            buf.copy_within(filled - overlap..filled, 0);
+            carry = overlap;
+        } else {
+            carry = filled.min(overlap);
+        }
+    }
 }
 
 #[cfg(test)]
