@@ -495,6 +495,9 @@ async fn oracle5_superseded_4409_reconnect_replaces_stale_conn_and_delivers_fram
             return Err(format!("expected 4409 CLOSE_SUPERSEDED, got {other:?}").into());
         }
     }
+    // Close the duplicate-EndpointId raw socket immediately so it cannot intercept
+    // Alice's subsequent Part C dial back to Bob's real endpoint on macOS CI.
+    stale_ep.close().await;
 
     assert!(wait_for_connected(&mut bob, alice_pk).await);
     assert!(wait_for_connected(&mut alice, bob_pk).await);
@@ -551,7 +554,6 @@ async fn oracle5_superseded_4409_reconnect_replaces_stale_conn_and_delivers_fram
         Some(ctrl)
     );
 
-    stale_ep.close().await;
     alice.close().await;
     bob.close().await;
     Ok(())
